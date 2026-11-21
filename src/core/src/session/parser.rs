@@ -11,7 +11,7 @@ use crate::pricing::TierThresholds;
 use crate::session::antigravity::parse_antigravity_session;
 use crate::session::claude::{parse_claude_jsonl_path, parse_claude_logs_with_diagnostics};
 use crate::session::codex::{parse_codex_jsonl_path, parse_codex_log_iter_with_diagnostics};
-use crate::session::copilot::parse_copilot_events_with_diagnostics;
+use crate::session::copilot::{parse_copilot_events_with_diagnostics, parse_copilot_jsonl_path};
 use crate::session::detector::{RecordClassifier, detect_extension_type};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::dsh::{has_zstd_magic, parse_dsh_session};
@@ -20,7 +20,6 @@ use crate::session::grok::{parse_grok_session, parse_grok_session_known};
 use crate::session::state::ParseMode;
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result, bail};
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::fs::File;
@@ -286,33 +285,7 @@ fn stream_parse_known(
     match provider {
         ExtensionType::ClaudeCode => parse_claude_jsonl_path(path, mode, tiers),
         ExtensionType::Codex => parse_codex_jsonl_path(path, mode, tiers),
-        ExtensionType::Copilot => {
-            let Some(mut stream) = prepare_typed_stream::<CopilotEvent>(path, provider)? else {
-                return Ok(None);
-            };
-            let diagnostics = Rc::new(RefCell::new(stream.diagnostics));
-            let warnings = Rc::new(RefCell::new(stream.warnings));
-            let io_failure = Rc::new(RefCell::new(None));
-            let rest = iter_jsonl_typed(
-                &mut stream.reader,
-                provider,
-                stream.lines_read,
-                Rc::clone(&diagnostics),
-                Rc::clone(&warnings),
-                Rc::clone(&io_failure),
-            );
-            let parsed =
-                parse_copilot_events_with_diagnostics(stream.first.into_iter().chain(rest), mode);
-            warnings.borrow().emit(path);
-            if let Some(error) = io_failure.borrow_mut().take() {
-                bail!("Failed to read session file {}: {error}", path.display());
-            }
-            let parsed = parsed?;
-            Ok(Some(finalize(
-                merge_extra_diagnostics(parsed, &diagnostics),
-                provider,
-            )))
-        }
+        ExtensionType::Copilot => parse_copilot_jsonl_path(path, mode),
         ExtensionType::Gemini => parse_gemini_jsonl_path(path, mode, tiers),
         // Grok `signals.json` is pretty-printed JSON with sibling session files; open it once directly.
         ExtensionType::Grok => {
@@ -328,54 +301,9 @@ fn stream_parse_known(
             parse_antigravity_session(path, mode, tiers)?,
             provider,
         ))),
-        _ => stream_parse_known_dynamic(path, provider, mode, tiers),
+        // SQLite-backed providers are not file streams.
+        ExtensionType::OpenCode | ExtensionType::Cursor | ExtensionType::Hermes => Ok(None),
     }
-}
-
-/// Dynamic streaming path for providers whose event schema stays as `Value`.
-fn stream_parse_known_dynamic(
-    path: &Path,
-    provider: ExtensionType,
-    mode: ParseMode,
-    tiers: Option<&TierThresholds>,
-) -> Result<Option<ParsedAnalysis>> {
-    let file =
-        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
-    let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
-
-    let mut lines_read = 0_usize;
-    let first_line = match read_next_non_empty_line(&mut reader, &mut lines_read)? {
-        Some(line) => line,
-        None => return Ok(None),
-    };
-
-    let first_value: Value = match serde_json::from_str(first_line.trim()) {
-        Ok(v) => v,
-        // Not JSONL; defer to whole-file `read_json`.
-        Err(_) => return Ok(None),
-    };
-
-    let parsed = dispatch_streaming_buffered(
-        provider,
-        vec![first_value],
-        reader,
-        mode,
-        ParseDiagnostics::default(),
-        Rc::new(RefCell::new(ParseWarningSummary::default())),
-        path,
-        tiers,
-        lines_read,
-    )?;
-    Ok(Some(finalize(parsed, provider)))
-}
-
-struct TypedStream<T> {
-    first: Option<T>,
-    reader: BufReader<File>,
-    diagnostics: ParseDiagnostics,
-    warnings: ParseWarningSummary,
-    /// Physical lines consumed while reading the first record, keeping subsequent warning line numbers accurate.
-    lines_read: usize,
 }
 
 /// Streams JSONL lines into `on_line` using one reusable byte buffer, returning `Ok(None)` if empty or non-JSONL.
@@ -460,51 +388,6 @@ pub(crate) fn stream_jsonl_borrowed<S>(
     let mut parsed = parsed?;
     parsed.diagnostics.merge(diagnostics);
     Ok(Some(finalize(parsed, provider)))
-}
-
-/// Opens a JSONL file and deserializes its first non-empty line into `T`, returning `Ok(None)` if empty or non-JSONL.
-fn prepare_typed_stream<T>(path: &Path, provider: ExtensionType) -> Result<Option<TypedStream<T>>>
-where
-    T: DeserializeOwned,
-{
-    let file =
-        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
-    let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
-    let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
-    let mut lines_read = 0_usize;
-
-    if !read_next_non_empty_bytes(&mut reader, &mut line, &mut lines_read)? {
-        return Ok(None);
-    }
-
-    let bytes = trim_ascii_whitespace(&line);
-    let mut diagnostics = ParseDiagnostics::default();
-    let mut warnings = ParseWarningSummary::default();
-    let first = match serde_json::from_slice::<T>(bytes) {
-        Ok(record) => Some(record),
-        Err(typed_error) => match serde_json::from_slice::<Value>(bytes) {
-            Ok(value) => {
-                record_typed_schema_failure(
-                    provider,
-                    &value,
-                    &mut diagnostics,
-                    &mut warnings,
-                    &typed_error,
-                );
-                None
-            }
-            // Incomplete JSON on line one indicates a pretty-printed document; defer to whole-file fallback.
-            Err(_) => return Ok(None),
-        },
-    };
-
-    Ok(Some(TypedStream {
-        first,
-        reader,
-        diagnostics,
-        warnings,
-        lines_read,
-    }))
 }
 
 /// Streams a JSONL file while classifying its provider, returning `Ok(None)` if empty or non-JSONL.
@@ -740,62 +623,6 @@ fn json_error_category(error: &serde_json::Error) -> &'static str {
         serde_json::error::Category::Data => "data error",
         serde_json::error::Category::Eof => "unexpected EOF",
     }
-}
-
-/// Yields JSONL records deserialized directly into `T`, offsetting reported line numbers by `lines_read`.
-fn iter_jsonl_typed<'a, T>(
-    reader: &'a mut BufReader<File>,
-    provider: ExtensionType,
-    lines_read: usize,
-    diagnostics: Rc<RefCell<ParseDiagnostics>>,
-    warnings: Rc<RefCell<ParseWarningSummary>>,
-    io_failure: Rc<RefCell<Option<String>>>,
-) -> impl Iterator<Item = T> + 'a
-where
-    T: DeserializeOwned + 'a,
-{
-    let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
-    let mut line_number = lines_read;
-
-    std::iter::from_fn(move || {
-        loop {
-            line.clear();
-            line_number += 1;
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) => return None,
-                Ok(_) => {}
-                Err(err) => {
-                    warnings.borrow_mut().record_unreadable(line_number, &err);
-                    *io_failure.borrow_mut() = Some(err.to_string());
-                    return None;
-                }
-            }
-
-            let bytes = trim_ascii_whitespace(&line);
-            if bytes.is_empty() {
-                continue;
-            }
-
-            match serde_json::from_slice::<T>(bytes) {
-                Ok(record) => return Some(record),
-                Err(typed_error) => match serde_json::from_slice::<Value>(bytes) {
-                    Ok(value) => {
-                        record_typed_schema_failure(
-                            provider,
-                            &value,
-                            &mut diagnostics.borrow_mut(),
-                            &mut warnings.borrow_mut(),
-                            &typed_error,
-                        );
-                    }
-                    Err(error) => {
-                        warnings.borrow_mut().record_malformed(line_number, &error);
-                        diagnostics.borrow_mut().record_malformed();
-                    }
-                },
-            }
-        }
-    })
 }
 
 /// Yields one [`Value`] per non-empty JSONL line from `reader`, offsetting reported line numbers by `lines_read`.
