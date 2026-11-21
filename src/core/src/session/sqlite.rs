@@ -203,6 +203,83 @@ fn sqlite_immutable_uri_from_str(raw: &str, is_windows: bool) -> Option<String> 
     Some(uri)
 }
 
+/// Returns the epoch-millis of the first instant of `date` in `tz`.
+pub(crate) fn day_start_millis<Tz: chrono::TimeZone>(tz: &Tz, date: chrono::NaiveDate) -> i64 {
+    use chrono::{Offset, TimeDelta};
+
+    let midnight = date.and_time(chrono::NaiveTime::MIN);
+    // `earliest()` handles fall-back DST transitions where local midnight occurs twice.
+    if let Some(start) = tz.from_local_datetime(&midnight).earliest() {
+        return start.timestamp_millis();
+    }
+    // Spring-forward zones that jump at local midnight (e.g. `America/Santiago`) have no `00:00`; compute the transition instant using the pre-jump offset probed 24h earlier.
+    let before = tz.offset_from_utc_datetime(&(midnight - TimeDelta::days(1)));
+    (midnight - TimeDelta::seconds(i64::from(before.fix().local_minus_utc())))
+        .and_utc()
+        .timestamp_millis()
+}
+
+/// Small per-scan cache mapping epoch-millisecond timestamps to local `YYYY-MM-DD` strings.
+///
+/// Caches exact `[day_start_ms, next_day_start_ms)` ranges so DST transitions (23h/24h/25h days and midnight gaps) stay exact while avoiding repeated `chrono::Local` lookups.
+#[derive(Default)]
+pub(crate) struct LocalDateCache {
+    entries: [(i64, i64, String); 4],
+    len: usize,
+    next_slot: usize,
+    scratch: String,
+}
+
+impl LocalDateCache {
+    /// Formats `ms` as local `YYYY-MM-DD`, returning `None` for out-of-range timestamps.
+    pub(crate) fn format_ms(&mut self, ms: i64) -> Option<&str> {
+        self.format_ms_in(&chrono::Local, ms)
+    }
+
+    fn format_ms_in<Tz: chrono::TimeZone>(&mut self, tz: &Tz, ms: i64) -> Option<&str> {
+        if let Some(idx) = self.entries[..self.len]
+            .iter()
+            .position(|(start, end, _)| ms >= *start && ms < *end)
+        {
+            return Some(self.entries[idx].2.as_str());
+        }
+
+        let dt = chrono::DateTime::from_timestamp_millis(ms)?;
+        let naive_date = dt.with_timezone(tz).date_naive();
+        let start = day_start_millis(tz, naive_date);
+        let end = naive_date.succ_opt().map(|next| day_start_millis(tz, next));
+
+        if let Some(end) = end
+            && ms >= start
+            && ms < end
+        {
+            let slot = if self.len < self.entries.len() {
+                let slot = self.len;
+                self.len += 1;
+                slot
+            } else {
+                let slot = self.next_slot;
+                self.next_slot = (self.next_slot + 1) % self.entries.len();
+                slot
+            };
+            let buf = &mut self.entries[slot].2;
+            buf.clear();
+            let _ =
+                std::fmt::Write::write_fmt(buf, format_args!("{}", naive_date.format("%Y-%m-%d")));
+            self.entries[slot].0 = start;
+            self.entries[slot].1 = end;
+            Some(self.entries[slot].2.as_str())
+        } else {
+            self.scratch.clear();
+            let _ = std::fmt::Write::write_fmt(
+                &mut self.scratch,
+                format_args!("{}", naive_date.format("%Y-%m-%d")),
+            );
+            Some(self.scratch.as_str())
+        }
+    }
+}
+
 fn probe(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
     conn.query_row(sql, [], |_| Ok(()))
 }
@@ -443,16 +520,11 @@ mod tests {
         assert!(!wal_path.exists());
         assert!(!shm_path.exists());
 
-        let sum: i64 = with_readonly_connection(
-            &db_path,
-            "entries",
-            "vct-sqlite-test-",
-            "Example",
-            |conn| {
+        let sum: i64 =
+            with_readonly_connection(&db_path, "entries", "vct-sqlite-test-", "Example", |conn| {
                 Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?)
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
 
         assert_eq!(sum, 18);
         assert!(
@@ -471,9 +543,7 @@ mod tests {
         let db_path = dir.path().join("active.db");
         let writer = Connection::open(&db_path).unwrap();
         writer.pragma_update(None, "journal_mode", "WAL").unwrap();
-        writer
-            .pragma_update(None, "wal_autocheckpoint", 0)
-            .unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
         writer
             .execute_batch(
                 "CREATE TABLE entries (value INTEGER NOT NULL); \
@@ -484,16 +554,11 @@ mod tests {
             .unwrap();
         assert!(append_suffix(&db_path, "-wal").exists());
 
-        let sum: i64 = with_readonly_connection(
-            &db_path,
-            "entries",
-            "vct-sqlite-test-",
-            "Example",
-            |conn| {
+        let sum: i64 =
+            with_readonly_connection(&db_path, "entries", "vct-sqlite-test-", "Example", |conn| {
                 Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?)
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(sum, 42);
 
         // Even if the DB is closed leaving a `-wal` without `-shm` (copied into a directory), `StableTempCopy` recovers the uncheckpointed rows.
@@ -513,9 +578,7 @@ mod tests {
             "entries",
             "vct-sqlite-test-",
             "Example",
-            |conn| {
-                Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?)
-            },
+            |conn| Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?),
         )
         .unwrap();
         assert_eq!(recovered_sum, 42);
@@ -549,9 +612,7 @@ mod tests {
             },
             || {
                 let writer = Connection::open(&db_path).unwrap();
-                writer
-                    .pragma_update(None, "wal_autocheckpoint", 0)
-                    .unwrap();
+                writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
                 writer
                     .execute("INSERT INTO entries VALUES (99)", [])
                     .unwrap();
@@ -646,5 +707,23 @@ mod tests {
             !append_suffix(&non_utf8_path, "-shm").exists(),
             "non-UTF-8 cleanly closed WAL DB must fall back to StableTempCopy without creating -shm"
         );
+    }
+
+    #[test]
+    fn local_date_cache_matches_chrono_across_multiple_days() {
+        let mut cache = LocalDateCache::default();
+        let base_ms = 1_780_757_089_000i64;
+        for day_offset in [0i64, 0, 1, 2, 3, 4, 5, 1, 4, -1, 180] {
+            for intra_day_ms in [0i64, 3_600_000, 43_200_000, 86_399_999] {
+                let ms = base_ms + day_offset * 86_400_000 + intra_day_ms;
+                let expected = chrono::DateTime::from_timestamp_millis(ms)
+                    .unwrap()
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string();
+                assert_eq!(cache.format_ms(ms), Some(expected.as_str()));
+            }
+        }
+        assert_eq!(cache.format_ms(i64::MAX), None);
     }
 }
