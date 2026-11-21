@@ -13,7 +13,7 @@ use crate::display::common::tui::{
 };
 use crate::display::settings::{SettingsOutcome, SettingsUiState};
 use crate::display::usage::{
-    QuotaRuntime, QuotaSnapshots, UsageRefreshPayload, UsageScanOutcome, UsageScanner, UsageUiState,
+    QuotaRuntime, UsageRefreshPayload, UsageScanOutcome, UsageScanner, UsageUiState,
 };
 use crate::layouts::{EventResult, LayoutCommand, LayoutContext, LayoutView, RANGES};
 use crossterm::event::KeyCode;
@@ -286,6 +286,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             });
         }
         let mut quota: Option<QuotaRuntime> = None;
+        let mut last_quota_state: Option<(u64, i64)> = None;
         let mut usage = UsageUiState::new(merge);
         let mut analysis = AnalysisUiState::new();
         let mut settings = SettingsUiState::new(
@@ -406,6 +407,25 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 }
             }
 
+            let quota_now = if tab == Tab::Quota {
+                let runtime = quota.get_or_insert_with(|| {
+                    last_quota_state = None;
+                    QuotaRuntime::start(
+                        &config.usage.quota.panels,
+                        config.providers,
+                        config.usage.quota_refresh_secs(),
+                    )
+                });
+                let now = chrono::Utc::now().timestamp();
+                let current_quota_state = (runtime.revision(), now / 60);
+                if last_quota_state != Some(current_quota_state) {
+                    redraw = true;
+                }
+                Some((now, current_quota_state))
+            } else {
+                None
+            };
+
             let loading = tab.scans() && shown[tab.index()].is_none();
             let tick = if loading {
                 Duration::from_millis(100)
@@ -425,20 +445,13 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 let update_text = update_notice.get().map(String::as_str);
                 let data_status = data_tab_status(refresh, update_text);
                 let update_status = update_text.map(|text| (text, theme().good));
-                let quota_snapshots = (tab == Tab::Quota).then(|| {
-                    let runtime = quota.get_or_insert_with(|| {
-                        QuotaRuntime::start(
-                            &config.usage.quota.panels,
-                            config.providers,
-                            config.usage.quota_refresh_secs(),
-                        )
-                    });
-                    QuotaSnapshots::read(runtime)
-                });
+                if let Some((_, state)) = quota_now {
+                    last_quota_state = Some(state);
+                }
                 let completed = terminal.terminal_mut().draw(|f| {
-                    let quota_view = quota_snapshots.as_ref().map(|snapshots| {
-                        let runtime = quota.as_ref().expect("started for Quota tab");
-                        (snapshots.view(runtime), chrono::Local::now().timestamp())
+                    let quota_view = quota_now.map(|(now, _)| {
+                        let runtime = quota.as_mut().expect("started for Quota tab");
+                        (runtime.view_cached(), now)
                     });
                     let mut ctx = LayoutContext {
                         tab,
@@ -506,6 +519,9 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                                     &mut active_layout_id,
                                     &mut layout_view,
                                 );
+                                if quota.is_none() {
+                                    last_quota_state = None;
+                                }
                             }
                             SettingsOutcome::Stay => {}
                         }
@@ -546,6 +562,9 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                                 &mut active_layout_id,
                                 &mut layout_view,
                             );
+                            if quota.is_none() {
+                                last_quota_state = None;
+                            }
                         }
                         last_draw = None;
                     }

@@ -13,7 +13,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
-use vct_core::config::{Config, SettingValue, apply_setting, get_setting, setting_description};
+use vct_core::config::{Config, SettingValue, apply_setting, setting_description};
+#[cfg(test)]
+use vct_core::config::get_setting;
 
 /// Below this only a notice is drawn.
 const SETTINGS_MIN_W: u16 = 64;
@@ -348,12 +350,72 @@ struct SettingsHitMap {
     editor_rect: Option<Rect>,
 }
 
+/// Converts a JSON value read from a serialized [`Config`] into a [`SettingValue`].
+fn setting_value_from_json(value: &serde_json::Value) -> Option<SettingValue> {
+    match value {
+        serde_json::Value::Bool(flag) => Some(SettingValue::Bool(*flag)),
+        serde_json::Value::Number(number) => number.as_i64().map(SettingValue::Integer),
+        serde_json::Value::String(text) => Some(SettingValue::String(text.clone())),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .map(SettingValue::List),
+        _ => None,
+    }
+}
+
+/// Extracts all [`FIELDS`] values from a single [`serde_json::to_value`] pass over `config`.
+fn extract_all_values(config: &Config) -> Vec<Option<SettingValue>> {
+    let root = serde_json::to_value(config).ok();
+    FIELDS
+        .iter()
+        .map(|field| {
+            let mut current = root.as_ref()?;
+            for key in field.path {
+                current = current.get(*key)?;
+            }
+            setting_value_from_json(current)
+        })
+        .collect()
+}
+
+/// Formats one field value for display in the Settings form.
+fn format_field_value(kind: Kind, value: Option<&SettingValue>) -> String {
+    match (kind, value) {
+        (Kind::Bool, Some(SettingValue::Bool(on))) => checkbox(*on),
+        (Kind::Member(name), Some(SettingValue::List(items))) => {
+            checkbox(items.iter().any(|item| item.eq_ignore_ascii_case(name)))
+        }
+        (Kind::Choice(_), Some(SettingValue::String(name))) => format!("‹ {name} ›"),
+        (Kind::Number { unit, zero, .. }, Some(SettingValue::Integer(number))) => {
+            match zero.filter(|_| *number == 0) {
+                Some(name) => format!("‹ {name} ›"),
+                None => format!("‹ {number}{unit} ›"),
+            }
+        }
+        (Kind::Text, Some(SettingValue::String(text))) if text.is_empty() => "auto".to_string(),
+        (Kind::Text, Some(SettingValue::String(text))) => text.clone(),
+        (Kind::Hosts, Some(SettingValue::List(items))) if items.is_empty() => "none".to_string(),
+        (Kind::Hosts, Some(SettingValue::List(items))) => items.join(", "),
+        _ => "?".to_string(),
+    }
+}
+
 /// What the Settings tab keeps between frames.
 pub(crate) struct SettingsUiState {
     config: Config,
     save: SaveSetting,
+    /// Whether schema descriptions, default values, and cached display strings have been materialized.
+    loaded: bool,
     sections: Vec<&'static str>,
     descriptions: Vec<String>,
+    default_values: Vec<Option<SettingValue>>,
+    default_displays: Vec<String>,
+    current_values: Vec<Option<SettingValue>>,
+    current_displays: Vec<String>,
+    changed: Vec<bool>,
+    changed_count: usize,
     /// Index into [`FIELDS`] of the selected field.
     row: usize,
     /// First line of the form on screen.
@@ -365,31 +427,78 @@ pub(crate) struct SettingsUiState {
 }
 
 impl SettingsUiState {
-    /// Returns a Settings form over `config` that persists changes through `save`.
+    /// Returns a lazily initialized Settings form over `config` that persists changes through `save`.
+    ///
+    /// Schema descriptions and formatted field values are deferred until the first Settings draw or interaction so startup pays zero serialization cost when the tab is never visited.
     pub(crate) fn new(config: Config, save: SaveSetting) -> Self {
         Self {
             config,
             save,
-            sections: sections(),
-            descriptions: FIELDS
-                .iter()
-                .map(|field| {
-                    // Fall back to the parent section's description when a field has none.
-                    setting_description(field.path)
-                        .or_else(|| setting_description(&field.path[..field.path.len() - 1]))
-                        .unwrap_or_default()
-                        // The comment's own line breaks would fight the box's.
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .collect(),
+            loaded: false,
+            sections: Vec::new(),
+            descriptions: Vec::new(),
+            default_values: Vec::new(),
+            default_displays: Vec::new(),
+            current_values: Vec::new(),
+            current_displays: Vec::new(),
+            changed: Vec::new(),
+            changed_count: 0,
             row: 0,
             offset: 0,
             editor: None,
             message: None,
             hits: SettingsHitMap::default(),
         }
+    }
+
+    /// Populates schema descriptions, default values, and current display caches on first visit.
+    fn ensure_loaded(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.sections = sections();
+        self.descriptions = FIELDS
+            .iter()
+            .map(|field| {
+                // Fall back to the parent section's description when a field has none.
+                setting_description(field.path)
+                    .or_else(|| setting_description(&field.path[..field.path.len() - 1]))
+                    .unwrap_or_default()
+                    // The comment's own line breaks would fight the box's.
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let default_values = extract_all_values(&Config::default());
+        let default_displays = FIELDS
+            .iter()
+            .enumerate()
+            .map(|(index, field)| format_field_value(field.kind, default_values[index].as_ref()))
+            .collect();
+        self.default_values = default_values;
+        self.default_displays = default_displays;
+        self.refresh_cached_values();
+        self.loaded = true;
+    }
+
+    /// Recomputes cached values, display strings, and diff flags from `self.config` in one JSON pass.
+    fn refresh_cached_values(&mut self) {
+        self.current_values = extract_all_values(&self.config);
+        self.current_displays = FIELDS
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                format_field_value(field.kind, self.current_values[index].as_ref())
+            })
+            .collect();
+        self.changed = self
+            .current_values
+            .iter()
+            .zip(&self.default_values)
+            .map(|(current, default)| current != default)
+            .collect();
+        self.changed_count = self.changed.iter().filter(|&&flag| flag).count();
     }
 
     /// Returns the current settings.
@@ -400,6 +509,9 @@ impl SettingsUiState {
     /// Replaces the settings, after something else wrote the file.
     pub(crate) fn set_config(&mut self, config: Config) {
         self.config = config;
+        if self.loaded {
+            self.refresh_cached_values();
+        }
     }
 
     /// Shows `text` beside the key hints, as a success or a failure.
@@ -431,33 +543,8 @@ impl SettingsUiState {
             .unwrap_or(0)
     }
 
-    fn value(&self, config: &Config, index: usize) -> Option<SettingValue> {
-        get_setting(config, FIELDS[index].path)
-    }
-
-    /// Returns the formatted value shown for the field at `index` in `config`.
-    fn display(&self, config: &Config, index: usize) -> String {
-        let field = &FIELDS[index];
-        match (field.kind, self.value(config, index)) {
-            (Kind::Bool, Some(SettingValue::Bool(on))) => checkbox(on),
-            (Kind::Member(name), Some(SettingValue::List(items))) => {
-                checkbox(items.iter().any(|item| item.eq_ignore_ascii_case(name)))
-            }
-            (Kind::Choice(_), Some(SettingValue::String(name))) => format!("‹ {name} ›"),
-            (Kind::Number { unit, zero, .. }, Some(SettingValue::Integer(number))) => {
-                match zero.filter(|_| number == 0) {
-                    Some(name) => format!("‹ {name} ›"),
-                    None => format!("‹ {number}{unit} ›"),
-                }
-            }
-            (Kind::Text, Some(SettingValue::String(text))) if text.is_empty() => "auto".to_string(),
-            (Kind::Text, Some(SettingValue::String(text))) => text,
-            (Kind::Hosts, Some(SettingValue::List(items))) if items.is_empty() => {
-                "none".to_string()
-            }
-            (Kind::Hosts, Some(SettingValue::List(items))) => items.join(", "),
-            _ => "?".to_string(),
-        }
+    fn current_value(&self, index: usize) -> Option<&SettingValue> {
+        self.current_values[index].as_ref()
     }
 
     /// Applies and saves `value` for the field at `index`.
@@ -469,6 +556,7 @@ impl SettingsUiState {
         match result {
             Ok(()) => {
                 self.config = next;
+                self.refresh_cached_values();
                 let note = if FIELDS[index].live {
                     "saved"
                 } else {
@@ -487,7 +575,7 @@ impl SettingsUiState {
     /// Toggles a [`Kind::Bool`] or [`Kind::Member`] field, or steps a [`Kind::Choice`] or [`Kind::Number`] by `step`.
     fn nudge(&mut self, step: i64) -> SettingsOutcome {
         let index = self.current();
-        let Some(value) = self.value(&self.config, index) else {
+        let Some(value) = self.current_value(index).cloned() else {
             return SettingsOutcome::Stay;
         };
         let next = match (FIELDS[index].kind, value) {
@@ -519,7 +607,7 @@ impl SettingsUiState {
     /// Opens the editor for the selected field's kind, or toggles [`Kind::Bool`] and [`Kind::Member`] fields immediately.
     fn open_editor(&mut self) -> SettingsOutcome {
         let index = self.current();
-        let value = self.value(&self.config, index);
+        let value = self.current_value(index).cloned();
         self.editor = match (FIELDS[index].kind, value) {
             (Kind::Bool | Kind::Member(_), _) => return self.nudge(1),
             (Kind::Choice(options), Some(SettingValue::String(name))) => Some(Editor::Choice {
@@ -545,17 +633,16 @@ impl SettingsUiState {
     /// Puts the focused field back to its default.
     fn reset(&mut self) -> SettingsOutcome {
         let index = self.current();
-        let defaults = Config::default();
-        let Some(default) = self.value(&defaults, index) else {
+        let Some(default) = self.default_values[index].clone() else {
             return SettingsOutcome::Stay;
         };
         // A panel row resets its own name, not the whole list.
         if let Kind::Member(name) = FIELDS[index].kind {
-            let on = |value: Option<SettingValue>| {
+            let on = |value: Option<&SettingValue>| {
                 matches!(value, Some(SettingValue::List(items))
                     if items.iter().any(|item| item.eq_ignore_ascii_case(name)))
             };
-            if on(Some(default)) == on(self.value(&self.config, index)) {
+            if on(Some(&default)) == on(self.current_value(index)) {
                 return SettingsOutcome::Stay;
             }
             return self.nudge(1);
@@ -565,6 +652,7 @@ impl SettingsUiState {
 
     /// Handles one key press.
     pub(crate) fn handle_key(&mut self, key: KeyCode) -> SettingsOutcome {
+        self.ensure_loaded();
         if self.editor.is_some() {
             return self.handle_editor_key(key);
         }
@@ -705,6 +793,7 @@ impl SettingsUiState {
 
     /// Handles mouse clicks and wheel scrolls inside the Settings tab.
     pub(crate) fn handle_mouse(&mut self, mouse: MouseInput) -> SettingsOutcome {
+        self.ensure_loaded();
         if self.editor.is_some() {
             return self.handle_editor_mouse(mouse);
         }
@@ -837,6 +926,7 @@ impl SettingsUiState {
         status: Option<(&str, Color)>,
         border_type: BorderType,
     ) {
+        self.ensure_loaded();
         self.hits = SettingsHitMap::default();
         if area.width < SETTINGS_MIN_W || area.height < SETTINGS_MIN_H {
             render_too_small(f, SETTINGS_MIN_W, SETTINGS_MIN_H);
@@ -882,11 +972,10 @@ impl SettingsUiState {
         );
 
         let inner_w = usize::from(right.width.saturating_sub(5));
-        let defaults = Config::default();
         let mut lines: Vec<Line> = Vec::new();
         let mut line_to_field: Vec<Option<usize>> = Vec::new();
         let mut selected_line = 0;
-        let mut changed_count = 0;
+        let changed_count = self.changed_count;
         for (index, field) in FIELDS.iter().enumerate() {
             if index == 0 || FIELDS[index - 1].section != field.section {
                 if index > 0 {
@@ -899,12 +988,11 @@ impl SettingsUiState {
                 )));
                 line_to_field.push(None);
             }
-            let value = self.display(&self.config, index);
+            let value = self.current_displays[index].as_str();
             let label_w = inner_w.saturating_sub(value.chars().count());
             let label: String = field.label.chars().take(label_w).collect();
-            let changed = self.value(&self.config, index) != self.value(&defaults, index);
-            changed_count += usize::from(changed);
-            let value_style = match value.as_str() {
+            let changed = self.changed[index];
+            let value_style = match value {
                 "[x] on" => Style::default().fg(theme.good),
                 "[ ] off" => dim,
                 _ => Style::default(),
@@ -915,7 +1003,7 @@ impl SettingsUiState {
                     Style::default().fg(theme.warn),
                 ),
                 Span::raw(format!("{label:<label_w$}")),
-                Span::styled(value, value_style),
+                Span::styled(value.to_string(), value_style),
                 Span::raw(" "),
             ]);
             if index == self.row {
@@ -974,7 +1062,7 @@ impl SettingsUiState {
                 Style::default().fg(theme.warn),
             ));
         }
-        let default = format!(" default: {} ", self.display(&defaults, index));
+        let default = format!(" default: {} ", self.default_displays[index]);
         f.render_widget(
             Paragraph::new(self.descriptions[index].as_str())
                 .wrap(Wrap { trim: true })
@@ -1164,10 +1252,17 @@ mod tests {
 
     #[test]
     fn every_field_reads_a_value_and_has_help() {
-        let (state, _) = form();
+        let (mut state, _) = form();
+        state.ensure_loaded();
         let config = Config::default();
         for (index, field) in FIELDS.iter().enumerate() {
-            assert_ne!(state.display(&config, index), "?", "{}", field.label);
+            assert_eq!(
+                state.current_values[index],
+                get_setting(&config, field.path),
+                "{}",
+                field.label
+            );
+            assert_ne!(state.current_displays[index], "?", "{}", field.label);
             assert!(!state.descriptions[index].is_empty(), "{}", field.label);
         }
     }
@@ -1538,5 +1633,18 @@ mod tests {
             );
             assert_eq!(state.config().general.layout, crate::layouts::LAYOUT_IDS[1]);
         }
+    }
+
+    #[test]
+    fn new_defers_loading_until_first_draw_or_input() {
+        let mut state = SettingsUiState::new(Config::default(), Box::new(|_, _| Ok(())));
+        assert!(!state.loaded);
+        assert!(state.descriptions.is_empty());
+        assert!(state.current_displays.is_empty());
+
+        let _ = screen(&mut state, 100, 24);
+        assert!(state.loaded);
+        assert_eq!(state.descriptions.len(), FIELDS.len());
+        assert_eq!(state.current_displays.len(), FIELDS.len());
     }
 }

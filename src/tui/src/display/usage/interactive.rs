@@ -27,7 +27,7 @@ use ratatui::{
     },
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
@@ -186,10 +186,36 @@ pub(crate) struct QuotaRuntime {
     pub(crate) cursor: Arc<Mutex<CursorQuotaSnapshot>>,
     pub(crate) grok: Arc<Mutex<GrokQuotaSnapshot>>,
     pub(crate) antigravity: Arc<Mutex<AntigravityQuotaSnapshot>>,
+    revision: Arc<AtomicU64>,
+    cached: Option<(u64, QuotaSnapshots)>,
     _guard: QuotaShutdownGuard,
 }
 
 impl QuotaRuntime {
+    /// Returns the monotonic snapshot revision bumped whenever any provider worker updates its snapshot.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Returns a [`QuotaView`] backed by a cached clone refreshed only when [`Self::revision`] changes.
+    pub(crate) fn view_cached(&mut self) -> QuotaView<'_> {
+        let rev = self.revision();
+        if self.cached.as_ref().is_none_or(|(r, _)| *r != rev) {
+            self.cached = Some((rev, QuotaSnapshots::read(self)));
+        }
+        let (_, snapshots) = self.cached.as_ref().expect("populated above");
+        QuotaView {
+            claude: &snapshots.claude,
+            codex: &snapshots.codex,
+            copilot: &snapshots.copilot,
+            cursor: &snapshots.cursor,
+            grok: &snapshots.grok,
+            antigravity: &snapshots.antigravity,
+            present: self.present,
+            band_enabled: self.band_enabled,
+        }
+    }
+
     pub(crate) fn start(
         quota_panels: &[String],
         providers: ProvidersConfig,
@@ -210,6 +236,7 @@ impl QuotaRuntime {
         present.antigravity &= providers.antigravity && panel_on("antigravity");
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let revision = Arc::new(AtomicU64::new(1));
         let claude = Arc::new(Mutex::new(
             present
                 .claude
@@ -253,113 +280,151 @@ impl QuotaRuntime {
                 .unwrap_or_default(),
         ));
 
-        if present.claude
-            || present.codex
-            || present.copilot
-            || present.cursor
-            || present.grok
-            || present.antigravity
-        {
-            match vct_core::quota::http::build_client() {
-                Ok(client) => {
-                    if present.claude {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&claude));
-                        let mut state = ClaudeState::default();
-                        spawn_quota_worker(
-                            "claude",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_claude_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.codex {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&codex));
-                        let mut state = CodexState::default();
-                        spawn_quota_worker(
-                            "codex",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_codex_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.copilot {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&copilot));
-                        let mut state = CopilotState;
-                        spawn_quota_worker(
-                            "copilot",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_copilot_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.cursor {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&cursor));
-                        let mut state = CursorState;
-                        spawn_quota_worker(
-                            "cursor",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_cursor_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.grok {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&grok));
-                        let mut state = GrokState::default();
-                        spawn_quota_worker(
-                            "grok",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_grok_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.antigravity {
-                        let (client, shutdown, shared) = (
-                            client.clone(),
-                            Arc::clone(&shutdown),
-                            Arc::clone(&antigravity),
-                        );
-                        let mut state = AntigravityState::default();
-                        spawn_quota_worker(
-                            "antigravity",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_antigravity_cache(snapshot);
-                            },
-                        );
-                    }
+        if present.count() > 0 {
+            // Move HTTP client construction (Tokio + OS root CA loading) and worker spawning off the UI thread so cached cards draw immediately.
+            let starter_shutdown = Arc::clone(&shutdown);
+            let starter_revision = Arc::clone(&revision);
+            let starter_claude = Arc::clone(&claude);
+            let starter_codex = Arc::clone(&codex);
+            let starter_copilot = Arc::clone(&copilot);
+            let starter_cursor = Arc::clone(&cursor);
+            let starter_grok = Arc::clone(&grok);
+            let starter_antigravity = Arc::clone(&antigravity);
+            std::thread::spawn(move || {
+                if starter_shutdown.load(Ordering::Relaxed) {
+                    return;
                 }
-                Err(error) => {
-                    log::warn!("quota workers disabled: failed to build HTTP client: {error}")
+                let client = match vct_core::quota::http::build_client() {
+                    Ok(client) => client,
+                    Err(error) => {
+                        log::warn!("quota workers disabled: failed to build HTTP client: {error}");
+                        return;
+                    }
+                };
+                if starter_shutdown.load(Ordering::Relaxed) {
+                    return;
                 }
-            }
+                if present.claude {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_claude,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = ClaudeState::default();
+                    spawn_quota_worker(
+                        "claude",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_claude_cache(snapshot);
+                        },
+                    );
+                }
+                if present.codex {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_codex,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = CodexState::default();
+                    spawn_quota_worker(
+                        "codex",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_codex_cache(snapshot);
+                        },
+                    );
+                }
+                if present.copilot {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_copilot,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = CopilotState;
+                    spawn_quota_worker(
+                        "copilot",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_copilot_cache(snapshot);
+                        },
+                    );
+                }
+                if present.cursor {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_cursor,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = CursorState;
+                    spawn_quota_worker(
+                        "cursor",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_cursor_cache(snapshot);
+                        },
+                    );
+                }
+                if present.grok {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_grok,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = GrokState::default();
+                    spawn_quota_worker(
+                        "grok",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_grok_cache(snapshot);
+                        },
+                    );
+                }
+                if present.antigravity {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_antigravity,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = AntigravityState::default();
+                    spawn_quota_worker(
+                        "antigravity",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_antigravity_cache(snapshot);
+                        },
+                    );
+                }
+            });
         }
 
         Self {
@@ -371,6 +436,8 @@ impl QuotaRuntime {
             cursor,
             grok,
             antigravity,
+            revision,
+            cached: None,
             _guard: QuotaShutdownGuard { shutdown },
         }
     }
@@ -443,9 +510,9 @@ impl UsageSort {
     }
 }
 
-/// A copy of every quota worker's latest snapshot, taken once per frame.
+/// A copy of every quota worker's latest snapshot, refreshed only when [`QuotaRuntime::revision`] advances.
 #[derive(Default)]
-pub(crate) struct QuotaSnapshots {
+struct QuotaSnapshots {
     claude: ClaudeQuotaSnapshot,
     codex: CodexQuotaSnapshot,
     copilot: CopilotQuotaSnapshot,
@@ -456,7 +523,7 @@ pub(crate) struct QuotaSnapshots {
 
 impl QuotaSnapshots {
     /// Copies the current snapshots out of `runtime`.
-    pub(crate) fn read(runtime: &QuotaRuntime) -> Self {
+    fn read(runtime: &QuotaRuntime) -> Self {
         fn copy<T: Clone + Default>(shared: &Mutex<T>) -> T {
             shared.lock().map(|value| value.clone()).unwrap_or_default()
         }
@@ -467,20 +534,6 @@ impl QuotaSnapshots {
             cursor: copy(&runtime.cursor),
             grok: copy(&runtime.grok),
             antigravity: copy(&runtime.antigravity),
-        }
-    }
-
-    /// Returns a [`QuotaView`] borrowing these snapshots and `runtime`'s presence flags.
-    pub(crate) fn view(&self, runtime: &QuotaRuntime) -> QuotaView<'_> {
-        QuotaView {
-            claude: &self.claude,
-            codex: &self.codex,
-            copilot: &self.copilot,
-            cursor: &self.cursor,
-            grok: &self.grok,
-            antigravity: &self.antigravity,
-            present: runtime.present,
-            band_enabled: runtime.band_enabled,
         }
     }
 }
@@ -1704,8 +1757,9 @@ pub(crate) fn fit_cards(
 ) -> (Vec<(Rect, QuotaCard)>, usize) {
     // Measure height at `base.min_w` first, then compute the final cell widths before building the rendered cards so line fitting matches the drawn cell.
     let present = quota.present.count();
+    let initial_cards = collect_cards(quota, now, base.min_w, wide);
     // Grow card height to the tallest card only if all present providers still fit.
-    let tallest = collect_cards(quota, now, base.min_w, wide)
+    let tallest = initial_cards
         .iter()
         .map(|card| card.lines.len())
         .max()
@@ -1724,7 +1778,11 @@ pub(crate) fn fit_cards(
     let fits = present.min(cols.saturating_mul(rows_that_fit));
     let cells = grid_cells(spec, area, fits);
     let card_w = cells.first().map_or(spec.min_w, |cell| cell.width);
-    let cards = collect_cards(quota, now, card_w, wide);
+    let cards = if card_w == base.min_w {
+        initial_cards
+    } else {
+        collect_cards(quota, now, card_w, wide)
+    };
     (cells.into_iter().zip(cards).collect(), present - fits)
 }
 
@@ -1885,6 +1943,7 @@ fn render_provider_box(
 }
 
 /// Pre-wrapped quota card lines ordered most-important-first; excess lines are counted by [`render_quota_card_with_border`].
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct QuotaCard {
     title: &'static str,
     color: RatatuiColor,
@@ -1899,14 +1958,14 @@ fn card_inner_w(width: u16) -> u16 {
 
 #[cfg(test)]
 pub(crate) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
-    render_quota_card_with_border(f, area, card, BorderType::Plain);
+    render_quota_card_with_border(f, area, card.clone(), BorderType::Plain);
 }
 
 /// Renders `card` into `area` with `border_type`, placing `+N` (hidden lines) and `LIMIT` flags on the top border.
 pub(crate) fn render_quota_card_with_border(
     f: &mut Frame,
     area: Rect,
-    card: &QuotaCard,
+    mut card: QuotaCard,
     border_type: BorderType,
 ) {
     let capacity = usize::from(area.height.saturating_sub(2));
@@ -1943,8 +2002,8 @@ pub(crate) fn render_quota_card_with_border(
         block = block.title(Line::from(flags).right_aligned());
     }
 
-    let shown = card.lines[..capacity.min(card.lines.len())].to_vec();
-    f.render_widget(Paragraph::new(shown).block(block), area);
+    card.lines.truncate(capacity);
+    f.render_widget(Paragraph::new(card.lines).block(block), area);
 }
 
 /// Truncates `text` to `width` characters, appending `…` when shortened.

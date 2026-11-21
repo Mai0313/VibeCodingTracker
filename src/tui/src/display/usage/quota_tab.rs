@@ -61,10 +61,10 @@ pub(crate) fn draw_quota_tab_with_border(
     // Center the top-aligned card grid vertically within `body`.
     let used = cards.last().map_or(body.y, |(cell, _)| cell.bottom());
     let shift = (body.bottom() - used) / 2;
-    for (cell, card) in &cards {
+    for (cell, card) in cards {
         let cell = Rect {
             y: cell.y + shift,
-            ..*cell
+            ..cell
         };
         render_quota_card_with_border(f, cell, card, border_type);
     }
