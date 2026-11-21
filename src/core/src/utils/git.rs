@@ -1,14 +1,14 @@
 //! Cached `origin` remote URL lookup from `.git/config`.
 
-use std::collections::HashMap;
+use crate::constants::FastHashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
 
 // Keyed by both the caller's original absolute path and the canonical path so symlink aliases resolve to the same entry; never invalidated.
-static GIT_URL_CACHE: LazyLock<RwLock<HashMap<PathBuf, String>>> =
-    LazyLock::new(|| RwLock::new(HashMap::with_capacity(20)));
+static GIT_URL_CACHE: LazyLock<RwLock<FastHashMap<PathBuf, String>>> =
+    LazyLock::new(|| RwLock::new(FastHashMap::with_capacity(20)));
 
 /// Returns the `origin` remote URL from `<cwd>/.git/config`, with any trailing `.git` stripped.
 ///
@@ -21,9 +21,7 @@ pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
         return String::new();
     }
 
-    let original_path = cwd.to_path_buf();
-
-    // Check the original absolute path first to avoid canonicalization on cache hits.
+    // Check the original absolute path first to avoid canonicalization and allocation on cache hits.
     if cwd.is_absolute()
         && let Some(url) = cached_url(cwd)
     {
@@ -37,7 +35,7 @@ pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
         if cwd.is_absolute()
             && let Ok(mut cache) = GIT_URL_CACHE.write()
         {
-            cache.insert(original_path, url.clone());
+            cache.insert(cwd.to_path_buf(), url.clone());
         }
         return url;
     }
@@ -47,7 +45,7 @@ pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
     // Store both the original absolute path (skips canonicalization) and the canonical path (deduplicates symlinks).
     if let Ok(mut cache) = GIT_URL_CACHE.write() {
         if cwd.is_absolute() || canonical_path.is_none() {
-            cache.insert(original_path, url.clone());
+            cache.insert(cwd.to_path_buf(), url.clone());
         }
         if let Some(path) = canonical_path {
             cache.insert(path, url.clone());

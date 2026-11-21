@@ -4,10 +4,19 @@
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
-use crate::session::state::{ParseMode, SessionParseState};
+use crate::session::parser::stream_jsonl_borrowed;
+use crate::session::state::{ParseMode, SessionParseState, TextMetrics, count_json_string_metrics};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp};
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde::{
+    Deserialize, Deserializer,
+    de::{Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
+use serde_json::{Value, json, value::RawValue};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::Path;
 
 /// Parses Copilot CLI session `events` into a single-record [`CodeAnalysis`].
 ///
@@ -31,22 +40,63 @@ pub(crate) fn parse_copilot_events_with_diagnostics<I>(
 where
     I: IntoIterator<Item = CopilotEvent>,
 {
-    let mut state = SessionParseState::with_mode(mode);
-    let mut conversation_usage: FastHashMap<String, Value> =
-        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
-    // Pending tool calls indexed by `toolCallId`.
-    let mut pending_tools: FastHashMap<String, PendingTool> = FastHashMap::with_capacity(32);
-
-    // Active model for fallback `assistant.message.outputTokens` attribution when `session.shutdown` never arrives.
-    let mut current_model = String::new();
-    // Guards against the fallback overwriting authoritative `session.shutdown` rows on the same canonicalized model key.
-    let mut shutdown_seen = false;
-    let mut pending_output_tokens: FastHashMap<String, i64> = FastHashMap::with_capacity(3);
-    let mut diagnostics = ParseDiagnostics::default();
-
+    let mut fold = CopilotFold::new(mode);
     for event in events {
+        fold.observe_owned_event(event);
+    }
+    Ok(fold.finish())
+}
+
+/// Streams and parses a Copilot CLI `events.jsonl` file at `path` using borrowed deserialization without per-line `Value` allocation.
+pub(crate) fn parse_copilot_jsonl_path(
+    path: &Path,
+    mode: ParseMode,
+) -> Result<Option<ParsedAnalysis>> {
+    stream_jsonl_borrowed(
+        path,
+        ExtensionType::Copilot,
+        CopilotFold::new(mode),
+        |fold, bytes| {
+            if !bytes.starts_with(b"{") {
+                return Err(serde::de::Error::custom("expected Copilot event object"));
+            }
+            let event = serde_json::from_slice::<BorrowedCopilotEvent<'_>>(bytes)?;
+            fold.observe_borrowed_event(event);
+            Ok(())
+        },
+        |fold| Ok(fold.finish()),
+    )
+}
+
+struct CopilotFold {
+    state: SessionParseState,
+    conversation_usage: FastHashMap<String, Value>,
+    // Pending tool calls indexed by `toolCallId`.
+    pending_tools: FastHashMap<String, PendingTool>,
+    // Active model for fallback `assistant.message.outputTokens` attribution when `session.shutdown` never arrives.
+    current_model: String,
+    // Guards against the fallback overwriting authoritative `session.shutdown` rows on the same canonicalized model key.
+    shutdown_seen: bool,
+    pending_output_tokens: FastHashMap<String, i64>,
+    diagnostics: ParseDiagnostics,
+}
+
+impl CopilotFold {
+    fn new(mode: ParseMode) -> Self {
+        Self {
+            state: SessionParseState::with_mode(mode),
+            conversation_usage: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
+            pending_tools: FastHashMap::with_capacity(32),
+            current_model: String::new(),
+            shutdown_seen: false,
+            pending_output_tokens: FastHashMap::with_capacity(3),
+            diagnostics: ParseDiagnostics::default(),
+        }
+    }
+
+    fn observe_envelope(&mut self, event_type: &str, timestamp: &str) -> i64 {
         let recognized = matches!(
-            event.event_type.as_str(),
+            event_type,
             "session.start"
                 | "session.model_change"
                 | "session.task_complete"
@@ -69,33 +119,226 @@ where
                 | "session.resume"
         );
         if recognized {
-            diagnostics.record_recognized_source();
+            self.diagnostics.record_recognized_source();
         } else {
-            diagnostics.record_unrecognized();
+            self.diagnostics.record_unrecognized();
         }
-        let ts = parse_iso_timestamp(&event.timestamp);
-        if ts > state.last_ts {
-            state.last_ts = ts;
+        let ts = parse_iso_timestamp(timestamp);
+        if ts > self.state.last_ts {
+            self.state.last_ts = ts;
         }
+        ts
+    }
+
+    fn apply_shutdown_metrics(&mut self, metrics: BTreeMap<String, Option<CopilotModelUsage>>) {
+        self.diagnostics.record_relevant(true);
+        for (model, usage) in metrics {
+            if model.is_empty() {
+                continue;
+            }
+            let Some(usage) = usage else {
+                continue;
+            };
+            // Copilot's `outputTokens` includes `reasoningTokens`, whereas the flat usage shape keeps output and reasoning disjoint.
+            let output_tokens = usage.output_tokens.saturating_sub(usage.reasoning_tokens);
+            let usage_json = json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_output_tokens": usage.reasoning_tokens,
+                "cache_read_input_tokens": usage.cache_read_tokens,
+                "cache_creation_input_tokens": usage.cache_write_tokens,
+            });
+            self.conversation_usage
+                .insert(canonicalize_model_name(&model), usage_json);
+        }
+        self.shutdown_seen = true;
+    }
+
+    fn observe_borrowed_event(&mut self, event: BorrowedCopilotEvent<'_>) {
+        let ts = self.observe_envelope(event.event_type.as_ref(), event.timestamp.as_ref());
+        let Some(data_raw) = event.data.filter(|raw| raw.get().starts_with('{')) else {
+            if matches!(
+                event.event_type.as_ref(),
+                "session.shutdown" | "tool.execution_start" | "tool.execution_complete"
+            ) {
+                self.diagnostics.record_relevant(false);
+            }
+            return;
+        };
+
+        match event.event_type.as_ref() {
+            "session.start" => {
+                if let Ok(data) =
+                    serde_json::from_str::<BorrowedSessionStartData<'_>>(data_raw.get())
+                {
+                    if self.state.task_id.is_empty() && !data.session_id.is_empty() {
+                        self.state.task_id = data.session_id.into_owned();
+                    }
+                    if let Some(ctx) = data.context {
+                        if self.state.folder_path.is_empty() {
+                            if !ctx.cwd.is_empty() {
+                                self.state.folder_path = ctx.cwd.into_owned();
+                            } else if !ctx.git_root.is_empty() {
+                                self.state.folder_path = ctx.git_root.into_owned();
+                            }
+                        }
+                        if self.state.git_remote.is_empty() {
+                            self.state.git_remote =
+                                build_remote_url(&ctx.repository_host, &ctx.repository);
+                        }
+                    }
+                }
+            }
+            "session.model_change" => {
+                if let Ok(data) =
+                    serde_json::from_str::<BorrowedModelChangeData<'_>>(data_raw.get())
+                    && let Some(new_model) =
+                        raw_as_str(data.new_model).filter(|model| !model.is_empty())
+                {
+                    self.current_model = canonicalize_model_name(new_model.as_ref());
+                }
+            }
+            "session.shutdown" => {
+                if let Ok(data) = serde_json::from_str::<ValidatedShutdownData>(data_raw.get()) {
+                    self.apply_shutdown_metrics(data.model_metrics);
+                } else {
+                    self.diagnostics.record_relevant(false);
+                }
+            }
+            "assistant.message" => {
+                if let Ok(data) =
+                    serde_json::from_str::<BorrowedAssistantMessageData<'_>>(data_raw.get())
+                    && let Some(raw_tokens) = data.output_tokens
+                {
+                    let output_tokens = serde_json::from_str::<i64>(raw_tokens.get()).ok();
+                    self.diagnostics
+                        .record_relevant(output_tokens.is_some() && !self.current_model.is_empty());
+                    if let Some(output_tokens) = output_tokens.filter(|&t| t > 0)
+                        && !self.current_model.is_empty()
+                    {
+                        if let Some(total) = self.pending_output_tokens.get_mut(&self.current_model)
+                        {
+                            *total += output_tokens;
+                        } else {
+                            self.pending_output_tokens
+                                .insert(self.current_model.clone(), output_tokens);
+                        }
+                    }
+                }
+            }
+            "tool.execution_start" => {
+                match serde_json::from_str::<BorrowedToolStartData<'_>>(data_raw.get()) {
+                    Ok(data) if !data.tool_call_id.is_empty() && !data.tool_name.is_empty() => {
+                        let tool = TrackedTool::from_name(data.tool_name.as_ref());
+                        let payload = match tool {
+                            Some(tracked) => {
+                                parse_borrowed_start_args(tracked, data.arguments, self.state.mode)
+                            }
+                            None => PendingToolPayload::Untracked,
+                        };
+                        self.pending_tools.insert(
+                            data.tool_call_id.into_owned(),
+                            PendingTool {
+                                tool,
+                                payload,
+                                timestamp: ts,
+                            },
+                        );
+                    }
+                    Ok(data) => {
+                        self.diagnostics.record_relevant(false);
+                        // Keep the `toolCallId` registered so its completion pairs cleanly instead of double-counting the drift as an orphan.
+                        if !data.tool_call_id.is_empty() {
+                            self.pending_tools.insert(
+                                data.tool_call_id.into_owned(),
+                                PendingTool {
+                                    tool: None,
+                                    payload: PendingToolPayload::Untracked,
+                                    timestamp: ts,
+                                },
+                            );
+                        }
+                    }
+                    Err(_) => self.diagnostics.record_relevant(false),
+                }
+            }
+            "tool.execution_complete" => {
+                let Ok(data) = serde_json::from_str::<BorrowedToolCompleteData<'_>>(data_raw.get())
+                else {
+                    self.diagnostics.record_relevant(false);
+                    return;
+                };
+                let Some(tool_call_id) = raw_as_str(data.tool_call_id).filter(|id| !id.is_empty())
+                else {
+                    self.diagnostics.record_relevant(false);
+                    return;
+                };
+                let success = data
+                    .success
+                    .and_then(|raw| serde_json::from_str::<bool>(raw.get()).ok());
+                let Some(pending) = self.pending_tools.remove(tool_call_id.as_ref()) else {
+                    // Only successful orphans count as drift because failed tool calls are ignored even when paired.
+                    if success == Some(true) {
+                        self.diagnostics.record_relevant(false);
+                    }
+                    return;
+                };
+                let Some(success) = success else {
+                    if pending.tool.is_some() {
+                        self.diagnostics.record_relevant(false);
+                    }
+                    return;
+                };
+                // Failed tool calls do not apply file operations; count them as valid lifecycle records without dispatching.
+                if !success {
+                    if pending.tool.is_some() {
+                        self.diagnostics.record_relevant(true);
+                    }
+                    return;
+                }
+                // Match `CopilotToolCompleteData`'s `model: String` validation.
+                if let Some(model_raw) = data.model
+                    && !model_raw.get().starts_with('"')
+                {
+                    if pending.tool.is_some() {
+                        self.diagnostics.record_relevant(false);
+                    }
+                    return;
+                }
+                if pending.tool.is_none() {
+                    return;
+                }
+                let complete = apply_borrowed_pending_tool(
+                    pending.payload,
+                    data.result,
+                    &mut self.state,
+                    pending.timestamp,
+                );
+                self.diagnostics.record_relevant(complete);
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_owned_event(&mut self, event: CopilotEvent) {
+        let ts = self.observe_envelope(&event.event_type, &event.timestamp);
 
         match event.event_type.as_str() {
             "session.start" => {
-                if let Ok(data) =
-                    serde_json::from_value::<CopilotSessionStartData>(event.data.clone())
-                {
-                    if state.task_id.is_empty() && !data.session_id.is_empty() {
-                        state.task_id = data.session_id;
+                if let Ok(data) = serde_json::from_value::<CopilotSessionStartData>(event.data) {
+                    if self.state.task_id.is_empty() && !data.session_id.is_empty() {
+                        self.state.task_id = data.session_id;
                     }
                     if let Some(ctx) = data.context {
-                        if state.folder_path.is_empty() {
+                        if self.state.folder_path.is_empty() {
                             if !ctx.cwd.is_empty() {
-                                state.folder_path = ctx.cwd;
+                                self.state.folder_path = ctx.cwd;
                             } else if !ctx.git_root.is_empty() {
-                                state.folder_path = ctx.git_root;
+                                self.state.folder_path = ctx.git_root;
                             }
                         }
-                        if state.git_remote.is_empty() {
-                            state.git_remote =
+                        if self.state.git_remote.is_empty() {
+                            self.state.git_remote =
                                 build_remote_url(&ctx.repository_host, &ctx.repository);
                         }
                     }
@@ -108,82 +351,76 @@ where
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty());
                 if let Some(new_model) = new_model {
-                    current_model = canonicalize_model_name(new_model);
+                    self.current_model = canonicalize_model_name(new_model);
                 }
             }
             "session.shutdown" => {
                 let payload_supported = shutdown_payload_supported(&event.data);
                 if payload_supported
-                    && let Ok(data) =
-                        serde_json::from_value::<CopilotShutdownData>(event.data.clone())
+                    && let Ok(data) = serde_json::from_value::<CopilotShutdownData>(event.data)
                 {
-                    diagnostics.record_relevant(true);
-                    for (model, metric) in data.model_metrics {
-                        if model.is_empty() {
-                            continue;
-                        }
-                        let Some(usage) = metric.usage else {
-                            continue;
-                        };
-                        // Copilot's `outputTokens` includes `reasoningTokens`, whereas the flat usage shape keeps output and reasoning disjoint.
-                        let output_tokens =
-                            usage.output_tokens.saturating_sub(usage.reasoning_tokens);
-                        let usage_json = json!({
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": output_tokens,
-                            "reasoning_output_tokens": usage.reasoning_tokens,
-                            "cache_read_input_tokens": usage.cache_read_tokens,
-                            "cache_creation_input_tokens": usage.cache_write_tokens,
-                        });
-                        conversation_usage.insert(canonicalize_model_name(&model), usage_json);
-                    }
-                    shutdown_seen = true;
+                    let metrics = data
+                        .model_metrics
+                        .into_iter()
+                        .map(|(model, metric)| (model, metric.usage))
+                        .collect();
+                    self.apply_shutdown_metrics(metrics);
                 } else {
-                    diagnostics.record_relevant(false);
+                    self.diagnostics.record_relevant(false);
                 }
             }
             "assistant.message" => {
                 // Only used as a fallback when no `session.shutdown` arrives.
                 if let Some(output_tokens) = event.data.get("outputTokens") {
                     let output_tokens = output_tokens.as_i64();
-                    diagnostics
-                        .record_relevant(output_tokens.is_some() && !current_model.is_empty());
+                    self.diagnostics
+                        .record_relevant(output_tokens.is_some() && !self.current_model.is_empty());
                     if let Some(output_tokens) = output_tokens.filter(|&t| t > 0)
-                        && !current_model.is_empty()
+                        && !self.current_model.is_empty()
                     {
-                        *pending_output_tokens
-                            .entry(current_model.clone())
-                            .or_insert(0) += output_tokens;
+                        if let Some(total) = self.pending_output_tokens.get_mut(&self.current_model)
+                        {
+                            *total += output_tokens;
+                        } else {
+                            self.pending_output_tokens
+                                .insert(self.current_model.clone(), output_tokens);
+                        }
                     }
                 }
             }
             "tool.execution_start" => {
-                match serde_json::from_value::<CopilotToolStartData>(event.data.clone()) {
+                match serde_json::from_value::<CopilotToolStartData>(event.data) {
                     Ok(data) if !data.tool_call_id.is_empty() && !data.tool_name.is_empty() => {
-                        pending_tools.insert(
+                        let tool = TrackedTool::from_name(&data.tool_name);
+                        let payload = if tool.is_some() {
+                            PendingToolPayload::Owned(data.arguments)
+                        } else {
+                            PendingToolPayload::Untracked
+                        };
+                        self.pending_tools.insert(
                             data.tool_call_id,
                             PendingTool {
-                                tool: TrackedTool::from_name(&data.tool_name),
-                                arguments: data.arguments,
+                                tool,
+                                payload,
                                 timestamp: ts,
                             },
                         );
                     }
                     Ok(data) => {
-                        diagnostics.record_relevant(false);
+                        self.diagnostics.record_relevant(false);
                         // Keep the `toolCallId` registered so its completion pairs cleanly instead of double-counting the drift as an orphan.
                         if !data.tool_call_id.is_empty() {
-                            pending_tools.insert(
+                            self.pending_tools.insert(
                                 data.tool_call_id,
                                 PendingTool {
                                     tool: None,
-                                    arguments: Value::Null,
+                                    payload: PendingToolPayload::Untracked,
                                     timestamp: ts,
                                 },
                             );
                         }
                     }
-                    Err(_) => diagnostics.record_relevant(false),
+                    Err(_) => self.diagnostics.record_relevant(false),
                 }
             }
             "tool.execution_complete" => {
@@ -193,81 +430,340 @@ where
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                 else {
-                    diagnostics.record_relevant(false);
-                    continue;
+                    self.diagnostics.record_relevant(false);
+                    return;
                 };
-                let Some(pending) = pending_tools.remove(tool_call_id) else {
+                let success_opt = event.data.get("success").and_then(Value::as_bool);
+                let Some(pending) = self.pending_tools.remove(tool_call_id) else {
                     // Only successful orphans count as drift because failed tool calls are ignored even when paired.
-                    if event.data.get("success").and_then(Value::as_bool) == Some(true) {
-                        diagnostics.record_relevant(false);
+                    if success_opt == Some(true) {
+                        self.diagnostics.record_relevant(false);
                     }
-                    continue;
+                    return;
                 };
-                let Some(success) = event.data.get("success").and_then(Value::as_bool) else {
+                let Some(success) = success_opt else {
                     if pending.tool.is_some() {
-                        diagnostics.record_relevant(false);
+                        self.diagnostics.record_relevant(false);
                     }
-                    continue;
+                    return;
                 };
                 // Failed tool calls do not apply file operations; count them as valid lifecycle records without dispatching.
                 if !success {
                     if pending.tool.is_some() {
-                        diagnostics.record_relevant(true);
+                        self.diagnostics.record_relevant(true);
                     }
-                    continue;
+                    return;
                 }
-                let data =
-                    match serde_json::from_value::<CopilotToolCompleteData>(event.data.clone()) {
-                        Ok(data) => data,
-                        Err(_) => {
-                            if pending.tool.is_some() {
-                                diagnostics.record_relevant(false);
-                            }
-                            continue;
+                let data = match serde_json::from_value::<CopilotToolCompleteData>(event.data) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        if pending.tool.is_some() {
+                            self.diagnostics.record_relevant(false);
                         }
-                    };
+                        return;
+                    }
+                };
+                let PendingToolPayload::Owned(arguments) = &pending.payload else {
+                    return;
+                };
                 let folded = pending
                     .tool
-                    .and_then(|tool| tool.read_args(&pending.arguments, &data.result));
+                    .and_then(|tool| tool.read_args(arguments, &data.result));
                 if pending.tool.is_some() {
-                    diagnostics.record_relevant(folded.as_ref().is_some_and(ToolArgs::is_complete));
+                    self.diagnostics
+                        .record_relevant(folded.as_ref().is_some_and(ToolArgs::is_complete));
                 }
                 if let Some(folded) = folded {
-                    folded.record(&mut state, pending.timestamp);
+                    folded.record(&mut self.state, pending.timestamp);
                 }
             }
             _ => {}
         }
     }
 
-    if !shutdown_seen {
-        for (model, output_tokens) in pending_output_tokens {
-            conversation_usage.insert(
-                model,
-                json!({
-                    "input_tokens": 0,
-                    "output_tokens": output_tokens,
-                    "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                }),
-            );
+    fn finish(mut self) -> ParsedAnalysis {
+        if !self.shutdown_seen {
+            for (model, output_tokens) in self.pending_output_tokens {
+                self.conversation_usage.insert(
+                    model,
+                    json!({
+                        "input_tokens": 0,
+                        "output_tokens": output_tokens,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    }),
+                );
+            }
         }
+
+        if self.state.git_remote.is_empty() {
+            self.state.git_remote = get_git_remote_url(&self.state.folder_path);
+        }
+
+        let record = self.state.into_record(self.conversation_usage);
+
+        let analysis = CodeAnalysis {
+            user: String::new(),
+            extension_name: String::from("Copilot-CLI"),
+            insights_version: String::new(),
+            machine_id: String::new(),
+            records: vec![record],
+        };
+        ParsedAnalysis::new(analysis, self.diagnostics)
     }
+}
 
-    if state.git_remote.is_empty() {
-        state.git_remote = get_git_remote_url(&state.folder_path);
+fn deserialize_present_raw<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<&'de RawValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    <&'de RawValue>::deserialize(deserializer).map(Some)
+}
+
+fn raw_as_str<'a>(raw: Option<&'a RawValue>) -> Option<Cow<'a, str>> {
+    let raw = raw?;
+    if !raw.get().starts_with('"') {
+        return None;
     }
+    serde_json::from_str::<Cow<'a, str>>(raw.get()).ok()
+}
 
-    let record = state.into_record(conversation_usage);
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedCopilotEvent<'a> {
+    #[serde(rename = "type", default, borrow)]
+    event_type: Cow<'a, str>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    data: Option<&'a RawValue>,
+    #[serde(default, borrow, rename = "id")]
+    _id: Cow<'a, str>,
+    #[serde(default, borrow)]
+    timestamp: Cow<'a, str>,
+    #[serde(default, borrow, rename = "parentId")]
+    _parent_id: Option<Cow<'a, str>>,
+}
 
-    let analysis = CodeAnalysis {
-        user: String::new(),
-        extension_name: String::from("Copilot-CLI"),
-        insights_version: String::new(),
-        machine_id: String::new(),
-        records: vec![record],
-    };
-    Ok(ParsedAnalysis::new(analysis, diagnostics))
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedSessionStartData<'a> {
+    #[serde(default, borrow)]
+    session_id: Cow<'a, str>,
+    #[serde(default, borrow)]
+    context: Option<BorrowedSessionContext<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedSessionContext<'a> {
+    #[serde(default, borrow)]
+    cwd: Cow<'a, str>,
+    #[serde(default, borrow)]
+    git_root: Cow<'a, str>,
+    #[serde(default, borrow)]
+    repository: Cow<'a, str>,
+    #[serde(default, borrow)]
+    repository_host: Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedModelChangeData<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    new_model: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedAssistantMessageData<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    output_tokens: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedToolStartData<'a> {
+    #[serde(default, borrow)]
+    tool_call_id: Cow<'a, str>,
+    #[serde(default, borrow)]
+    tool_name: Cow<'a, str>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    arguments: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedToolCompleteData<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    tool_call_id: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    success: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    result: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    model: Option<&'a RawValue>,
+}
+
+struct ValidatedShutdownData {
+    model_metrics: BTreeMap<String, Option<CopilotModelUsage>>,
+}
+
+impl<'de> Deserialize<'de> for ValidatedShutdownData {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ValidatedShutdownData;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a Copilot session.shutdown data object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut metrics: Option<BTreeMap<String, Option<CopilotModelUsage>>> = None;
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    if key == "modelMetrics" {
+                        metrics = Some(map.next_value::<ValidatedModelMetricsMap>()?.0);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                let model_metrics =
+                    metrics.ok_or_else(|| A::Error::custom("missing modelMetrics"))?;
+                Ok(ValidatedShutdownData { model_metrics })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+struct ValidatedModelMetricsMap(BTreeMap<String, Option<CopilotModelUsage>>);
+
+impl<'de> Deserialize<'de> for ValidatedModelMetricsMap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ValidatedModelMetricsMap;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a Copilot modelMetrics map")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some(model) = map.next_key::<String>()? {
+                    let metric = map.next_value::<ValidatedMetricEntry>()?;
+                    out.insert(model, metric.0);
+                }
+                Ok(ValidatedModelMetricsMap(out))
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+struct ValidatedMetricEntry(Option<CopilotModelUsage>);
+
+impl<'de> Deserialize<'de> for ValidatedMetricEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ValidatedMetricEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a Copilot model metric object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut usage: Option<CopilotModelUsage> = None;
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    if key == "usage" {
+                        usage = map
+                            .next_value::<Option<ValidatedCopilotUsage>>()?
+                            .map(|u| u.0);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(ValidatedMetricEntry(usage))
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+struct ValidatedCopilotUsage(CopilotModelUsage);
+
+impl<'de> Deserialize<'de> for ValidatedCopilotUsage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ValidatedCopilotUsage;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a Copilot usage object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut usage = CopilotModelUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                };
+                let mut field_count = 0_usize;
+                let mut recognized = false;
+
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    field_count += 1;
+                    match key.as_ref() {
+                        "inputTokens" => {
+                            usage.input_tokens = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "outputTokens" => {
+                            usage.output_tokens = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "cacheReadTokens" => {
+                            usage.cache_read_tokens = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "cacheWriteTokens" => {
+                            usage.cache_write_tokens = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "reasoningTokens" => {
+                            usage.reasoning_tokens = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                if field_count > 0 && !recognized {
+                    return Err(A::Error::custom("unrecognized Copilot usage keys"));
+                }
+                Ok(ValidatedCopilotUsage(usage))
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
 }
 
 fn shutdown_payload_supported(data: &Value) -> bool {
@@ -312,6 +808,403 @@ fn copilot_usage_supported(usage: &Value) -> bool {
     recognized
 }
 
+#[derive(Default, Deserialize)]
+struct BorrowedCopilotToolArgs<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    path: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    view_range: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    file_text: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    content: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    old_string: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    old_str: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    old_text: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    new_string: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    new_str: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    new_text: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    input: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    patch: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "patchText",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    patch_text: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    string: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    command: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    cmd: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    description: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedCopilotReadResult<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    content: Option<&'a RawValue>,
+}
+
+#[derive(Clone, Copy)]
+enum ViewRangeState {
+    Missing,
+    Valid(usize),
+    Invalid,
+}
+
+fn parse_raw_view_range(raw: Option<&RawValue>) -> ViewRangeState {
+    struct RangeVisitor;
+    impl<'de> Visitor<'de> for RangeVisitor {
+        type Value = ViewRangeState;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a Copilot view_range array")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let Some(first) = seq.next_element::<&'de RawValue>()? else {
+                return Ok(ViewRangeState::Missing);
+            };
+            let Some(second) = seq.next_element::<&'de RawValue>()? else {
+                return Ok(ViewRangeState::Missing);
+            };
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            let (Ok(start), Ok(end)) = (
+                serde_json::from_str::<i64>(first.get()),
+                serde_json::from_str::<i64>(second.get()),
+            ) else {
+                return Ok(ViewRangeState::Invalid);
+            };
+            Ok(ViewRangeState::Valid((end - start + 1).max(0) as usize))
+        }
+    }
+
+    let Some(raw) = raw else {
+        return ViewRangeState::Missing;
+    };
+    if !raw.get().starts_with('[') {
+        return ViewRangeState::Missing;
+    }
+    let mut de = serde_json::Deserializer::from_str(raw.get());
+    de.deserialize_seq(RangeVisitor)
+        .unwrap_or(ViewRangeState::Missing)
+}
+
+enum PendingToolPayload {
+    Untracked,
+    Invalid,
+    Owned(Value),
+    Read {
+        path: String,
+        view_range: ViewRangeState,
+    },
+    Search,
+    WriteFull {
+        path: String,
+        content: String,
+    },
+    WriteCounts {
+        path: String,
+        metrics: TextMetrics,
+    },
+    EditFull {
+        path: String,
+        old_string: String,
+        new_string: String,
+    },
+    EditCounts {
+        path: String,
+        old_is_empty: bool,
+        new_metrics: TextMetrics,
+    },
+    ApplyPatch {
+        patches: Vec<CopilotPatch>,
+    },
+    ShellFull {
+        command: String,
+        description: String,
+    },
+    ShellCount,
+}
+
+fn first_raw_choice<'a>(choices: &[Option<&'a RawValue>]) -> Option<&'a RawValue> {
+    choices.iter().copied().flatten().next()
+}
+
+fn parse_borrowed_start_args(
+    tool: TrackedTool,
+    args_raw: Option<&RawValue>,
+    mode: ParseMode,
+) -> PendingToolPayload {
+    if matches!(tool, TrackedTool::Search) {
+        return PendingToolPayload::Search;
+    }
+    let Some(args_raw) = args_raw else {
+        return PendingToolPayload::Invalid;
+    };
+    let usage_only = matches!(mode, ParseMode::UsageOnly);
+
+    if matches!(tool, TrackedTool::ApplyPatch) {
+        let patch_text = if args_raw.get().starts_with('"') {
+            raw_as_str(Some(args_raw))
+        } else if args_raw.get().starts_with('{') {
+            serde_json::from_str::<BorrowedCopilotToolArgs<'_>>(args_raw.get())
+                .ok()
+                .and_then(|args| {
+                    raw_as_str(args.input)
+                        .or_else(|| raw_as_str(args.patch))
+                        .or_else(|| raw_as_str(args.patch_text))
+                        .or_else(|| raw_as_str(args.string))
+                })
+        } else {
+            None
+        };
+        let Some(patch_text) = patch_text else {
+            return PendingToolPayload::Invalid;
+        };
+        let patches = parse_apply_patch_text(&patch_text);
+        if patches.iter().all(|patch| patch.file_path.is_empty()) {
+            return PendingToolPayload::Invalid;
+        }
+        return PendingToolPayload::ApplyPatch { patches };
+    }
+
+    if !args_raw.get().starts_with('{') {
+        return PendingToolPayload::Invalid;
+    }
+    let Ok(args) = serde_json::from_str::<BorrowedCopilotToolArgs<'_>>(args_raw.get()) else {
+        return PendingToolPayload::Invalid;
+    };
+
+    match tool {
+        TrackedTool::Read => {
+            let Some(path) = raw_as_str(args.path).filter(|p| !p.is_empty()) else {
+                return PendingToolPayload::Invalid;
+            };
+            PendingToolPayload::Read {
+                path: path.into_owned(),
+                view_range: parse_raw_view_range(args.view_range),
+            }
+        }
+        TrackedTool::Write => {
+            let Some(path) = raw_as_str(args.path).filter(|p| !p.is_empty()) else {
+                return PendingToolPayload::Invalid;
+            };
+            let Some(body_raw) = first_raw_choice(&[args.file_text, args.content]) else {
+                return PendingToolPayload::Invalid;
+            };
+            if usage_only {
+                let Some(metrics) = count_json_string_metrics(body_raw.get()) else {
+                    return PendingToolPayload::Invalid;
+                };
+                PendingToolPayload::WriteCounts {
+                    path: path.into_owned(),
+                    metrics,
+                }
+            } else {
+                let Some(content) = raw_as_str(Some(body_raw)) else {
+                    return PendingToolPayload::Invalid;
+                };
+                PendingToolPayload::WriteFull {
+                    path: path.into_owned(),
+                    content: content.into_owned(),
+                }
+            }
+        }
+        TrackedTool::Edit => {
+            let Some(path) = raw_as_str(args.path).filter(|p| !p.is_empty()) else {
+                return PendingToolPayload::Invalid;
+            };
+            let Some(old_raw) = first_raw_choice(&[args.old_string, args.old_str, args.old_text])
+            else {
+                return PendingToolPayload::Invalid;
+            };
+            let Some(new_raw) = first_raw_choice(&[args.new_string, args.new_str, args.new_text])
+            else {
+                return PendingToolPayload::Invalid;
+            };
+            if usage_only {
+                let Some(old_metrics) = count_json_string_metrics(old_raw.get()) else {
+                    return PendingToolPayload::Invalid;
+                };
+                let Some(new_metrics) = count_json_string_metrics(new_raw.get()) else {
+                    return PendingToolPayload::Invalid;
+                };
+                PendingToolPayload::EditCounts {
+                    path: path.into_owned(),
+                    old_is_empty: old_metrics.is_empty(),
+                    new_metrics,
+                }
+            } else {
+                let Some(old_string) = raw_as_str(Some(old_raw)) else {
+                    return PendingToolPayload::Invalid;
+                };
+                let Some(new_string) = raw_as_str(Some(new_raw)) else {
+                    return PendingToolPayload::Invalid;
+                };
+                PendingToolPayload::EditFull {
+                    path: path.into_owned(),
+                    old_string: old_string.into_owned(),
+                    new_string: new_string.into_owned(),
+                }
+            }
+        }
+        TrackedTool::Shell => {
+            let Some(command) = raw_as_str(first_raw_choice(&[args.command, args.cmd]))
+                .filter(|command| !command.trim().is_empty())
+            else {
+                return PendingToolPayload::Invalid;
+            };
+            if usage_only {
+                PendingToolPayload::ShellCount
+            } else {
+                let description = raw_as_str(args.description).unwrap_or(Cow::Borrowed(""));
+                PendingToolPayload::ShellFull {
+                    command: command.into_owned(),
+                    description: description.into_owned(),
+                }
+            }
+        }
+        TrackedTool::WriteBash => {
+            let Some(input) = raw_as_str(args.input).filter(|input| !input.trim().is_empty())
+            else {
+                return PendingToolPayload::Invalid;
+            };
+            if usage_only {
+                PendingToolPayload::ShellCount
+            } else {
+                PendingToolPayload::ShellFull {
+                    command: input.into_owned(),
+                    description: String::new(),
+                }
+            }
+        }
+        TrackedTool::Search | TrackedTool::ApplyPatch => unreachable!(),
+    }
+}
+
+fn view_range_metrics(line_count: usize) -> TextMetrics {
+    if line_count == 0 {
+        TextMetrics::default()
+    } else {
+        // Matches `vec!["-"; line_count].join("\n")`: `line_count` dashes plus `line_count - 1` newlines.
+        TextMetrics {
+            lines: line_count,
+            chars: line_count.saturating_mul(2).saturating_sub(1),
+        }
+    }
+}
+
+fn apply_borrowed_pending_tool(
+    payload: PendingToolPayload,
+    result_raw: Option<&RawValue>,
+    state: &mut SessionParseState,
+    ts: i64,
+) -> bool {
+    match payload {
+        PendingToolPayload::Untracked | PendingToolPayload::Owned(_) => true,
+        PendingToolPayload::Invalid => false,
+        PendingToolPayload::Read { path, view_range } => {
+            state.tool_counts.read += 1;
+            let usage_only = matches!(state.mode, ParseMode::UsageOnly);
+            match view_range {
+                ViewRangeState::Invalid => false,
+                ViewRangeState::Valid(line_count) => {
+                    if usage_only {
+                        let metrics = view_range_metrics(line_count);
+                        attach_read_counts(state, &path, metrics.lines, metrics.chars);
+                    } else if line_count > 0 {
+                        let placeholder = vec!["-"; line_count].join("\n");
+                        attach_read_detail(state, &path, &placeholder, ts);
+                    }
+                    true
+                }
+                ViewRangeState::Missing => {
+                    let content_raw = result_raw
+                        .filter(|raw| raw.get().starts_with('{'))
+                        .and_then(|raw| {
+                            serde_json::from_str::<BorrowedCopilotReadResult<'_>>(raw.get()).ok()
+                        })
+                        .and_then(|res| res.content);
+                    let Some(content_raw) = content_raw else {
+                        return false;
+                    };
+                    if usage_only {
+                        let Some(metrics) = count_json_string_metrics(content_raw.get()) else {
+                            return false;
+                        };
+                        attach_read_counts(state, &path, metrics.lines, metrics.chars);
+                    } else {
+                        let Some(content) = raw_as_str(Some(content_raw)) else {
+                            return false;
+                        };
+                        attach_read_detail(state, &path, &content, ts);
+                    }
+                    true
+                }
+            }
+        }
+        PendingToolPayload::Search => {
+            state.tool_counts.read += 1;
+            true
+        }
+        PendingToolPayload::WriteFull { path, content } => {
+            state.add_write_detail(&path, &content, ts);
+            true
+        }
+        PendingToolPayload::WriteCounts { path, metrics } => {
+            state.add_write_counts(&path, metrics.lines, metrics.chars);
+            true
+        }
+        PendingToolPayload::EditFull {
+            path,
+            old_string,
+            new_string,
+        } => {
+            state.add_edit_detail(&path, &old_string, &new_string, ts);
+            true
+        }
+        PendingToolPayload::EditCounts {
+            path,
+            old_is_empty,
+            new_metrics,
+        } => {
+            state.add_edit_counts(&path, old_is_empty, new_metrics.lines, new_metrics.chars);
+            true
+        }
+        PendingToolPayload::ApplyPatch { patches } => {
+            record_patches(state, patches, ts);
+            true
+        }
+        PendingToolPayload::ShellFull {
+            command,
+            description,
+        } => {
+            state.add_run_command(&command, &description, ts);
+            true
+        }
+        PendingToolPayload::ShellCount => {
+            state.tool_counts.bash += 1;
+            true
+        }
+    }
+}
+
 /// Tracked Copilot CLI tool category, resolved from the log's tool name.
 #[derive(Clone, Copy)]
 enum TrackedTool {
@@ -341,11 +1234,11 @@ impl TrackedTool {
     }
 
     /// Extracts the foldable payload for a completed tool call, returning `None` if required arguments are missing or unreadable (schema drift).
-    fn read_args<'a>(self, args: &'a Value, result: &Value) -> Option<ToolArgs<'a>> {
+    fn read_args<'a>(self, args: &'a Value, result: &'a Value) -> Option<ToolArgs<'a>> {
         Some(match self {
             Self::Read => ToolArgs::Read {
                 path: arg_path(args)?,
-                content: read_view_content(args, result),
+                content: read_view_content_ref(args, result),
             },
             Self::Search => ToolArgs::Search,
             Self::Write => ToolArgs::Write {
@@ -378,12 +1271,17 @@ impl TrackedTool {
     }
 }
 
+enum ViewContent<'a> {
+    Range(usize),
+    Text(&'a str),
+}
+
 /// Validated payload of a successful [`TrackedTool`] call.
 enum ToolArgs<'a> {
     /// `content` is `None` when the completion body is unreadable; the read invocation still counts, but records schema drift.
     Read {
         path: &'a str,
-        content: Option<String>,
+        content: Option<ViewContent<'a>>,
     },
     Search,
     Write {
@@ -418,7 +1316,21 @@ impl ToolArgs<'_> {
         match self {
             Self::Read { path, content } => {
                 state.tool_counts.read += 1;
-                attach_read_detail(state, path, content.as_deref().unwrap_or(""), ts);
+                match content {
+                    Some(ViewContent::Range(line_count)) => {
+                        if matches!(state.mode, ParseMode::UsageOnly) {
+                            let metrics = view_range_metrics(line_count);
+                            attach_read_counts(state, path, metrics.lines, metrics.chars);
+                        } else if line_count > 0 {
+                            let placeholder = vec!["-"; line_count].join("\n");
+                            attach_read_detail(state, path, &placeholder, ts);
+                        }
+                    }
+                    Some(ViewContent::Text(text)) => {
+                        attach_read_detail(state, path, text, ts);
+                    }
+                    None => {}
+                }
             }
             Self::Search => state.tool_counts.read += 1,
             Self::Write { path, content } => state.add_write_detail(path, content, ts),
@@ -459,8 +1371,8 @@ fn extract_apply_patch_text(args: &Value) -> Option<&str> {
 struct PendingTool {
     /// Tracked tool category, or `None` for untracked tools.
     tool: Option<TrackedTool>,
-    /// Raw tool arguments from `tool.execution_start`.
-    arguments: Value,
+    /// Extracted or raw tool arguments from `tool.execution_start`.
+    payload: PendingToolPayload,
     /// Start-event timestamp in epoch milliseconds.
     timestamp: i64,
 }
@@ -469,6 +1381,17 @@ struct PendingTool {
 fn attach_read_detail(state: &mut SessionParseState, path: &str, content: &str, ts: i64) {
     let invocation_count = state.tool_counts.read;
     state.add_read_detail(path, content, ts);
+    state.tool_counts.read = invocation_count;
+}
+
+fn attach_read_counts(
+    state: &mut SessionParseState,
+    path: &str,
+    line_count: usize,
+    char_count: usize,
+) {
+    let invocation_count = state.tool_counts.read;
+    state.add_read_counts(path, line_count, char_count);
     state.tool_counts.read = invocation_count;
 }
 
@@ -560,8 +1483,8 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
     (old_string, new_string)
 }
 
-/// Returns the read body for a `view`-family call from `arguments.view_range` (synthesized line placeholder) or `result.content`, or `None` if neither is readable.
-fn read_view_content(arguments: &Value, result: &Value) -> Option<String> {
+/// Returns the read body or `view_range` line count for a `view`-family call, or `None` if neither is readable.
+fn read_view_content_ref<'a>(arguments: &'a Value, result: &'a Value) -> Option<ViewContent<'a>> {
     if let Some(range) = arguments
         .get("view_range")
         .and_then(|v| v.as_array())
@@ -570,14 +1493,20 @@ fn read_view_content(arguments: &Value, result: &Value) -> Option<String> {
         let start = range.first()?.as_i64()?;
         let end = range.get(1)?.as_i64()?;
         let line_count = (end - start + 1).max(0) as usize;
-        if line_count == 0 {
-            return Some(String::new());
-        }
-        // Use non-empty lines so `add_read_detail`'s trailing-newline trim cannot collapse the placeholder to empty.
-        return Some(vec!["-"; line_count].join("\n"));
+        return Some(ViewContent::Range(line_count));
     }
 
-    Some(result.get("content")?.as_str()?.to_string())
+    Some(ViewContent::Text(result.get("content")?.as_str()?))
+}
+
+/// Returns the read body for a `view`-family call from `arguments.view_range` (synthesized line placeholder) or `result.content`, or `None` if neither is readable.
+#[cfg(test)]
+fn read_view_content(arguments: &Value, result: &Value) -> Option<String> {
+    match read_view_content_ref(arguments, result)? {
+        ViewContent::Range(0) => Some(String::new()),
+        ViewContent::Range(line_count) => Some(vec!["-"; line_count].join("\n")),
+        ViewContent::Text(text) => Some(text.to_string()),
+    }
 }
 
 /// Builds an `https://{host}/{repository}` remote URL, or an empty string if either part is empty.
@@ -620,7 +1549,7 @@ mod tests {
     }
 
     /// Resolves `tool_name` and reads its payload, panicking if `tool_name` is untracked.
-    fn read<'a>(tool_name: &str, arguments: &'a Value, result: &Value) -> Option<ToolArgs<'a>> {
+    fn read<'a>(tool_name: &str, arguments: &'a Value, result: &'a Value) -> Option<ToolArgs<'a>> {
         TrackedTool::from_name(tool_name)
             .unwrap_or_else(|| panic!("`{tool_name}` must resolve to a tracked tool"))
             .read_args(arguments, result)
@@ -1162,5 +2091,124 @@ mod tests {
         assert_eq!(canonicalize_model_name("gpt-5.1"), "gpt-5.1");
         assert_eq!(canonicalize_model_name("gpt-4.1-mini"), "gpt-4.1-mini");
         assert_eq!(canonicalize_model_name("gemini-1.5-pro"), "gemini-1.5-pro");
+    }
+
+    #[test]
+    fn borrowed_jsonl_stream_matches_owned_parser_across_view_range_and_cjk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let events = vec![
+            event(
+                "session.start",
+                json!({
+                    "sessionId": "cop-1",
+                    "context": {
+                        "cwd": "/workspace",
+                        "repositoryHost": "github.com",
+                        "repository": "owner/repo"
+                    }
+                }),
+            ),
+            event(
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "v1",
+                    "toolName": "view",
+                    "arguments": { "path": "/workspace/a.rs", "view_range": [10, 14] }
+                }),
+            ),
+            event(
+                "tool.execution_complete",
+                json!({ "toolCallId": "v1", "success": true, "result": {} }),
+            ),
+            event(
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "v2",
+                    "toolName": "view",
+                    "arguments": { "path": "/workspace/zh.md" }
+                }),
+            ),
+            event(
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "v2",
+                    "success": true,
+                    "result": { "content": "繁體中文\n第二行🚀\n" }
+                }),
+            ),
+            event(
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "w1",
+                    "toolName": "create",
+                    "arguments": { "path": "/workspace/new.md", "file_text": "寫入\n多行😀\n\n" }
+                }),
+            ),
+            event(
+                "tool.execution_complete",
+                json!({ "toolCallId": "w1", "success": true, "result": {} }),
+            ),
+            event(
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "e1",
+                    "toolName": "str_replace",
+                    "arguments": { "path": "/workspace/new.md", "old_string": "", "new_string": "重分類\r\n寫入" }
+                }),
+            ),
+            event(
+                "tool.execution_complete",
+                json!({ "toolCallId": "e1", "success": true, "result": {} }),
+            ),
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-4.6": {
+                            "usage": {
+                                "inputTokens": 1000,
+                                "outputTokens": 353,
+                                "reasoningTokens": 341,
+                                "cacheReadTokens": 200,
+                                "cacheWriteTokens": 50
+                            }
+                        }
+                    }
+                }),
+            ),
+        ];
+
+        let body: String = events
+            .iter()
+            .map(|ev| format!("{}\n", serde_json::to_string(ev).unwrap()))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+
+        let owned = parse_copilot_events_with_diagnostics(events, ParseMode::Full).unwrap();
+        let streamed_full = super::parse_copilot_jsonl_path(&path, ParseMode::Full)
+            .unwrap()
+            .unwrap();
+        let streamed_usage = super::parse_copilot_jsonl_path(&path, ParseMode::UsageOnly)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(streamed_full.diagnostics, owned.diagnostics);
+        assert_eq!(streamed_usage.diagnostics, owned.diagnostics);
+        let o = &owned.analysis.records[0];
+        let sf = &streamed_full.analysis.records[0];
+        let su = &streamed_usage.analysis.records[0];
+        assert_eq!(
+            serde_json::to_value(sf).unwrap(),
+            serde_json::to_value(o).unwrap()
+        );
+        assert_eq!(su.total_unique_files, o.total_unique_files);
+        assert_eq!(su.total_read_lines, o.total_read_lines);
+        assert_eq!(su.total_read_characters, o.total_read_characters);
+        assert_eq!(su.total_write_lines, o.total_write_lines);
+        assert_eq!(su.total_write_characters, o.total_write_characters);
+        assert_eq!(su.total_edit_lines, o.total_edit_lines);
+        assert_eq!(su.total_edit_characters, o.total_edit_characters);
+        assert_eq!(su.conversation_usage, o.conversation_usage);
     }
 }

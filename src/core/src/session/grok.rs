@@ -1,14 +1,16 @@
 //! Grok CLI `signals.json` and sibling session-history parser.
 
-use crate::constants::FastHashMap;
+use crate::constants::{FastHashMap, buffer};
 use crate::models::{CodeAnalysis, GrokSignals, GrokSummary};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
-use crate::session::state::{ParseMode, SessionParseState};
+use crate::session::parser::trim_ascii_whitespace;
+use crate::session::state::{CountedJsonString, ParseMode, SessionParseState};
 use crate::utils::parse_iso_timestamp;
 use anyhow::{Context, Result, bail};
 use percent_encoding::percent_decode_str;
-use serde_json::{Value, json};
-use std::collections::HashMap;
+use serde::Deserialize;
+use serde_json::{Value, json, value::RawValue};
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -20,6 +22,65 @@ struct PendingToolCall {
     input: Value,
 }
 
+#[derive(Deserialize)]
+struct BorrowedGrokUpdateLine<'a> {
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default, borrow)]
+    params: Option<BorrowedGrokParams<'a>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGrokParams<'a> {
+    #[serde(default, borrow)]
+    update: Option<BorrowedGrokUpdate<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedGrokUpdate<'a> {
+    #[serde(default, borrow)]
+    session_update: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    tool_call_id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    title: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    status: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    raw_input: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    raw_output: Option<&'a RawValue>,
+    #[serde(default, borrow, rename = "_meta")]
+    meta: Option<BorrowedGrokMeta<'a>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGrokMeta<'a> {
+    #[serde(default, borrow, rename = "x.ai/tool")]
+    xai_tool: Option<BorrowedGrokToolMeta<'a>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGrokToolMeta<'a> {
+    #[serde(default, borrow)]
+    name: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGrokReadOutput<'a> {
+    #[serde(default, borrow, rename = "FileContent")]
+    file_content: Option<BorrowedGrokFileContent<'a>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGrokFileContent<'a> {
+    #[serde(default, borrow)]
+    absolute_path: Option<Cow<'a, str>>,
+    #[serde(default)]
+    content: Option<CountedJsonString>,
+}
+
 /// Returns whether a JSON value carries Grok's aggregate signals envelope.
 pub(crate) fn is_grok_signals(value: &Value) -> bool {
     value.get("primaryModelId").is_some()
@@ -27,12 +88,41 @@ pub(crate) fn is_grok_signals(value: &Value) -> bool {
         && (value.get("contextWindowTokens").is_some() || value.get("toolsUsed").is_some())
 }
 
+/// Parses a Grok `signals.json` file for a known provider, returning `Ok(None)` if empty.
+pub(crate) fn parse_grok_session_known(
+    path: &Path,
+    mode: ParseMode,
+) -> Result<Option<ParsedAnalysis>> {
+    let bytes = read_signals_bytes(path)?;
+    if trim_ascii_whitespace(&bytes).is_empty() {
+        return Ok(None);
+    }
+    parse_grok_signals_bytes(path, &bytes, mode).map(Some)
+}
+
 /// Parses a Grok `signals.json` file and its optional session-history siblings.
 pub(crate) fn parse_grok_session(path: &Path, mode: ParseMode) -> Result<ParsedAnalysis> {
-    let signals_value: Value = serde_json::from_reader(
-        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?,
-    )
-    .with_context(|| format!("Failed to parse Grok signals: {}", path.display()))?;
+    let bytes = read_signals_bytes(path)?;
+    parse_grok_signals_bytes(path, &bytes, mode)
+}
+
+fn read_signals_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(
+        file.metadata()
+            .ok()
+            .and_then(|meta| usize::try_from(meta.len()).ok())
+            .unwrap_or(512),
+    );
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("Failed to read Grok signals: {}", path.display()))?;
+    Ok(bytes)
+}
+
+fn parse_grok_signals_bytes(path: &Path, bytes: &[u8], mode: ParseMode) -> Result<ParsedAnalysis> {
+    let signals_value: Value = serde_json::from_slice(bytes)
+        .with_context(|| format!("Failed to parse Grok signals: {}", path.display()))?;
 
     if !is_grok_signals(&signals_value) {
         bail!("{} is not a recognized Grok signals file", path.display());
@@ -92,7 +182,7 @@ fn read_summary(
                 .with_context(|| format!("Failed to open Grok summary: {}", path.display()));
         }
     };
-    parse_summary_reader(file, &path, diagnostics)
+    parse_summary_reader(BufReader::new(file), &path, diagnostics)
 }
 
 fn parse_summary_reader<R: Read>(
@@ -209,94 +299,233 @@ fn parse_updates(
         }
     };
 
-    let mut calls = HashMap::<String, PendingToolCall>::new();
+    let mut calls = FastHashMap::<String, PendingToolCall>::default();
+    let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
+    let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
+    let mut line_number = 0_usize;
 
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line = match line {
-            Ok(line) => line,
+    loop {
+        line.clear();
+        line_number += 1;
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!(
                         "Failed to read Grok update line {}: {}",
-                        index + 1,
+                        line_number,
                         path.display()
                     )
                 });
             }
-        };
-        if line.trim().is_empty() {
+        }
+        let text = std::str::from_utf8(&line)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+            .with_context(|| {
+                format!(
+                    "Failed to read Grok update line {}: {}",
+                    line_number,
+                    path.display()
+                )
+            })?;
+        let bytes = trim_ascii_whitespace(text.as_bytes());
+        if bytes.is_empty() {
             continue;
         }
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => {
-                diagnostics.record_malformed();
-                continue;
-            }
-        };
-        let Some(update) = value.pointer("/params/update") else {
+        if bytes.starts_with(b"{")
+            && let Ok(parsed) = serde_json::from_slice::<BorrowedGrokUpdateLine<'_>>(bytes)
+        {
+            handle_borrowed_update(parsed, &mut calls, state, diagnostics);
             continue;
-        };
-        let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
-            continue;
-        };
-
-        match kind {
-            "tool_call" => {
-                let name = update
-                    .pointer("/_meta/x.ai~1tool/name")
-                    .and_then(Value::as_str)
-                    .or_else(|| update.get("title").and_then(Value::as_str))
-                    .unwrap_or_default()
-                    .to_string();
-                calls.insert(
-                    id.to_string(),
-                    PendingToolCall {
-                        name,
-                        input: update.get("rawInput").cloned().unwrap_or(Value::Null),
-                    },
-                );
-            }
-            "tool_call_update" => {
-                let Some(status) = update.get("status").and_then(Value::as_str) else {
-                    continue;
-                };
-                if status != "completed" && status != "failed" {
-                    continue;
-                }
-                let Some(call) = calls.remove(id) else {
-                    continue;
-                };
-                let tracked = is_tracked_tool(&call.name);
-                if !tracked && !is_known_unmodeled_tool(&call.name) {
-                    continue;
-                }
-                diagnostics.record_recognized_source();
-                if !tracked {
-                    // Recognized above to avoid schema drift, but mapped to no metric.
-                    continue;
-                }
-                if status != "completed" {
-                    diagnostics.record_relevant(true);
-                    continue;
-                }
-                let timestamp = value
-                    .get("timestamp")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default()
-                    .saturating_mul(1_000);
-                state.last_ts = state.last_ts.max(timestamp);
-                let output = update.get("rawOutput").unwrap_or(&Value::Null);
-                let normalized = apply_completed_tool(state, &call, timestamp, output);
-                diagnostics.record_relevant(normalized);
-            }
-            _ => {}
+        }
+        match serde_json::from_slice::<Value>(bytes) {
+            Ok(value) => handle_value_update(&value, &mut calls, state, diagnostics),
+            Err(_) => diagnostics.record_malformed(),
         }
     }
     Ok(())
+}
+
+fn handle_borrowed_update(
+    parsed: BorrowedGrokUpdateLine<'_>,
+    calls: &mut FastHashMap<String, PendingToolCall>,
+    state: &mut SessionParseState,
+    diagnostics: &mut ParseDiagnostics,
+) {
+    let Some(update) = parsed.params.and_then(|params| params.update) else {
+        return;
+    };
+    let Some(kind) = update.session_update.as_deref() else {
+        return;
+    };
+    let Some(id) = update.tool_call_id.as_deref() else {
+        return;
+    };
+
+    match kind {
+        "tool_call" => {
+            let name = update
+                .meta
+                .and_then(|meta| meta.xai_tool)
+                .and_then(|tool| tool.name)
+                .or(update.title)
+                .unwrap_or(Cow::Borrowed(""));
+            let input = if is_tracked_tool(name.as_ref()) {
+                update
+                    .raw_input
+                    .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok())
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            calls.insert(
+                id.to_string(),
+                PendingToolCall {
+                    name: name.into_owned(),
+                    input,
+                },
+            );
+        }
+        "tool_call_update" => {
+            let Some(status) = update.status.as_deref() else {
+                return;
+            };
+            if status != "completed" && status != "failed" {
+                return;
+            }
+            let Some(call) = calls.remove(id) else {
+                return;
+            };
+            let tracked = is_tracked_tool(&call.name);
+            if !tracked && !is_known_unmodeled_tool(&call.name) {
+                return;
+            }
+            diagnostics.record_recognized_source();
+            if !tracked {
+                // Recognized above to avoid schema drift, but mapped to no metric.
+                return;
+            }
+            if status != "completed" {
+                diagnostics.record_relevant(true);
+                return;
+            }
+            let timestamp = parsed.timestamp.unwrap_or_default().saturating_mul(1_000);
+            state.last_ts = state.last_ts.max(timestamp);
+
+            // Count `read_file` bodies directly from raw JSON in `UsageOnly` without allocating the file text.
+            if matches!(state.mode, ParseMode::UsageOnly)
+                && call.name == "read_file"
+                && let Some(raw_output) = update.raw_output
+                && raw_output.get().starts_with('{')
+                && let Ok(read_out) =
+                    serde_json::from_str::<BorrowedGrokReadOutput<'_>>(raw_output.get())
+            {
+                let path = read_out
+                    .file_content
+                    .as_ref()
+                    .and_then(|fc| fc.absolute_path.as_deref())
+                    .or_else(|| call.input.get("target_file").and_then(Value::as_str))
+                    .filter(|path| !path.is_empty());
+                let normalized = match path {
+                    Some(path) => {
+                        let metrics = read_out
+                            .file_content
+                            .as_ref()
+                            .and_then(|fc| fc.content)
+                            .map(|c| c.0)
+                            .unwrap_or_default();
+                        if metrics.is_empty() {
+                            state.tool_counts.read += 1;
+                            state.add_non_text_read_path(path);
+                        } else {
+                            state.add_read_counts(path, metrics.lines, metrics.chars);
+                        }
+                        true
+                    }
+                    None => false,
+                };
+                diagnostics.record_relevant(normalized);
+                return;
+            }
+
+            let output = update
+                .raw_output
+                .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok())
+                .unwrap_or(Value::Null);
+            let normalized = apply_completed_tool(state, &call, timestamp, &output);
+            diagnostics.record_relevant(normalized);
+        }
+        _ => {}
+    }
+}
+
+fn handle_value_update(
+    value: &Value,
+    calls: &mut FastHashMap<String, PendingToolCall>,
+    state: &mut SessionParseState,
+    diagnostics: &mut ParseDiagnostics,
+) {
+    let Some(update) = value.pointer("/params/update") else {
+        return;
+    };
+    let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+        return;
+    };
+
+    match kind {
+        "tool_call" => {
+            let name = update
+                .pointer("/_meta/x.ai~1tool/name")
+                .and_then(Value::as_str)
+                .or_else(|| update.get("title").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            calls.insert(
+                id.to_string(),
+                PendingToolCall {
+                    name,
+                    input: update.get("rawInput").cloned().unwrap_or(Value::Null),
+                },
+            );
+        }
+        "tool_call_update" => {
+            let Some(status) = update.get("status").and_then(Value::as_str) else {
+                return;
+            };
+            if status != "completed" && status != "failed" {
+                return;
+            }
+            let Some(call) = calls.remove(id) else {
+                return;
+            };
+            let tracked = is_tracked_tool(&call.name);
+            if !tracked && !is_known_unmodeled_tool(&call.name) {
+                return;
+            }
+            diagnostics.record_recognized_source();
+            if !tracked {
+                return;
+            }
+            if status != "completed" {
+                diagnostics.record_relevant(true);
+                return;
+            }
+            let timestamp = value
+                .get("timestamp")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                .saturating_mul(1_000);
+            state.last_ts = state.last_ts.max(timestamp);
+            let output = update.get("rawOutput").unwrap_or(&Value::Null);
+            let normalized = apply_completed_tool(state, &call, timestamp, output);
+            diagnostics.record_relevant(normalized);
+        }
+        _ => {}
+    }
 }
 
 fn is_tracked_tool(name: &str) -> bool {
@@ -673,5 +902,36 @@ mod tests {
 
         assert_eq!(state.task_id, "session-id");
         assert_eq!(state.folder_path, expected.to_string_lossy());
+    }
+
+    #[test]
+    fn known_grok_empty_signals_returns_none_and_usage_only_matches_full() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty = temp.path().join("signals.json");
+        std::fs::write(&empty, "  \n").unwrap();
+        assert!(
+            parse_grok_session_known(&empty, ParseMode::UsageOnly)
+                .unwrap()
+                .is_none()
+        );
+
+        let fixture = vct_test_support::fixture("sessions/grok/signals.json");
+        let full = parse_grok_session_known(&fixture, ParseMode::Full)
+            .unwrap()
+            .unwrap();
+        let usage_only = parse_grok_session_known(&fixture, ParseMode::UsageOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage_only.diagnostics, full.diagnostics);
+        let f = &full.analysis.records[0];
+        let u = &usage_only.analysis.records[0];
+        assert_eq!(u.total_unique_files, f.total_unique_files);
+        assert_eq!(u.total_read_lines, f.total_read_lines);
+        assert_eq!(u.total_read_characters, f.total_read_characters);
+        assert_eq!(u.total_write_lines, f.total_write_lines);
+        assert_eq!(u.total_write_characters, f.total_write_characters);
+        assert_eq!(u.total_edit_lines, f.total_edit_lines);
+        assert_eq!(u.total_edit_characters, f.total_edit_characters);
+        assert_eq!(u.conversation_usage, f.conversation_usage);
     }
 }
