@@ -146,13 +146,13 @@ impl SessionLedger {
                 .iter()
                 .filter_map(move |remote| remote.books.get(&provider))
         };
-        // Remote snapshots key sessions by export key, so hash local keys only when non-empty remote books exist.
-        let local: FastHashSet<String> = if books().any(|book| !book.sessions.is_empty()) {
+        // Remote snapshots key sessions by 128-bit FNV-1a export key, so hash local keys into raw u128s only when non-empty remote books exist.
+        let local: FastHashSet<u128> = if books().any(|book| !book.sessions.is_empty()) {
             self.providers
                 .get(&provider)
                 .into_iter()
                 .flat_map(|book| book.sessions.keys())
-                .map(|key| export_key(key))
+                .map(|key| export_key_hash(key))
                 .collect()
         } else {
             FastHashSet::default()
@@ -160,7 +160,10 @@ impl SessionLedger {
         let mut seen: FastHashSet<&str> = FastHashSet::default();
         books()
             .flat_map(|book| &book.sessions)
-            .filter(move |(key, _)| !local.contains(*key) && seen.insert(key.as_str()))
+            .filter(move |(key, _)| {
+                !parse_export_key(key).is_some_and(|hash| local.contains(&hash))
+                    && seen.insert(key.as_str())
+            })
             .map(|(_, entry)| entry)
     }
 
@@ -197,16 +200,39 @@ impl RemoteSnapshot {
     }
 }
 
+/// Returns the raw 128-bit FNV-1a hash of `key` used for export-key deduplication.
+///
+/// Must remain stable: changing the hash breaks deduplication against existing stored snapshots.
+fn export_key_hash(key: &str) -> u128 {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    key.bytes().fold(OFFSET, |hash, byte| {
+        (hash ^ u128::from(byte)).wrapping_mul(PRIME)
+    })
+}
+
 /// Returns the 128-bit FNV-1a hex hash of `key` used in exports.
 ///
 /// Must remain stable: changing the hash breaks deduplication against existing stored snapshots.
 fn export_key(key: &str) -> String {
-    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
-    let hash = key.bytes().fold(OFFSET, |hash, byte| {
-        (hash ^ u128::from(byte)).wrapping_mul(PRIME)
-    });
-    format!("{hash:032x}")
+    format!("{:032x}", export_key_hash(key))
+}
+
+/// Parses a 32-character lowercase hexadecimal export key produced by [`export_key`].
+fn parse_export_key(key: &str) -> Option<u128> {
+    if key.len() != 32 {
+        return None;
+    }
+    let mut hash = 0u128;
+    for byte in key.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => return None,
+        };
+        hash = (hash << 4) | u128::from(digit);
+    }
+    Some(hash)
 }
 
 fn read_snapshot(path: &Path) -> FastHashMap<String, SessionEntry> {
@@ -271,7 +297,15 @@ pub fn store_export(cache_dir: &Path, name: &str, output: &str) -> Result<()> {
             );
             continue;
         }
-        write_string_atomic(provider_path(&dir, provider), file.get())?;
+        let path = provider_path(&dir, provider);
+        let payload = file.get();
+        let unchanged = std::fs::metadata(&path)
+            .is_ok_and(|metadata| metadata.len() == payload.len() as u64)
+            && std::fs::read(&path).is_ok_and(|existing| existing == payload.as_bytes());
+        if unchanged {
+            continue;
+        }
+        write_string_atomic(path, payload)?;
     }
     Ok(())
 }
@@ -307,5 +341,46 @@ mod tests {
     fn export_keys_are_the_published_fnv1a_128_values() {
         assert_eq!(export_key(""), "6c62272e07bb014262b821756295c58d");
         assert_eq!(export_key("a"), "d228cb696f1a8caf78912b704e4a8964");
+        assert_eq!(parse_export_key(&export_key("")), Some(export_key_hash("")));
+        assert_eq!(
+            parse_export_key(&export_key("proj/session.jsonl")),
+            Some(export_key_hash("proj/session.jsonl"))
+        );
+        assert_eq!(parse_export_key("short"), None);
+        assert_eq!(parse_export_key("6C62272E07BB014262B821756295C58D"), None);
+    }
+
+    #[test]
+    fn store_export_skips_rewriting_unchanged_provider_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = r#"{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider":"claude","sessions":{}}}}"#;
+        store_export(dir.path(), "devbox", payload).unwrap();
+
+        let path = provider_path(
+            &remote_dir(dir.path(), "devbox").join(LEDGER_DIR_NAME),
+            ExtensionType::ClaudeCode,
+        );
+        let earlier = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+
+        store_export(dir.path(), "devbox", payload).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            earlier,
+            "unchanged snapshot file must not be rewritten"
+        );
+
+        let updated = r#"{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider":"claude","sessions":{"d228cb696f1a8caf78912b704e4a8964":{"days":{}}}}}}"#;
+        store_export(dir.path(), "devbox", updated).unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            earlier,
+            "changed snapshot payload must replace the file"
+        );
     }
 }
