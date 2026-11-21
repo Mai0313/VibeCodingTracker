@@ -30,7 +30,6 @@ log = { workspace = true }
 lru = { workspace = true }
 percent-encoding = { workspace = true }
 rayon = { workspace = true }
-regex = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
 schemars = { workspace = true }

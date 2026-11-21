@@ -3842,7 +3842,6 @@ dependencies = [
  "lru 0.19.0",
  "percent-encoding",
  "rayon",
- "regex",
  "reqwest",
  "rusqlite",
  "schemars",
