@@ -223,7 +223,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             .get("total_token_usage")
             .and_then(|v| v.as_object())
         {
-            // OpenAI/Codex `input_tokens` includes `cached_input_tokens`; subtract cached reads so LiteLLM does not bill them twice.
+            // OpenAI/Codex `input_tokens` includes `cached_input_tokens` and `cache_write_input_tokens`; subtract both so LiteLLM bills each bucket once.
             let raw_input = total_usage
                 .get("input_tokens")
                 .and_then(|v| v.as_i64())
@@ -232,8 +232,15 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 .get("cached_input_tokens")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            counts.input_tokens = (raw_input - cached).max(0);
+            let cache_write = total_usage
+                .get("cache_write_input_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            counts.input_tokens = (raw_input - cached - cache_write).max(0);
             counts.cache_read = cached;
+            counts.cache_creation = cache_write;
+            counts.cache_creation_5m = cache_write;
+            counts.cache_creation_1h = 0;
 
             if let Some(output) = total_usage.get("output_tokens").and_then(|v| v.as_i64()) {
                 counts.output_tokens = output;
@@ -614,6 +621,44 @@ mod tests {
             }
         });
         assert!(extract_token_counts(&usage).above_tiers.is_empty());
+    }
+
+    #[test]
+    fn codex_cache_write_is_subtracted_from_input_and_populates_5m_bucket() {
+        let usage = json!({
+            "total_token_usage": {
+                "input_tokens": 50_000,
+                "cached_input_tokens": 30_000,
+                "cache_write_input_tokens": 12_000,
+                "output_tokens": 1_500,
+                "reasoning_output_tokens": 500,
+                "total_tokens": 51_500
+            }
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.input_tokens, 8_000);
+        assert_eq!(c.cache_read, 30_000);
+        assert_eq!(c.cache_creation, 12_000);
+        assert_eq!(c.cache_creation_5m, 12_000);
+        assert_eq!(c.cache_creation_1h, 0);
+        assert_eq!(c.output_tokens, 1_000);
+        assert_eq!(c.reasoning_tokens, 500);
+        assert_eq!(c.total, 51_500);
+
+        let clamped = json!({
+            "total_token_usage": {
+                "input_tokens": 1_000,
+                "cached_input_tokens": 700,
+                "cache_write_input_tokens": 600,
+                "output_tokens": 100
+            }
+        });
+        let c = extract_token_counts(&clamped);
+        assert_eq!(c.input_tokens, 0);
+        assert_eq!(c.cache_read, 700);
+        assert_eq!(c.cache_creation, 600);
+        assert_eq!(c.cache_creation_5m, 600);
+        assert_eq!(c.total, 1_400);
     }
 
     #[test]

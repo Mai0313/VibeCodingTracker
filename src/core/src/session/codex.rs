@@ -264,6 +264,7 @@ struct BorrowedExecCommandArgs<'a> {
 struct CodexTokenFields {
     input_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     reasoning_output_tokens: Option<i64>,
     total_tokens: Option<i64>,
@@ -277,6 +278,9 @@ impl CodexTokenFields {
             cached_input_tokens: self
                 .cached_input_tokens
                 .unwrap_or(carried.cached_input_tokens),
+            cache_write_input_tokens: self
+                .cache_write_input_tokens
+                .unwrap_or(carried.cache_write_input_tokens),
             output_tokens: self.output_tokens.unwrap_or(carried.output_tokens),
             reasoning_output_tokens: self
                 .reasoning_output_tokens
@@ -313,6 +317,7 @@ enum ParsedTokenCount<'a> {
 struct CodexModelUsage {
     input_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     reasoning_output_tokens: Option<i64>,
     total_tokens: Option<i64>,
@@ -352,12 +357,15 @@ impl CodexModelUsage {
     }
 
     fn into_value(self) -> Value {
-        let mut total_map = serde_json::Map::with_capacity(5);
+        let mut total_map = serde_json::Map::with_capacity(6);
         if let Some(v) = self.input_tokens {
             total_map.insert("input_tokens".to_string(), v.into());
         }
         if let Some(v) = self.cached_input_tokens {
             total_map.insert("cached_input_tokens".to_string(), v.into());
+        }
+        if let Some(v) = self.cache_write_input_tokens {
+            total_map.insert("cache_write_input_tokens".to_string(), v.into());
         }
         if let Some(v) = self.output_tokens {
             total_map.insert("output_tokens".to_string(), v.into());
@@ -545,6 +553,13 @@ impl<'a> CodexFold<'a> {
                                                         .max(0)
                                                 },
                                             ),
+                                            cache_write_input_tokens: fields
+                                                .cache_write_input_tokens
+                                                .map(|_| {
+                                                    (current.cache_write_input_tokens
+                                                        - base.cache_write_input_tokens)
+                                                        .max(0)
+                                                }),
                                             output_tokens: fields.output_tokens.map(|_| {
                                                 (current.output_tokens - base.output_tokens).max(0)
                                             }),
@@ -585,6 +600,10 @@ impl<'a> CodexFold<'a> {
                                         &mut usage.cached_input_tokens,
                                         delta.cached_input_tokens,
                                     );
+                                    add_opt_i64(
+                                        &mut usage.cache_write_input_tokens,
+                                        delta.cache_write_input_tokens,
+                                    );
                                     add_opt_i64(&mut usage.output_tokens, delta.output_tokens);
                                     add_opt_i64(
                                         &mut usage.reasoning_output_tokens,
@@ -593,19 +612,22 @@ impl<'a> CodexFold<'a> {
                                     add_opt_i64(&mut usage.total_tokens, delta.total_tokens);
                                     if level > 0 {
                                         let cached = delta.cached_input_tokens.unwrap_or(0);
+                                        let cache_write =
+                                            delta.cache_write_input_tokens.unwrap_or(0);
                                         let reasoning = delta.reasoning_output_tokens.unwrap_or(0);
                                         usage.add_tier_slice(
                                             level,
                                             TierSlice {
                                                 input_tokens: (delta.input_tokens.unwrap_or(0)
-                                                    - cached)
+                                                    - cached
+                                                    - cache_write)
                                                     .max(0),
                                                 output_tokens: (delta.output_tokens.unwrap_or(0)
                                                     - reasoning)
                                                     .max(0),
                                                 reasoning_tokens: reasoning,
                                                 cache_read: cached,
-                                                cache_creation_5m: 0,
+                                                cache_creation_5m: cache_write,
                                                 cache_creation_1h: 0,
                                             },
                                         );
@@ -826,6 +848,10 @@ fn parse_token_fields_value(usage: &Value) -> Option<CodexTokenFields> {
     };
     if !read_key("input_tokens", &mut fields.input_tokens)
         || !read_key("cached_input_tokens", &mut fields.cached_input_tokens)
+        || !read_key(
+            "cache_write_input_tokens",
+            &mut fields.cache_write_input_tokens,
+        )
         || !read_key("output_tokens", &mut fields.output_tokens)
         || !read_key(
             "reasoning_output_tokens",
@@ -864,6 +890,8 @@ struct BorrowedTokenFields<'a> {
     input_tokens: Option<&'a RawValue>,
     #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
     cached_input_tokens: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    cache_write_input_tokens: Option<&'a RawValue>,
     #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
     output_tokens: Option<&'a RawValue>,
     #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
@@ -949,6 +977,10 @@ fn parse_token_fields_raw(raw: &str) -> Option<CodexTokenFields> {
         || !parse_field(
             borrowed.cached_input_tokens,
             &mut fields.cached_input_tokens,
+        )
+        || !parse_field(
+            borrowed.cache_write_input_tokens,
+            &mut fields.cache_write_input_tokens,
         )
         || !parse_field(borrowed.output_tokens, &mut fields.output_tokens)
         || !parse_field(
@@ -2724,5 +2756,125 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(rejected_parsed.diagnostics.is_complete_failure());
+    }
+
+    #[test]
+    fn cache_write_input_tokens_match_between_value_and_streamed_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache-write.jsonl");
+        let raw_lines = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-6-astra" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100_000,
+                            "cached_input_tokens": 40_000,
+                            "cache_write_input_tokens": 20_000,
+                            "output_tokens": 2_000,
+                            "reasoning_output_tokens": 500,
+                            "total_tokens": 102_000
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 100_000,
+                            "cached_input_tokens": 40_000,
+                            "cache_write_input_tokens": 20_000,
+                            "output_tokens": 2_000,
+                            "reasoning_output_tokens": 500,
+                            "total_tokens": 102_000
+                        },
+                        "model_context_window": 400_000
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 400_000,
+                            "cached_input_tokens": 240_000,
+                            "cache_write_input_tokens": 70_000,
+                            "output_tokens": 5_000,
+                            "reasoning_output_tokens": 1_500,
+                            "total_tokens": 405_000
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 300_000,
+                            "cached_input_tokens": 200_000,
+                            "cache_write_input_tokens": 50_000,
+                            "output_tokens": 3_000,
+                            "reasoning_output_tokens": 1_000,
+                            "total_tokens": 303_000
+                        },
+                        "model_context_window": 400_000
+                    }
+                }
+            }),
+        ];
+        let body: String = raw_lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let logs: Vec<CodexLog> = raw_lines
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let tiers = crate::pricing::TierThresholds::from_entries(
+            [("gpt-6-astra", vec![272_000])].into_iter(),
+        );
+
+        let value_parsed =
+            parse_codex_log_iter_with_diagnostics(&logs, ParseMode::UsageOnly, Some(&tiers))
+                .unwrap();
+        let streamed_parsed = parse_codex_jsonl_path(&path, ParseMode::UsageOnly, Some(&tiers))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(value_parsed.diagnostics, streamed_parsed.diagnostics);
+        assert_eq!(value_parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(
+            value_parsed.analysis.records[0].conversation_usage,
+            streamed_parsed.analysis.records[0].conversation_usage
+        );
+
+        let usage = &streamed_parsed.analysis.records[0].conversation_usage["gpt-6-astra"];
+        assert_eq!(
+            usage["total_token_usage"]["cache_write_input_tokens"],
+            70_000
+        );
+        assert_eq!(usage["above_tier"]["level_1_input_tokens"], 50_000);
+        assert_eq!(usage["above_tier"]["level_1_cache_read_tokens"], 200_000);
+        assert_eq!(
+            usage["above_tier"]["level_1_cache_creation_5m_tokens"],
+            50_000
+        );
+        assert_eq!(usage["above_tier"]["level_1_output_tokens"], 2_000);
+        assert_eq!(usage["above_tier"]["level_1_reasoning_tokens"], 1_000);
+
+        let valid_only_cw = serde_json::json!({
+            "total_token_usage": { "cache_write_input_tokens": 12 }
+        });
+        assert!(is_supported_codex_usage(&valid_only_cw));
+        assert!(matches!(
+            parse_token_count_raw(&valid_only_cw.to_string()),
+            ParsedTokenCount::Valid { .. }
+        ));
+        let invalid_cw = serde_json::json!({
+            "total_token_usage": { "cache_write_input_tokens": "bad" }
+        });
+        assert!(!is_supported_codex_usage(&invalid_cw));
+        assert!(matches!(
+            parse_token_count_raw(&invalid_cw.to_string()),
+            ParsedTokenCount::Invalid
+        ));
     }
 }
