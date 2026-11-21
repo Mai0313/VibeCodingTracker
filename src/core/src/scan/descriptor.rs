@@ -20,13 +20,13 @@ use crate::utils::{
 };
 use anyhow::Result;
 use rayon::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Scan roots, file filter, depth cap, and config toggle for one file-backed provider.
 struct FileProviderSpec {
     provider: ExtensionType,
     enabled: fn(&ProvidersConfig) -> bool,
-    dirs: fn(&HelperPaths) -> Vec<&Path>,
+    dirs: fn(&HelperPaths) -> Vec<PathBuf>,
     filter: fn(&Path) -> bool,
     max_depth: Option<usize>,
 }
@@ -36,49 +36,54 @@ const FILE_PROVIDERS: [FileProviderSpec; 7] = [
     FileProviderSpec {
         provider: ExtensionType::ClaudeCode,
         enabled: |p| p.claude,
-        dirs: |p| vec![p.claude_session_dir.as_path()],
+        dirs: |p| vec![p.claude_session_dir.clone()],
         filter: is_claude_session_file,
         max_depth: None,
     },
     FileProviderSpec {
         provider: ExtensionType::Codex,
         enabled: |p| p.codex,
-        dirs: |p| p.codex_session_dirs().to_vec(),
+        dirs: |p| {
+            p.codex_session_dirs()
+                .into_iter()
+                .map(Path::to_path_buf)
+                .collect()
+        },
         filter: is_codex_session_file,
         max_depth: None,
     },
     FileProviderSpec {
         provider: ExtensionType::Copilot,
         enabled: |p| p.copilot,
-        dirs: |p| vec![p.copilot_session_dir.as_path()],
+        dirs: |p| vec![p.copilot_session_dir.clone()],
         filter: is_copilot_session_file,
         max_depth: Some(COPILOT_SESSION_MAX_DEPTH),
     },
     FileProviderSpec {
         provider: ExtensionType::Gemini,
         enabled: |p| p.gemini,
-        dirs: |p| vec![p.gemini_session_dir.as_path()],
+        dirs: |p| vec![p.gemini_session_dir.clone()],
         filter: is_gemini_session_file,
         max_depth: None,
     },
     FileProviderSpec {
         provider: ExtensionType::Grok,
         enabled: |p| p.grok,
-        dirs: |p| vec![p.grok_session_dir.as_path()],
+        dirs: |p| vec![p.grok_session_dir.clone()],
         filter: is_grok_session_file,
         max_depth: Some(GROK_SESSION_MAX_DEPTH),
     },
     FileProviderSpec {
         provider: ExtensionType::DeepSeek,
         enabled: |p| p.dsh,
-        dirs: |p| vec![p.dsh_session_dir.as_path()],
+        dirs: |p| vec![p.dsh_session_dir.clone()],
         filter: is_dsh_session_file,
         max_depth: Some(DSH_SESSION_MAX_DEPTH),
     },
     FileProviderSpec {
         provider: ExtensionType::Antigravity,
         enabled: |p| p.antigravity,
-        dirs: |p| p.antigravity_session_dirs().to_vec(),
+        dirs: HelperPaths::antigravity_session_dirs,
         filter: is_antigravity_session_file,
         max_depth: Some(ANTIGRAVITY_SESSION_MAX_DEPTH),
     },
@@ -137,8 +142,10 @@ fn scan_all_cached_files_target(
         enabled
             .into_par_iter()
             .map(|(spec, book)| {
+                let dirs = (spec.dirs)(paths);
+                let dir_refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
                 scan_provider_files(
-                    &(spec.dirs)(paths),
+                    &dir_refs,
                     spec.provider,
                     spec.filter,
                     spec.max_depth,
@@ -154,8 +161,10 @@ fn scan_all_cached_files_target(
         enabled
             .into_iter()
             .map(|(spec, book)| {
+                let dirs = (spec.dirs)(paths);
+                let dir_refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
                 scan_provider_files(
-                    &(spec.dirs)(paths),
+                    &dir_refs,
                     spec.provider,
                     spec.filter,
                     spec.max_depth,
