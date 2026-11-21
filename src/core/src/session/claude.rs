@@ -1469,7 +1469,6 @@ impl<'a> ClaudeFold<'a> {
                     PendingToolInput::UsageOnly(UsageOnlyPendingInput {
                         file_path: inp.file_path.map(Cow::into_owned),
                         content: inp.content.map(|c| c.0),
-                        old_is_empty: inp.old_string.map(|c| c.0.is_empty()),
                         new_metrics: inp.new_string.map(|c| c.0),
                     })
                 })
@@ -1652,15 +1651,9 @@ impl<'a> ClaudeFold<'a> {
                     });
                 }
                 PendingToolKind::Edit => {
-                    let old_is_empty = input.old_is_empty.unwrap_or(true);
                     let metrics = input.new_metrics.unwrap_or_default();
                     preserve_file_tool_counts(&mut self.state, |state| {
-                        state.add_edit_counts(
-                            file_path,
-                            old_is_empty,
-                            metrics.lines,
-                            metrics.chars,
-                        );
+                        state.add_edit_counts_raw(file_path, metrics.lines, metrics.chars);
                     });
                 }
                 PendingToolKind::Other => {}
@@ -2287,7 +2280,6 @@ impl PendingToolKind {
 struct UsageOnlyPendingInput {
     file_path: Option<String>,
     content: Option<TextMetrics>,
-    old_is_empty: Option<bool>,
     new_metrics: Option<TextMetrics>,
 }
 
@@ -2586,7 +2578,8 @@ fn dispatch_top_level_tool_result(
             let old_string = result.old_string.as_deref().expect("validated old string");
             let new_string = result.new_string.as_deref().expect("validated new string");
             preserve_file_tool_counts(state, |state| {
-                state.add_edit_detail(file_path, old_string, new_string, ts);
+                // Keep empty `old_string` edits under edit metrics to match `tool_counts.edit`.
+                state.add_edit_detail_raw(file_path, old_string, new_string, ts);
             });
         }
     }
@@ -2615,19 +2608,9 @@ fn dispatch_top_level_tool_result_usage_only(
         }
         FileToolResultKind::Edit => {
             let file_path = result.file_path.as_deref().expect("validated edit path");
-            let old_is_empty = result
-                .old_string
-                .expect("validated old string")
-                .0
-                .is_empty();
             let new_metrics = result.new_string.expect("validated new string").0;
             preserve_file_tool_counts(state, |state| {
-                state.add_edit_counts(
-                    file_path,
-                    old_is_empty,
-                    new_metrics.lines,
-                    new_metrics.chars,
-                );
+                state.add_edit_counts_raw(file_path, new_metrics.lines, new_metrics.chars);
             });
         }
     }
@@ -2661,7 +2644,7 @@ fn dispatch_subagent_tool_result(
             let new_string = input.new_string.as_deref().unwrap_or("");
             let old_string = input.old_string.as_deref().unwrap_or("");
             preserve_file_tool_counts(state, |state| {
-                state.add_edit_detail(file_path, old_string, new_string, ts);
+                state.add_edit_detail_raw(file_path, old_string, new_string, ts);
             });
         }
         PendingToolKind::Other => {}
@@ -3628,4 +3611,97 @@ mod tests {
         assert!(u.read_file_details.is_empty());
         assert!(u.edit_file_details.is_empty());
     }
+
+    #[test]
+    fn edit_with_empty_old_string_stays_under_edit_metrics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("empty_old_edit.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "assistant",
+                "sessionId": "s-edit",
+                "cwd": "/workspace",
+                "timestamp": "2026-07-12T00:00:01Z",
+                "message": {
+                    "id": "msg-1",
+                    "model": "claude-opus-4-8",
+                    "usage": { "input_tokens": 10, "output_tokens": 5 },
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "e1",
+                            "name": "Edit",
+                            "input": { "file_path": "/workspace/a.rs", "old_string": "", "new_string": "line1\nline2\n" }
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "e2",
+                            "name": "Edit",
+                            "input": { "file_path": "/workspace/a.rs", "old_string": "\n", "new_string": "line3" }
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "se1",
+                            "name": "Edit",
+                            "input": { "file_path": "/workspace/b.rs", "old_string": "", "new_string": "sub1\nsub2\n" }
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "s-edit",
+                "timestamp": "2026-07-12T00:00:02Z",
+                "toolUseResult": { "filePath": "/workspace/a.rs", "oldString": "", "newString": "line1\nline2\n" },
+                "message": { "content": [{ "type": "tool_result", "tool_use_id": "e1", "content": "ok" }] }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "s-edit",
+                "timestamp": "2026-07-12T00:00:03Z",
+                "toolUseResult": { "filePath": "/workspace/a.rs", "oldString": "\n", "newString": "line3" },
+                "message": { "content": [{ "type": "tool_result", "tool_use_id": "e2", "content": "ok" }] }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "s-edit",
+                "isSidechain": true,
+                "timestamp": "2026-07-12T00:00:04Z",
+                "message": { "content": [{ "type": "tool_result", "tool_use_id": "se1", "content": "ok" }] }
+            }),
+        ];
+        let body: String = lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let owned_logs: Vec<ClaudeCodeLog> = lines
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let expected_chars =
+            "line1\nline2".chars().count() + "line3".chars().count() + "sub1\nsub2".chars().count();
+
+        for mode in [ParseMode::Full, ParseMode::UsageOnly] {
+            let streamed = parse_claude_jsonl_path(&path, mode, None).unwrap().unwrap();
+            let owned = parse_claude_logs_with_diagnostics(owned_logs.clone(), mode, None).unwrap();
+
+            for parsed in [&streamed, &owned] {
+                assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+                let rec = &parsed.analysis.records[0];
+                assert_eq!(rec.tool_call_counts.edit, 3);
+                assert_eq!(rec.tool_call_counts.write, 0);
+                assert_eq!(rec.total_edit_lines, 5);
+                assert_eq!(rec.total_edit_characters, expected_chars);
+                assert_eq!(rec.total_write_lines, 0);
+                assert_eq!(rec.total_write_characters, 0);
+                assert_eq!(rec.total_unique_files, 2);
+                assert!(rec.write_file_details.is_empty());
+                if matches!(mode, ParseMode::Full) {
+                    assert_eq!(rec.edit_file_details.len(), 3);
+                } else {
+                    assert!(rec.edit_file_details.is_empty());
+                }
+            }
+        }
+    }
+
 }
