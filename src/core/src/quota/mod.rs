@@ -27,7 +27,7 @@ pub use copilot::{COPILOT_LOGIN_HINT, CopilotState};
 pub use cursor::{CURSOR_LOGIN_HINT, CursorState};
 pub use grok::{GROK_LOGIN_HINT, GrokState};
 pub use http::enable_cli_version_detection;
-pub use provider::{QuotaOutcome, QuotaSnapshot, spawn_quota_worker};
+pub use provider::{QuotaOutcome, QuotaShutdown, QuotaSnapshot, spawn_quota_worker};
 
 use crate::models::{CodexQuotaSnapshot, QuotaWindow};
 use crate::quota::refresh::{RefreshCooldown, file_mtime};
@@ -84,8 +84,8 @@ enum CodexFetch {
 /// Refresh is reactive: the current access token is used until an endpoint returns HTTP 401, then refreshed and retried once.
 #[derive(Default)]
 pub struct CodexState {
-    /// Cached `(access_token, auth_mtime)`; invalidated when `auth.json` changes on disk.
-    token: Option<(String, Option<SystemTime>)>,
+    /// Cached `(access_token, account_id, auth_mtime)`; invalidated when `auth.json` changes on disk.
+    token: Option<(String, Option<String>, Option<SystemTime>)>,
     cooldown: RefreshCooldown,
     /// Independent backoff for HTTP 401 responses from the optional reset-credit details endpoint.
     reset_credits_cooldown: RefreshCooldown,
@@ -144,28 +144,55 @@ impl CodexState {
         reset_credits_url: &str,
         token_url: &str,
     ) -> CodexFetch {
-        let body = match std::fs::read_to_string(auth) {
-            Ok(b) => b,
-            Err(e) => {
-                log::warn!("codex quota: failed to read {}: {e}", auth.display());
-                return CodexFetch::Transient;
-            }
-        };
-        let (file_token, account_id) = match wham::parse_auth(&body) {
-            Ok(x) => x,
-            Err(e) => {
-                log::warn!("codex quota: failed to parse auth.json: {e}");
-                return CodexFetch::Transient;
-            }
-        };
         let cur_mtime = file_mtime(auth);
-        // Reuse the cached token only while `auth.json` is unchanged; a re-login or account switch rewrites the file.
-        let token = match &self.token {
-            Some((t, m)) if *m == cur_mtime => t.clone(),
-            _ => file_token,
+        // Reuse the cached token and account id while `auth.json` is unchanged; a re-login or account switch rewrites the file.
+        let (token, account_id, using_cached_token) = match &self.token {
+            Some((t, acct, m)) if cur_mtime.is_some() && *m == cur_mtime => {
+                (t.clone(), acct.clone(), true)
+            }
+            _ => {
+                let body = match std::fs::read_to_string(auth) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::warn!("codex quota: failed to read {}: {e}", auth.display());
+                        return CodexFetch::Transient;
+                    }
+                };
+                let (file_token, acct) = match wham::parse_auth(&body) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        log::warn!("codex quota: failed to parse auth.json: {e}");
+                        return CodexFetch::Transient;
+                    }
+                };
+                (file_token, acct, false)
+            }
         };
 
-        match wham::call_wham(client, &token, account_id.as_deref(), now, wham_url) {
+        // On steady-state polls with a verified cached token, issue both read endpoints concurrently to shave one RTT.
+        let (wham_result, prefetched_reset_credits) = if using_cached_token {
+            std::thread::scope(|scope| {
+                let reset_handle = scope.spawn(|| {
+                    wham::call_reset_credit_details(
+                        client,
+                        &token,
+                        account_id.as_deref(),
+                        reset_credits_url,
+                    )
+                });
+                let wham_res =
+                    wham::call_wham(client, &token, account_id.as_deref(), now, wham_url);
+                let reset_res = reset_handle.join().unwrap_or(ResetCreditsResult::Transient);
+                (wham_res, Some(reset_res))
+            })
+        } else {
+            (
+                wham::call_wham(client, &token, account_id.as_deref(), now, wham_url),
+                None,
+            )
+        };
+
+        match wham_result {
             WhamResult::Ok(snap) => self.finish_with_reset_credits(
                 client,
                 auth,
@@ -177,6 +204,7 @@ impl CodexState {
                 reset_credits_url,
                 token_url,
                 true,
+                prefetched_reset_credits,
             ),
             WhamResult::Unauthorized => {
                 if self.cooldown.active(now, cur_mtime) {
@@ -188,7 +216,7 @@ impl CodexState {
                         self.cooldown.clear();
                         // Key cache and cooldown on the post-refresh mtime because the refresh just rewrote `auth.json`.
                         let post_mtime = file_mtime(auth);
-                        self.token = Some((new_tok.clone(), post_mtime));
+                        self.token = Some((new_tok.clone(), account_id.clone(), post_mtime));
                         match wham::call_wham(
                             client,
                             &new_tok,
@@ -207,6 +235,7 @@ impl CodexState {
                                 reset_credits_url,
                                 token_url,
                                 false,
+                                None,
                             ),
                             // Keep the fresh token and fall back to session logs on a transient retry error; only HTTP 401 requires login.
                             WhamResult::Transient => CodexFetch::Transient,
@@ -243,11 +272,15 @@ impl CodexState {
         reset_credits_url: &str,
         token_url: &str,
         refresh_on_unauthorized: bool,
+        prefetched: Option<ResetCreditsResult>,
     ) -> CodexFetch {
         self.cooldown.clear();
-        self.token = Some((token.clone(), token_mtime));
+        self.token = Some((token.clone(), account_id.map(str::to_string), token_mtime));
 
-        match wham::call_reset_credit_details(client, &token, account_id, reset_credits_url) {
+        let reset_result = prefetched.unwrap_or_else(|| {
+            wham::call_reset_credit_details(client, &token, account_id, reset_credits_url)
+        });
+        match reset_result {
             ResetCreditsResult::Ok {
                 available_count,
                 expirations,
@@ -275,7 +308,11 @@ impl CodexState {
                     }
                 };
                 let post_mtime = file_mtime(auth);
-                self.token = Some((new_token.clone(), post_mtime));
+                self.token = Some((
+                    new_token.clone(),
+                    account_id.map(str::to_string),
+                    post_mtime,
+                ));
                 match wham::call_reset_credit_details(
                     client,
                     &new_token,
@@ -556,5 +593,65 @@ mod tests {
             &server.url("/token"),
         );
         assert!(matches!(result, CodexFetch::NeedsLogin));
+    }
+
+    #[test]
+    fn fetch_with_refresh_reuses_cached_token_and_fetches_details_concurrently() {
+        let server = MockServer::start();
+        let usage = server.mock(|when, then| {
+            when.method(GET)
+                .path("/wham")
+                .header("authorization", "Bearer tok")
+                .header("chatgpt-account-id", "acct");
+            then.status(200).body(r#"{"plan_type":"plus"}"#);
+        });
+        let details = server.mock(|when, then| {
+            when.method(GET)
+                .path("/reset-credits")
+                .header("authorization", "Bearer tok")
+                .header("chatgpt-account-id", "acct");
+            then.status(200)
+                .body(r#"{"credits":[],"available_count":3}"#);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"tok","refresh_token":"rt","account_id":"acct"}}"#,
+        )
+        .unwrap();
+
+        let client = crate::quota::http::build_client().unwrap();
+        let mut state = CodexState::default();
+        // First tick populates the mtime-keyed cache.
+        let first = state.fetch_with_refresh(
+            &client,
+            &auth,
+            1_000_000,
+            &server.url("/wham"),
+            &server.url("/reset-credits"),
+            &server.url("/token"),
+        );
+        assert!(matches!(first, CodexFetch::Ok(_)));
+
+        // Second tick hits the mtime cache and issues both endpoints concurrently.
+        let second = state.fetch_with_refresh(
+            &client,
+            &auth,
+            1_000_060,
+            &server.url("/wham"),
+            &server.url("/reset-credits"),
+            &server.url("/token"),
+        );
+        match second {
+            CodexFetch::Ok(snap) => {
+                assert_eq!(snap.plan_type.as_deref(), Some("plus"));
+                assert_eq!(snap.reset_credits_available, Some(3));
+            }
+            _ => panic!("expected cached steady-state fetch to succeed"),
+        }
+        assert_eq!(usage.calls(), 2);
+        assert_eq!(details.calls(), 2);
     }
 }

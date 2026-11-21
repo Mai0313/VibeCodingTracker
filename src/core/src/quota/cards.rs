@@ -409,7 +409,7 @@ fn fetch_quota_cards_with_client(client: &Client, present: PresentPanels) -> Vec
         });
         let copilot = present.copilot.then(|| {
             scope.spawn(|| {
-                let mut state = CopilotState;
+                let mut state = CopilotState::default();
                 resolve_one(
                     "copilot",
                     COPILOT_LOGIN_HINT,
@@ -425,7 +425,7 @@ fn fetch_quota_cards_with_client(client: &Client, present: PresentPanels) -> Vec
         });
         let cursor = present.cursor.then(|| {
             scope.spawn(|| {
-                let mut state = CursorState;
+                let mut state = CursorState::default();
                 resolve_one(
                     "cursor",
                     CURSOR_LOGIN_HINT,

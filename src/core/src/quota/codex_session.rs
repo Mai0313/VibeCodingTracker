@@ -1,6 +1,6 @@
 //! Codex session-log fallback that extracts the newest `rate_limits` record from rollout JSONL files when the wham API is unavailable.
 //!
-//! Scans raw [`serde_json::Value`] lines newest-first to preserve point-in-time latest-value semantics rather than aggregating across sessions.
+//! Streams rollout files newest-first, filtering lines for `"rate_limits"` before deserializing to preserve point-in-time latest-value semantics without loading whole logs into memory.
 
 use crate::models::{
     CodexQuotaSnapshot, CodexSessionRateLimits, CodexSessionWindow, QuotaSource, QuotaWindow,
@@ -8,6 +8,7 @@ use crate::models::{
 use crate::quota::{CodexWindowSlot, assign_codex_window};
 use crate::utils::{is_codex_session_file, resolve_paths};
 use anyhow::Result;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -18,6 +19,29 @@ use walkdir::WalkDir;
 
 /// Maximum number of newest rollout files to scan for a `rate_limits` snapshot.
 const MAX_FILES: usize = 64;
+/// Substring pre-filter for JSONL lines that may carry a `rate_limits` object.
+const RATE_LIMITS_NEEDLE: &str = "\"rate_limits\"";
+/// Read buffer size for streaming rollout JSONL files.
+const STREAM_BUF_CAPACITY: usize = 64 * 1024;
+
+/// Minimal rollout line projection capturing only `payload.rate_limits` and `payload.info.rate_limits`.
+#[derive(Deserialize)]
+struct RolloutLine {
+    payload: Option<RolloutPayload>,
+}
+
+/// Minimal `payload` projection inside a rollout line.
+#[derive(Deserialize)]
+struct RolloutPayload {
+    rate_limits: Option<CodexSessionRateLimits>,
+    info: Option<RolloutInfo>,
+}
+
+/// Minimal `payload.info` projection inside a rollout line.
+#[derive(Deserialize)]
+struct RolloutInfo {
+    rate_limits: Option<CodexSessionRateLimits>,
+}
 
 /// Returns the newest live Codex session `rate_limits` snapshot, if any.
 ///
@@ -43,15 +67,60 @@ pub fn latest_session_rate_limits_in(
 ) -> Result<Option<CodexQuotaSnapshot>> {
     let now = chrono::Local::now().timestamp();
     for file in newest_codex_files(codex_session_dirs, MAX_FILES) {
-        let values = read_jsonl_lenient(&file);
-        if let Some(snap) = extract_latest_rate_limits(&values, now) {
+        if let Some(snap) = extract_latest_rate_limits_from_file(&file, now) {
             return Ok(Some(snap));
         }
     }
     Ok(None)
 }
 
+/// Streams `path` line by line with a reusable buffer, returning the newest live `rate_limits` snapshot as of `now`.
+///
+/// Lines without `"rate_limits"` are skipped without JSON parsing, and unreadable files or torn trailing lines are ignored.
+fn extract_latest_rate_limits_from_file(path: &Path, now: i64) -> Option<CodexQuotaSnapshot> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::with_capacity(STREAM_BUF_CAPACITY, file);
+    let mut buf = Vec::with_capacity(8 * 1024);
+    let mut latest = None;
+
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        if !line.contains(RATE_LIMITS_NEEDLE) {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<RolloutLine>(trimmed) else {
+            continue;
+        };
+        let Some(payload) = parsed.payload else {
+            continue;
+        };
+        let Some(rl) = payload
+            .rate_limits
+            .or_else(|| payload.info.and_then(|i| i.rate_limits))
+        else {
+            continue;
+        };
+        if let Some(snap) = map_rate_limits(rl, now) {
+            latest = Some(snap);
+        }
+    }
+
+    latest
+}
+
 /// Reads parseable JSONL lines from `path`, skipping unreadable or malformed lines (such as a torn tail on a live rollout).
+#[cfg(test)]
 fn read_jsonl_lenient(path: &Path) -> Vec<Value> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
@@ -183,61 +252,68 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
         let Ok(rl) = serde_json::from_value::<CodexSessionRateLimits>(rl_val.clone()) else {
             continue;
         };
-        // Only the main "codex" limit family maps to the 5h/7d panel; skip other metered families.
-        if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
-            continue;
+        if let Some(snap) = map_rate_limits(rl, now) {
+            return Some(snap);
         }
-        let mut primary = None;
-        let mut secondary = None;
-        if let Some(window) = &rl.primary {
-            let mapped = map_session_window(window);
-            if is_window_live(&mapped, now) {
-                assign_codex_window(
-                    &mut primary,
-                    &mut secondary,
-                    mapped,
-                    window
-                        .window_minutes
-                        .and_then(|minutes| minutes.checked_mul(60)),
-                    CodexWindowSlot::FiveHour,
-                );
-            }
-        }
-        if let Some(window) = &rl.secondary {
-            let mapped = map_session_window(window);
-            if is_window_live(&mapped, now) {
-                assign_codex_window(
-                    &mut primary,
-                    &mut secondary,
-                    mapped,
-                    window
-                        .window_minutes
-                        .and_then(|minutes| minutes.checked_mul(60)),
-                    CodexWindowSlot::SevenDay,
-                );
-            }
-        }
-        if primary.is_none() && secondary.is_none() {
-            continue;
-        }
-        return Some(CodexQuotaSnapshot {
-            source: QuotaSource::SessionFallback,
-            fetched_at: now,
-            plan_type: rl.plan_type,
-            primary,
-            secondary,
-            credits_balance: None,
-            has_credits: None,
-            unlimited: None,
-            reset_credits_available: None,
-            reset_credit_expirations: None,
-            approx_messages: None,
-            spend_limit: None,
-            limit_reached: None,
-            needs_login: false,
-        });
     }
     None
+}
+
+/// Maps a single [`CodexSessionRateLimits`] record into a live [`CodexQuotaSnapshot`] as of `now`, or `None` if filtered out or expired.
+fn map_rate_limits(rl: CodexSessionRateLimits, now: i64) -> Option<CodexQuotaSnapshot> {
+    // Only the main "codex" limit family maps to the 5h/7d panel; skip other metered families.
+    if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
+        return None;
+    }
+    let mut primary = None;
+    let mut secondary = None;
+    if let Some(window) = &rl.primary {
+        let mapped = map_session_window(window);
+        if is_window_live(&mapped, now) {
+            assign_codex_window(
+                &mut primary,
+                &mut secondary,
+                mapped,
+                window
+                    .window_minutes
+                    .and_then(|minutes| minutes.checked_mul(60)),
+                CodexWindowSlot::FiveHour,
+            );
+        }
+    }
+    if let Some(window) = &rl.secondary {
+        let mapped = map_session_window(window);
+        if is_window_live(&mapped, now) {
+            assign_codex_window(
+                &mut primary,
+                &mut secondary,
+                mapped,
+                window
+                    .window_minutes
+                    .and_then(|minutes| minutes.checked_mul(60)),
+                CodexWindowSlot::SevenDay,
+            );
+        }
+    }
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+    Some(CodexQuotaSnapshot {
+        source: QuotaSource::SessionFallback,
+        fetched_at: now,
+        plan_type: rl.plan_type,
+        primary,
+        secondary,
+        credits_balance: None,
+        has_credits: None,
+        unlimited: None,
+        reset_credits_available: None,
+        reset_credit_expirations: None,
+        approx_messages: None,
+        spend_limit: None,
+        limit_reached: None,
+        needs_login: false,
+    })
 }
 
 /// Returns whether `w` has a reset timestamp strictly after `now` (missing reset times count as stale).
@@ -495,5 +571,24 @@ mod tests {
         assert_eq!(values.len(), 2, "torn tail dropped, complete lines kept");
         let snap = extract_latest_rate_limits(&values, 0).unwrap();
         assert_eq!(snap.primary.unwrap().used_percent, 33.0);
+    }
+
+    #[test]
+    fn streaming_extractor_skips_noise_torn_tail_and_non_codex_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-stream.jsonl");
+        let body = concat!(
+            "{\"payload\":{\"type\":\"message\",\"text\":\"noise line\"}}\n",
+            "{\"payload\":{\"info\":{\"rate_limits\":{\"limit_id\":\"codex\",\"primary\":{\"used_percent\":18.0,\"window_minutes\":300,\"resets_at\":2000},\"plan_type\":\"plus\"}}}}\n",
+            "{\"payload\":{\"rate_limits\":{\"limit_id\":\"codex_other\",\"primary\":{\"used_percent\":99.0,\"window_minutes\":300,\"resets_at\":3000}}}}\n",
+            "{\"payload\":{\"rate_limits\":{\"limit_id\":\"codex\",\"primary\":{\"used_percent\":77.0,\"window_minutes\":300,\"resets_at\":500}}}}\n",
+            "{\"payload\":\"contains \\\"rate_limits\\\" in a non-object payload\"}\n",
+            "{\"payload\":{\"rate_limits\":{\"primary\":{\"used_per",
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let snap = extract_latest_rate_limits_from_file(&path, 1000).unwrap();
+        assert_eq!(snap.primary.unwrap().used_percent, 18.0);
+        assert_eq!(snap.plan_type.as_deref(), Some("plus"));
     }
 }

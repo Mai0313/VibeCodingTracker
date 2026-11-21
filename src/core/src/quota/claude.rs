@@ -194,12 +194,20 @@ pub(crate) fn fetch_claude_raw_from(
     Ok((status, body))
 }
 
-/// Returns the prettified plan tier from `path`, preferring `rateLimitTier` over `subscriptionType`.
-fn read_claude_plan(path: &Path) -> Option<String> {
-    let oauth = read_claude_oauth(path)?;
-    let raw = oauth.rate_limit_tier.or(oauth.subscription_type)?;
+/// Returns the prettified plan tier from a parsed [`ClaudeOauth`] block, preferring `rateLimitTier` over `subscriptionType`.
+fn plan_from_oauth(oauth: &ClaudeOauth) -> Option<String> {
+    let raw = oauth
+        .rate_limit_tier
+        .as_deref()
+        .or(oauth.subscription_type.as_deref())?;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| prettify_tier(trimmed))
+}
+
+/// Returns the prettified plan tier from `path`, preferring `rateLimitTier` over `subscriptionType`.
+#[cfg(test)]
+fn read_claude_plan(path: &Path) -> Option<String> {
+    plan_from_oauth(&read_claude_oauth(path)?)
 }
 
 /// Cleans a raw tier string for display, e.g. `default_claude_max_20x` -> `max 20x`.
@@ -431,18 +439,18 @@ fn refresh_claude(
     Ok((access, expires_ms))
 }
 
-/// The result of obtaining a usable access token.
+/// The result of obtaining a usable access token and its cached plan label.
 enum EnsureToken {
-    Token(String),
+    Token(String, Option<String>),
     NeedsLogin,
     Transient,
 }
 
-/// Per-worker Claude state: an in-memory access token + refresh backoff.
+/// Per-worker Claude state: an in-memory access token + plan label + refresh backoff.
 #[derive(Default)]
 pub struct ClaudeState {
-    /// Cached `(access_token, expires_at_ms, credential_mtime)`; invalidated whenever the credentials file mtime changes.
-    token: Option<(String, i64, Option<SystemTime>)>,
+    /// Cached `(access_token, expires_at_ms, plan_type, credential_mtime)`; invalidated whenever the credentials file mtime changes.
+    token: Option<(String, i64, Option<String>, Option<SystemTime>)>,
     cooldown: RefreshCooldown,
 }
 
@@ -456,8 +464,8 @@ impl ClaudeState {
             Err(_) => return QuotaOutcome::Transient,
         };
 
-        let token = match self.ensure_token(client, &path, now_secs, now_ms) {
-            EnsureToken::Token(t) => t,
+        let (token, plan) = match self.ensure_token(client, &path, now_secs, now_ms) {
+            EnsureToken::Token(t, plan) => (t, plan),
             EnsureToken::NeedsLogin => return QuotaOutcome::NeedsLogin,
             EnsureToken::Transient => return QuotaOutcome::Transient,
         };
@@ -465,7 +473,7 @@ impl ClaudeState {
         match fetch_claude_usage(client, &token, now_secs, CLAUDE_USAGE_URL) {
             FetchResult::Ok(mut snap) => {
                 self.cooldown.clear();
-                snap.plan_type = read_claude_plan(&path);
+                snap.plan_type = plan;
                 QuotaOutcome::Data(snap)
             }
             FetchResult::Unauthorized => {
@@ -475,21 +483,23 @@ impl ClaudeState {
                     return QuotaOutcome::NeedsLogin;
                 }
                 match self.force_refresh(client, &path) {
-                    Some(t) => match fetch_claude_usage(client, &t, now_secs, CLAUDE_USAGE_URL) {
-                        FetchResult::Ok(mut snap) => {
-                            self.cooldown.clear();
-                            snap.plan_type = read_claude_plan(&path);
-                            QuotaOutcome::Data(snap)
+                    Some((t, refreshed_plan)) => {
+                        match fetch_claude_usage(client, &t, now_secs, CLAUDE_USAGE_URL) {
+                            FetchResult::Ok(mut snap) => {
+                                self.cooldown.clear();
+                                snap.plan_type = refreshed_plan;
+                                QuotaOutcome::Data(snap)
+                            }
+                            // Keep the freshly refreshed token and last-known-good snapshot on a transient retry error.
+                            FetchResult::Transient => QuotaOutcome::Transient,
+                            // Re-read mtime because the successful refresh above just rewrote the file.
+                            FetchResult::Unauthorized => {
+                                self.cooldown.arm(now_secs, file_mtime(&path));
+                                self.token = None;
+                                QuotaOutcome::NeedsLogin
+                            }
                         }
-                        // Keep the freshly refreshed token and last-known-good snapshot on a transient retry error.
-                        FetchResult::Transient => QuotaOutcome::Transient,
-                        // Re-read mtime because the successful refresh above just rewrote the file.
-                        FetchResult::Unauthorized => {
-                            self.cooldown.arm(now_secs, file_mtime(&path));
-                            self.token = None;
-                            QuotaOutcome::NeedsLogin
-                        }
-                    },
+                    }
                     None => {
                         self.cooldown.arm(now_secs, file_mtime(&path));
                         self.token = None;
@@ -501,7 +511,7 @@ impl ClaudeState {
         }
     }
 
-    /// Returns a usable access token, refreshing proactively near expiry.
+    /// Returns a usable access token and plan label, refreshing proactively near expiry.
     fn ensure_token(
         &mut self,
         client: &Client,
@@ -509,11 +519,13 @@ impl ClaudeState {
         now_secs: i64,
         now_ms: i64,
     ) -> EnsureToken {
-        if let Some((tok, exp_ms, cred_mtime)) = &self.token
+        let cur_mtime = file_mtime(path);
+        if let Some((tok, exp_ms, plan, cred_mtime)) = &self.token
+            && cur_mtime.is_some()
             && exp_ms - now_ms > EXPIRY_SKEW_SECS * 1000
-            && *cred_mtime == file_mtime(path)
+            && *cred_mtime == cur_mtime
         {
-            return EnsureToken::Token(tok.clone());
+            return EnsureToken::Token(tok.clone(), plan.clone());
         }
 
         // Treat an absent or unreadable file as transient (e.g. an atomic rewrite in flight), but unparseable JSON as an auth failure.
@@ -525,6 +537,7 @@ impl ClaudeState {
             Some(o) => o,
             None => return EnsureToken::NeedsLogin,
         };
+        let plan = plan_from_oauth(&oauth);
         let access = oauth.access_token.clone().filter(|s| !s.is_empty());
         let expires_secs = oauth.expires_at.map(|ms| ms / 1000);
         let need_refresh =
@@ -536,7 +549,7 @@ impl ClaudeState {
                 return EnsureToken::NeedsLogin;
             }
             match self.force_refresh(client, path) {
-                Some(t) => EnsureToken::Token(t),
+                Some((t, refreshed_plan)) => EnsureToken::Token(t, refreshed_plan),
                 None => {
                     // Re-read: a partial write could have changed the mtime.
                     self.cooldown.arm(now_secs, file_mtime(path));
@@ -548,16 +561,18 @@ impl ClaudeState {
             self.token = Some((
                 tok.clone(),
                 oauth.expires_at.unwrap_or(now_ms),
+                plan.clone(),
                 file_mtime(path),
             ));
-            EnsureToken::Token(tok)
+            EnsureToken::Token(tok, plan)
         }
     }
 
     /// Reads the refresh token from `path` with its mtime guard and refreshes the access token once.
-    fn force_refresh(&mut self, client: &Client, path: &Path) -> Option<String> {
+    fn force_refresh(&mut self, client: &Client, path: &Path) -> Option<(String, Option<String>)> {
         let expected_mtime = file_mtime(path);
         let oauth = read_claude_oauth(path)?;
+        let plan = plan_from_oauth(&oauth);
         let refresh_token = oauth.refresh_token.filter(|s| !s.is_empty())?;
         match refresh_claude(
             client,
@@ -569,8 +584,8 @@ impl ClaudeState {
         ) {
             Ok((access, expires_ms)) => {
                 self.cooldown.clear();
-                self.token = Some((access.clone(), expires_ms, file_mtime(path)));
-                Some(access)
+                self.token = Some((access.clone(), expires_ms, plan.clone(), file_mtime(path)));
+                Some((access, plan))
             }
             Err(e) => {
                 log::warn!("claude token refresh failed: {e}");

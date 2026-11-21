@@ -5,19 +5,34 @@
 use crate::utils::get_version_cache_path_in;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// On-disk schema version for [`CliVersionCache`]; mismatched files are ignored and re-probed.
 const SCHEMA_VERSION: u32 = 1;
+/// Upper bound on `<bin> --version` wall-clock runtime before terminating the child.
+const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum stdout bytes read from `<bin> --version`.
+const MAX_CLI_VERSION_BYTES: u64 = 4096;
 
 /// On-disk record at `~/.vct/version/<provider>.json` caching a probed CLI version and its probe timestamp.
 #[derive(Serialize, Deserialize)]
 struct CliVersionCache {
     schema_version: u32,
     provider: String,
+    /// Detected version string, or empty when the probe failed (negative cache entry).
     version: String,
     last_checked_at: String,
+}
+
+/// Same-day version cache lookup result.
+#[derive(Debug, PartialEq, Eq)]
+enum CachedVersion {
+    Hit(String),
+    Miss,
 }
 
 /// Process-wide gate enabling CLI `--version` probing via [`enable_cli_version_detection`].
@@ -37,18 +52,22 @@ fn cli_version_detection_enabled() -> bool {
 
 /// Returns the installed version of `bin` for `provider`, or `fallback` if unavailable or probing is disabled.
 ///
-/// Runs `<bin> --version` at most once per UTC day and caches the result under `~/.vct/version/<provider>.json`. Always returns `fallback` until [`enable_cli_version_detection`] is called.
+/// Runs `<bin> --version` at most once per UTC day and caches both successes and misses under `~/.vct/version/<provider>.json`. Always returns `fallback` until [`enable_cli_version_detection`] is called.
 pub fn detect_cli_version(bin: &str, provider: &str, fallback: &str) -> String {
     if !cli_version_detection_enabled() {
         return fallback.to_string();
     }
-    if let Some(v) = read_cached_version(provider) {
-        return v;
+    if let Some(cached) = read_cached_version_entry(provider) {
+        return match cached {
+            CachedVersion::Hit(v) => v,
+            CachedVersion::Miss => fallback.to_string(),
+        };
     }
     if let Some(v) = run_cli_version(bin) {
         let _ = write_cached_version(provider, &v);
         return v;
     }
+    let _ = write_cached_version(provider, "");
     fallback.to_string()
 }
 
@@ -59,19 +78,35 @@ pub fn parse_version(raw: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Returns `provider`'s cached CLI version if stamped on the current UTC day.
-fn read_cached_version(provider: &str) -> Option<String> {
-    read_cached_version_in(&crate::utils::get_cache_dir().ok()?, provider)
+/// Returns `provider`'s cached CLI version entry if stamped on the current UTC day.
+fn read_cached_version_entry(provider: &str) -> Option<CachedVersion> {
+    read_cached_version_entry_in(&crate::utils::get_cache_dir().ok()?, provider)
 }
 
-/// Injectable core of [`read_cached_version`] reading from cache root `dir`.
-fn read_cached_version_in(dir: &Path, provider: &str) -> Option<String> {
+/// Injectable core of [`read_cached_version_entry`] reading from cache root `dir`.
+fn read_cached_version_entry_in(dir: &Path, provider: &str) -> Option<CachedVersion> {
     let text = std::fs::read_to_string(get_version_cache_path_in(dir, provider)).ok()?;
     let cached: CliVersionCache = serde_json::from_str(&text).ok()?;
     if cached.schema_version != SCHEMA_VERSION || cached.provider != provider {
         return None;
     }
-    is_today_utc(&cached.last_checked_at).then_some(cached.version)
+    if !is_today_utc(&cached.last_checked_at) {
+        return None;
+    }
+    if cached.version.is_empty() {
+        Some(CachedVersion::Miss)
+    } else {
+        Some(CachedVersion::Hit(cached.version))
+    }
+}
+
+/// Returns `provider`'s cached positive CLI version from cache root `dir`, if stamped today.
+#[cfg(test)]
+fn read_cached_version_in(dir: &Path, provider: &str) -> Option<String> {
+    match read_cached_version_entry_in(dir, provider) {
+        Some(CachedVersion::Hit(v)) => Some(v),
+        _ => None,
+    }
 }
 
 /// Persists `version` stamped with the current UTC time (best-effort, atomic).
@@ -92,19 +127,58 @@ fn write_cached_version_in(dir: &Path, provider: &str, version: &str) -> Result<
     )
 }
 
-/// Runs `<bin> --version` and parses the version token from stdout.
+/// Runs `<bin> --version` with a bounded timeout and parses the version token from stdout.
 fn run_cli_version(bin: &str) -> Option<String> {
+    run_cli_version_with_timeout(bin, &["--version"], CLI_VERSION_TIMEOUT)
+}
+
+/// Runs `bin` with `args`, enforcing `timeout` and a bounded stdout read, and parses the version token.
+fn run_cli_version_with_timeout(bin: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut command = std::process::Command::new(bin);
-    command.arg("--version");
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = command.output().ok()?;
-    output.status.success().then_some(())?;
-    parse_version(&String::from_utf8_lossy(&output.stdout))
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.take(MAX_CLI_VERSION_BYTES).read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let bytes = reader.join().ok()?;
+                return parse_version(&String::from_utf8_lossy(&bytes));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// Returns whether RFC3339 timestamp `ts` falls on the current UTC calendar day, or `false` if unparseable.
@@ -230,5 +304,43 @@ mod tests {
         assert_eq!(parse_version("  2.0.14\n").as_deref(), Some("2.0.14"));
         assert_eq!(parse_version(""), None);
         assert_eq!(parse_version("Claude Code"), None);
+    }
+
+    #[test]
+    fn negative_version_cache_round_trips_and_expires_next_day() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cached_version_in(dir.path(), "codex", "").unwrap();
+        assert_eq!(
+            read_cached_version_entry_in(dir.path(), "codex"),
+            Some(CachedVersion::Miss)
+        );
+        assert_eq!(read_cached_version_in(dir.path(), "codex"), None);
+
+        std::fs::write(
+            get_version_cache_path_in(dir.path(), "codex"),
+            serde_json::to_string(&CliVersionCache {
+                schema_version: SCHEMA_VERSION,
+                provider: "codex".into(),
+                version: String::new(),
+                last_checked_at: "2000-01-01T00:00:00Z".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_cached_version_entry_in(dir.path(), "codex"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_version_probe_kills_hung_process_on_timeout() {
+        let start = Instant::now();
+        let res =
+            run_cli_version_with_timeout("sh", &["-c", "sleep 10"], Duration::from_millis(120));
+        assert_eq!(res, None);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "hung probe should be terminated quickly, took {:?}",
+            start.elapsed()
+        );
     }
 }

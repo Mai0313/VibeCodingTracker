@@ -27,7 +27,7 @@ use ratatui::{
     },
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
@@ -39,7 +39,7 @@ use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::quota::{
     ANTIGRAVITY_LOGIN_HINT, AntigravityState, CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT,
     COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState, CodexState, CopilotState, CursorState,
-    GROK_LOGIN_HINT, GrokState, antigravity_quota_present, load_antigravity_cache,
+    GROK_LOGIN_HINT, GrokState, QuotaShutdown, antigravity_quota_present, load_antigravity_cache,
     load_claude_cache, load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache,
     save_antigravity_cache, save_claude_cache, save_codex_cache, save_copilot_cache,
     save_cursor_cache, save_grok_cache, spawn_quota_worker,
@@ -168,12 +168,12 @@ pub(crate) struct UsageRefreshPayload {
 }
 
 struct QuotaShutdownGuard {
-    shutdown: Arc<AtomicBool>,
+    shutdown: Arc<QuotaShutdown>,
 }
 
 impl Drop for QuotaShutdownGuard {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown.signal();
     }
 }
 
@@ -235,7 +235,7 @@ impl QuotaRuntime {
         present.grok &= providers.grok && panel_on("grok");
         present.antigravity &= providers.antigravity && panel_on("antigravity");
 
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(QuotaShutdown::new());
         let revision = Arc::new(AtomicU64::new(1));
         let claude = Arc::new(Mutex::new(
             present
@@ -291,7 +291,7 @@ impl QuotaRuntime {
             let starter_grok = Arc::clone(&grok);
             let starter_antigravity = Arc::clone(&antigravity);
             std::thread::spawn(move || {
-                if starter_shutdown.load(Ordering::Relaxed) {
+                if starter_shutdown.is_shutdown() {
                     return;
                 }
                 let client = match vct_core::quota::http::build_client() {
@@ -301,7 +301,7 @@ impl QuotaRuntime {
                         return;
                     }
                 };
-                if starter_shutdown.load(Ordering::Relaxed) {
+                if starter_shutdown.is_shutdown() {
                     return;
                 }
                 if present.claude {
@@ -351,7 +351,7 @@ impl QuotaRuntime {
                         starter_copilot,
                         Arc::clone(&starter_revision),
                     );
-                    let mut state = CopilotState;
+                    let mut state = CopilotState::default();
                     spawn_quota_worker(
                         "copilot",
                         shared,
@@ -371,7 +371,7 @@ impl QuotaRuntime {
                         starter_cursor,
                         Arc::clone(&starter_revision),
                     );
-                    let mut state = CursorState;
+                    let mut state = CursorState::default();
                     spawn_quota_worker(
                         "cursor",
                         shared,
@@ -604,8 +604,10 @@ impl UsageUiState {
     /// Re-syncs selection and highlight tracking to the active rows; flashes differences only when `changed` is `true`.
     fn resync(&mut self, previous: Option<String>, changed: bool) {
         let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
-        self.scroll
-            .sync_by(previous.as_deref(), rows.iter().map(|row| row.model.as_str()));
+        self.scroll.sync_by(
+            previous.as_deref(),
+            rows.iter().map(|row| row.model.as_str()),
+        );
         self.update_tracker
             .cleanup_str(rows.iter().map(|row| row.model.as_str()));
         let now = std::time::Instant::now();
@@ -1090,7 +1092,9 @@ pub(crate) fn build_usage_table_row(
     } else {
         format!("{prefix}{}", row.model)
     };
-    cells.push(RatatuiCell::from(Text::from(model).alignment(Alignment::Left)));
+    cells.push(RatatuiCell::from(
+        Text::from(model).alignment(Alignment::Left),
+    ));
     for &i in &cols.kept {
         cells.push(RatatuiCell::from(
             Text::from(format_usage_column(row, i)).alignment(Alignment::Right),
@@ -2731,11 +2735,11 @@ mod tests {
 
     #[test]
     fn quota_shutdown_guard_never_waits_and_sets_flag() {
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(QuotaShutdown::new());
         drop(QuotaShutdownGuard {
             shutdown: Arc::clone(&shutdown),
         });
-        assert!(shutdown.load(Ordering::Relaxed));
+        assert!(shutdown.is_shutdown());
     }
 
     #[test]

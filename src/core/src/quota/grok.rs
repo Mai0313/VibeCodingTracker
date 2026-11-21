@@ -542,11 +542,19 @@ enum EnsureToken {
     NeedsLogin,
 }
 
+/// Cached bearer token and metadata from `auth.json`, invalidated when the file mtime changes.
+struct CachedGrokToken {
+    access_token: String,
+    user_id: Option<String>,
+    /// `None` for non-expiring API keys.
+    expiry_secs: Option<i64>,
+    auth_mtime: Option<SystemTime>,
+}
+
 /// Per-worker Grok quota state holding the cached access token, discovered OIDC token endpoint, cached plan label, and refresh backoff.
 #[derive(Default)]
 pub struct GrokState {
-    /// `(access_token, expiry_secs, auth_mtime)`; `None` expiry means non-expiring API key.
-    token: Option<(String, Option<i64>, Option<SystemTime>)>,
+    token: Option<CachedGrokToken>,
     cooldown: RefreshCooldown,
     /// Cached `(issuer, token_endpoint)` pair.
     token_endpoint: Option<(String, String)>,
@@ -555,6 +563,15 @@ pub struct GrokState {
 }
 
 impl GrokState {
+    /// Returns the cached `(access_token, user_id)` when `path`'s mtime is unchanged and the token is not near expiry.
+    fn cached_token(&self, path: &Path, now: i64) -> Option<(String, Option<String>)> {
+        let cur_mtime = file_mtime(path)?;
+        let cached = self.token.as_ref()?;
+        (cached.auth_mtime == Some(cur_mtime)
+            && !is_expiring(cached.expiry_secs, now, EXPIRY_SKEW_SECS))
+        .then(|| (cached.access_token.clone(), cached.user_id.clone()))
+    }
+
     /// Fetches a Grok quota snapshot, refreshing the OAuth token proactively near expiry and reactively on HTTP 401/403.
     pub fn resolve(&mut self, client: &Client) -> QuotaOutcome<GrokQuotaSnapshot> {
         let now = chrono::Local::now().timestamp();
@@ -562,16 +579,23 @@ impl GrokState {
             Ok(p) => p,
             Err(_) => return QuotaOutcome::Transient,
         };
-        let cred = match read_grok_credential(&path) {
-            CredentialRead::Ok(cred) => *cred,
-            CredentialRead::NeedsLogin => return QuotaOutcome::NeedsLogin,
-            CredentialRead::Transient => return QuotaOutcome::Transient,
-        };
-        let user_id = cred.user_id().map(str::to_string);
-
-        let token = match self.ensure_token(client, &path, &cred, now) {
-            EnsureToken::Token(t) => t,
-            EnsureToken::NeedsLogin => return QuotaOutcome::NeedsLogin,
+        let (token, user_id) = if let Some(cached) = self.cached_token(&path, now) {
+            cached
+        } else {
+            let cred = match read_grok_credential(&path) {
+                CredentialRead::Ok(cred) => *cred,
+                CredentialRead::NeedsLogin => {
+                    self.token = None;
+                    return QuotaOutcome::NeedsLogin;
+                }
+                CredentialRead::Transient => return QuotaOutcome::Transient,
+            };
+            let user_id = cred.user_id().map(str::to_string);
+            let token = match self.ensure_token(client, &path, &cred, now) {
+                EnsureToken::Token(t) => t,
+                EnsureToken::NeedsLogin => return QuotaOutcome::NeedsLogin,
+            };
+            (token, user_id)
         };
 
         match fetch_grok_billing(client, &token, user_id.as_deref(), now, GROK_BILLING_URL) {
@@ -593,11 +617,12 @@ impl GrokState {
                     return QuotaOutcome::NeedsLogin;
                 }
                 match self.force_refresh(client, &path) {
-                    Some(fresh) => {
+                    Some((fresh, fresh_uid)) => {
+                        let uid = fresh_uid.or(user_id);
                         match fetch_grok_billing(
                             client,
                             &fresh,
-                            user_id.as_deref(),
+                            uid.as_deref(),
                             now,
                             GROK_BILLING_URL,
                         ) {
@@ -607,7 +632,7 @@ impl GrokState {
                                     client,
                                     snap,
                                     &fresh,
-                                    user_id.as_deref(),
+                                    uid.as_deref(),
                                     file_mtime(&path),
                                     GROK_SETTINGS_URL,
                                 ))
@@ -673,26 +698,33 @@ impl GrokState {
         now: i64,
     ) -> EnsureToken {
         // Invalidate the cached token when `auth.json` changes on disk (e.g. re-login), even if it is not yet expired.
-        if let Some((tok, expiry, cred_mtime)) = &self.token
-            && !is_expiring(*expiry, now, EXPIRY_SKEW_SECS)
-            && *cred_mtime == file_mtime(path)
+        let cur_mtime = file_mtime(path);
+        if let Some(cached) = &self.token
+            && cur_mtime.is_some()
+            && !is_expiring(cached.expiry_secs, now, EXPIRY_SKEW_SECS)
+            && cached.auth_mtime == cur_mtime
         {
-            return EnsureToken::Token(tok.clone());
+            return EnsureToken::Token(cached.access_token.clone());
         }
 
         let expires = cred.expires_at_secs();
         if !is_expiring(expires, now, EXPIRY_SKEW_SECS) {
             let tok = cred.access_token().to_string();
-            self.token = Some((tok.clone(), expires, file_mtime(path)));
+            let uid = cred.user_id().map(str::to_string);
+            self.token = Some(CachedGrokToken {
+                access_token: tok.clone(),
+                user_id: uid,
+                expiry_secs: expires,
+                auth_mtime: cur_mtime,
+            });
             return EnsureToken::Token(tok);
         }
 
-        let mtime = file_mtime(path);
-        if self.cooldown.active(now, mtime) {
+        if self.cooldown.active(now, cur_mtime) {
             return EnsureToken::NeedsLogin;
         }
         match self.force_refresh(client, path) {
-            Some(t) => EnsureToken::Token(t),
+            Some((t, _)) => EnsureToken::Token(t),
             None => {
                 // Re-read: a partial write could have changed the mtime.
                 self.cooldown.arm(now, file_mtime(path));
@@ -702,7 +734,7 @@ impl GrokState {
     }
 
     /// Re-reads `path` and refreshes the OAuth token once, aborting write-back if `path` changes concurrently.
-    fn force_refresh(&mut self, client: &Client, path: &Path) -> Option<String> {
+    fn force_refresh(&mut self, client: &Client, path: &Path) -> Option<(String, Option<String>)> {
         let expected_mtime = file_mtime(path);
         let body = std::fs::read_to_string(path).ok()?;
         let cred = select_grok_entry(&body)?;
@@ -712,11 +744,17 @@ impl GrokState {
             return None;
         };
         let token_url = self.token_endpoint(client, &issuer)?;
+        let uid = cred.user_id().map(str::to_string);
         match refresh_grok(client, path, &cred, expected_mtime, &token_url) {
             Ok((access, expires_at)) => {
                 self.cooldown.clear();
-                self.token = Some((access.clone(), Some(expires_at), file_mtime(path)));
-                Some(access)
+                self.token = Some(CachedGrokToken {
+                    access_token: access.clone(),
+                    user_id: uid.clone(),
+                    expiry_secs: Some(expires_at),
+                    auth_mtime: file_mtime(path),
+                });
+                Some((access, uid))
             }
             Err(e) => {
                 log::warn!("grok token refresh failed: {e}");
