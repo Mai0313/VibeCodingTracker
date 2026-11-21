@@ -15,14 +15,15 @@ use crate::session::diagnostics::{
     DatabaseAnalysisRow, DatabaseUsageRead, UsageContribution, UsageTokenContribution,
 };
 use crate::session::sqlite::{
-    DatabaseFingerprint, optional_database_fingerprint, with_readonly_connection,
+    DatabaseFingerprint, LocalDateCache, optional_database_fingerprint, with_readonly_connection,
 };
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_current_user, get_machine_id};
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
-use serde_json::{Value, json};
-use std::collections::HashMap;
+use serde::{Deserialize, Deserializer};
+use serde_json::{Value, json, value::RawValue};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 // ===========================================================================
@@ -290,13 +291,14 @@ pub(crate) fn read_cursor_usage_store(
 ) -> Result<DatabaseUsageRead> {
     let conv_id = conversation_id_from_path(store_db);
     let read = read_store_context(store_db, conv_models, &conv_id)?;
+    let mut date_cache = LocalDateCache::default();
     let events = read
         .turns
         .into_iter()
         .filter_map(|(timestamp_ms, cache_read)| {
-            ms_to_local_date(timestamp_ms).map(|date| UsageEvent {
+            date_cache.format_ms(timestamp_ms).map(|date| UsageEvent {
                 conversation_id: conv_id.clone(),
-                date,
+                date: date.to_owned(),
                 timestamp_ms,
                 model: read.model.clone(),
                 input: 0,
@@ -326,7 +328,8 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
         ),
     };
     // (conversation, date, model) -> (summed context-window gauge, latest timestamp)
-    let mut agg: HashMap<(String, String, String), (i64, i64)> = HashMap::new();
+    let mut agg: FastHashMap<(String, String, String), (i64, i64)> = FastHashMap::default();
+    let mut date_cache = LocalDateCache::default();
     let discovery = discover_cursor_store_dbs(chats_dir);
     let candidates = discovery.stores.len() + discovery.failures.len();
     let mut parsed = 0usize;
@@ -367,11 +370,11 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
             }
         };
         for (ts, ctx) in read.turns {
-            let Some(date) = ms_to_local_date(ts) else {
+            let Some(date) = date_cache.format_ms(ts) else {
                 continue;
             };
             let entry = agg
-                .entry((conv_id.clone(), date, read.model.clone()))
+                .entry((conv_id.clone(), date.to_owned(), read.model.clone()))
                 .or_insert((0, ts));
             entry.0 += ctx;
             entry.1 = entry.1.max(ts);
@@ -591,9 +594,10 @@ pub(crate) fn read_store_analysis(
         // Pass 1: index Read tool results by tool-call id for attribution in pass 2.
         let read_results = collect_read_results(&blobs);
         let mut failed_payloads = 0usize;
+        let mut date_cache = LocalDateCache::default();
 
         // Pass 2: fold each assistant turn's tool calls into a per-date state.
-        let mut per_date: HashMap<String, SessionParseState> = HashMap::new();
+        let mut per_date: FastHashMap<String, SessionParseState> = FastHashMap::default();
         let mut normalized_messages = 0usize;
         for data in &blobs {
             if data.first() != Some(&0x0A) {
@@ -604,16 +608,22 @@ pub(crate) fn read_store_analysis(
                 // Aggregate DAG nodes carry a context gauge and timestamp without a message and are not assistant turns; a timestamped node missing both message and gauge indicates schema drift.
                 if node.ctx_msg.is_none()
                     && let Some(ts) = node.ts
-                    && ms_to_local_date(ts).is_some_and(|date| !is_before_cutoff(&date, &cutoff))
+                    && date_cache
+                        .format_ms(ts)
+                        .is_some_and(|date| !is_before_cutoff(date, &cutoff))
                 {
                     failed_payloads += 1;
                 }
                 continue;
             };
+            let mut resolved_date = None;
             if let Some(ts) = node.ts
-                && ms_to_local_date(ts).is_some_and(|date| is_before_cutoff(&date, &cutoff))
+                && let Some(date) = date_cache.format_ms(ts)
             {
-                continue;
+                if is_before_cutoff(date, &cutoff) {
+                    continue;
+                }
+                resolved_date = Some(date);
             }
             let Ok(msg) = serde_json::from_slice::<Value>(msg_bytes) else {
                 failed_payloads += 1;
@@ -631,22 +641,21 @@ pub(crate) fn read_store_analysis(
                 failed_payloads += 1;
                 continue;
             };
-            let Some(date) = ms_to_local_date(ts) else {
+            let Some(date) = resolved_date else {
                 failed_payloads += 1;
                 continue;
             };
-            if is_before_cutoff(&date, &cutoff) {
-                continue;
-            }
             if msg.get("content").and_then(Value::as_array).is_none() {
                 failed_payloads += 1;
                 continue;
             }
-            let state = per_date.entry(date).or_insert_with(|| {
+            let state = if let Some(state) = per_date.get_mut(date) {
+                state
+            } else {
                 let mut s = SessionParseState::with_mode(mode);
                 s.task_id = conv_id.clone();
-                s
-            });
+                per_date.entry(date.to_owned()).or_insert(s)
+            };
             state.last_ts = ts.max(state.last_ts);
             match apply_assistant_tools(state, &msg, &read_results, ts) {
                 Ok(tool_failures) => {
@@ -691,12 +700,15 @@ fn read_store_context(
     with_readonly_connection(store_db, "blobs", "vct-cursor-", "Cursor", |conn| {
         let transaction = conn.unchecked_transaction()?;
         let model = resolve_store_model(&transaction, conv_models, conv_id);
-        // Filter to binary DAG nodes in SQL so large JSON tool-result blobs are never loaded on the usage path.
-        let blobs = load_node_blobs(&transaction)?;
+        // Stream binary DAG nodes directly from SQLite so neither JSON tool-result blobs nor a full `Vec<Vec<u8>>` are materialized on the usage path.
+        let mut stmt = transaction
+            .prepare("SELECT data FROM blobs WHERE substr(data, 1, 1) = X'0A' ORDER BY id")?;
+        let mut rows = stmt.query([])?;
         let mut turns = Vec::new();
         let mut expected_records = 0usize;
         let mut parsed_records = 0usize;
-        for data in &blobs {
+        while let Some(row) = rows.next()? {
+            let data = row.get_ref(0)?.as_blob()?;
             if data.first() != Some(&0x0A) {
                 continue;
             }
@@ -723,6 +735,8 @@ fn read_store_context(
                 Some(_) | None => expected_records += 1,
             }
         }
+        drop(rows);
+        drop(stmt);
         transaction.commit()?;
         Ok(CursorStoreContextRead {
             model,
@@ -772,24 +786,30 @@ fn load_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Loads only binary DAG-node blobs (first byte `0x0A`) ordered by `id`.
-fn load_node_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
-    let mut stmt =
-        conn.prepare("SELECT data FROM blobs WHERE substr(data, 1, 1) = X'0A' ORDER BY id")?;
-    let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+fn deserialize_present_raw<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<&'de RawValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    <&'de RawValue>::deserialize(deserializer).map(Some)
+}
+
+fn decode_raw_str(raw: Option<&RawValue>) -> Option<Cow<'_, str>> {
+    serde_json::from_str::<Cow<'_, str>>(raw?.get()).ok()
+}
+
+#[derive(Deserialize)]
+struct BorrowedMessageRole<'a> {
+    #[serde(default, borrow)]
+    role: Option<Cow<'a, str>>,
 }
 
 /// Returns the `role` field of a message JSON blob, if present.
-fn message_role(bytes: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(bytes)
+fn message_role(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    serde_json::from_slice::<BorrowedMessageRole<'_>>(bytes)
         .ok()
-        .and_then(|message| {
-            message
-                .get("role")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+        .and_then(|message| message.role)
 }
 
 /// Applies one assistant message's tool calls to `state`.
@@ -798,7 +818,7 @@ fn message_role(bytes: &[u8]) -> Option<String> {
 fn apply_assistant_tools(
     state: &mut SessionParseState,
     msg: &Value,
-    read_results: &HashMap<String, CursorReadResult>,
+    read_results: &FastHashMap<String, CursorReadResult>,
     ts: i64,
 ) -> std::result::Result<usize, ()> {
     if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
@@ -888,48 +908,88 @@ enum CursorReadResult {
     Unsupported,
 }
 
+#[derive(Deserialize)]
+struct BorrowedToolBlob<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    role: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    content: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedToolResultItem<'a> {
+    #[serde(
+        default,
+        borrow,
+        rename = "type",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    kind: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "toolName",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    tool_name: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "toolCallId",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    tool_call_id: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    result: Option<&'a RawValue>,
+}
+
 /// Indexes `Read` / `ReadFile` tool results by `toolCallId` with line-number prefixes stripped.
-fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> {
-    let mut map = HashMap::new();
+fn collect_read_results(blobs: &[Vec<u8>]) -> FastHashMap<String, CursorReadResult> {
+    let mut map = FastHashMap::default();
     for data in blobs {
         if data.first() != Some(&b'{') {
             continue;
         }
-        let Ok(msg) = serde_json::from_slice::<Value>(data) else {
+        let Ok(blob) = serde_json::from_slice::<BorrowedToolBlob<'_>>(data) else {
             continue;
         };
-        let role = msg.get("role").and_then(Value::as_str);
-        // Standalone JSON blobs also hold undated copies of assistant messages referenced by DAG nodes; pass 2 reads those via their dated nodes, so skip every non-tool role here.
-        if role != Some("tool") {
+        // Standalone JSON blobs also hold undated copies of assistant messages referenced by DAG nodes; pass 2 reads those via their dated nodes, so skip every non-tool role before parsing `content`.
+        if decode_raw_str(blob.role).as_deref() != Some("tool") {
             continue;
         }
-        let Some(content) = msg.get("content").and_then(|v| v.as_array()) else {
+        let Some(content_raw) = blob.content.filter(|raw| raw.get().starts_with('[')) else {
             continue;
         };
-        for c in content {
-            if c.get("type").and_then(|v| v.as_str()) != Some("tool-result") {
+        let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(content_raw.get()) else {
+            continue;
+        };
+        for raw_item in items {
+            if !raw_item.get().starts_with('{') {
+                continue;
+            }
+            let Ok(item) = serde_json::from_str::<BorrowedToolResultItem<'_>>(raw_item.get())
+            else {
+                continue;
+            };
+            if decode_raw_str(item.kind).as_deref() != Some("tool-result") {
                 continue;
             }
             if !matches!(
-                c.get("toolName").and_then(|v| v.as_str()),
+                decode_raw_str(item.tool_name).as_deref(),
                 Some("Read" | "ReadFile")
             ) {
                 continue;
             }
-            let Some(id) = c
-                .get("toolCallId")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.is_empty())
-            else {
+            let Some(id) = decode_raw_str(item.tool_call_id).filter(|id| !id.is_empty()) else {
                 continue;
             };
-            if let Some(result) = c.get("result").and_then(|v| v.as_str()) {
+            if let Some(result) = decode_raw_str(item.result) {
                 map.insert(
-                    id.to_string(),
-                    CursorReadResult::Content(strip_cursor_line_numbers(result)),
+                    id.into_owned(),
+                    CursorReadResult::Content(strip_cursor_line_numbers(&result)),
                 );
             } else {
-                map.entry(id.to_string())
+                map.entry(id.into_owned())
                     .or_insert(CursorReadResult::Unsupported);
             }
         }
@@ -1095,15 +1155,6 @@ fn wrap_record(record: CodeAnalysisRecord, user: &str, machine: &str) -> CodeAna
         machine_id: machine.to_string(),
         records: vec![record],
     }
-}
-
-/// Converts a millisecond epoch timestamp into a local `YYYY-MM-DD` date.
-fn ms_to_local_date(ms: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp_millis(ms).map(|dt| {
-        dt.with_timezone(&chrono::Local)
-            .format("%Y-%m-%d")
-            .to_string()
-    })
 }
 
 /// Pre-computes the `YYYY-MM-DD` cutoff for `time_range`, if any.
@@ -1315,7 +1366,7 @@ mod tests {
                  "args": {"path": "/repo/w.rs"}},
             ]
         });
-        let mut reads = HashMap::new();
+        let mut reads = FastHashMap::default();
         reads.insert(
             "e".to_string(),
             CursorReadResult::Content("r1\nr2\nr3".to_string()),
@@ -1830,5 +1881,27 @@ mod tests {
         assert_eq!(result.parsed, 1);
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].path, invalid);
+    }
+
+    #[test]
+    fn message_role_and_collect_read_results_handle_edge_shapes() {
+        assert_eq!(
+            message_role(br#"{"role":"assistant","content":[1,2,3]}"#).as_deref(),
+            Some("assistant")
+        );
+        assert_eq!(message_role(br#"{"role":123}"#), None);
+        assert_eq!(message_role(br#"{"role":null}"#), None);
+        assert_eq!(message_role(br#"{"content":[]}"#), None);
+
+        let blobs = vec![
+            br#"{"role":"assistant","content":[{"type":"tool-result","toolName":"Read","toolCallId":"ignored","result":"1|x"}]}"#.to_vec(),
+            br#"{"role":"tool","content":[42,{"type":"tool-result","toolName":"Shell","toolCallId":"sh","result":"huge"},{"type":"tool-result","toolName":"ReadFile","toolCallId":"rf","result":" 1|hello\n 2|world"}]}"#.to_vec(),
+        ];
+        let results = collect_read_results(&blobs);
+        assert_eq!(results.len(), 1);
+        match results.get("rf") {
+            Some(CursorReadResult::Content(text)) => assert_eq!(text, "hello\nworld"),
+            _ => panic!("expected ReadFile content"),
+        }
     }
 }

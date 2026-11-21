@@ -14,11 +14,10 @@ use crate::utils::token_merge::write_tier_slice;
 use crate::utils::{MAX_TIER_LEVELS, TierSlice};
 use anyhow::{Context, Result};
 use percent_encoding::percent_decode_str;
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json, value::RawValue};
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -101,7 +100,7 @@ impl ModelUsage {
 #[derive(Debug, Default)]
 struct ConversationMeta {
     /// Model of each generation that records the step it answered, keyed by step index.
-    step_models: HashMap<i64, String>,
+    step_models: FastHashMap<i64, String>,
     /// First generation's model, used for steps before any keyed generation.
     first_model: Option<String>,
     workspace: Option<String>,
@@ -193,9 +192,12 @@ fn read_conversation_meta(db: &Path) -> Result<ConversationMeta> {
         |conn| {
             let mut meta = ConversationMeta::default();
             let mut statement = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx")?;
-            let rows = statement.query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))?;
-            for row in rows {
-                let Some((step, model)) = row?.as_deref().and_then(decode_generation) else {
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let Some(bytes) = row.get_ref(0)?.as_blob_or_null()? else {
+                    continue;
+                };
+                let Some((step, model)) = decode_generation(bytes) else {
                     continue;
                 };
                 meta.first_model.get_or_insert_with(|| model.clone());
@@ -210,15 +212,13 @@ fn read_conversation_meta(db: &Path) -> Result<ConversationMeta> {
                 |row| row.get(0),
             )?;
             if has_trajectory {
-                let blob: Option<Option<Vec<u8>>> = conn
-                    .query_row(
-                        "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(trajectory) = blob.flatten() {
-                    decode_trajectory(&trajectory, &mut meta);
+                let mut traj_stmt =
+                    conn.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")?;
+                let mut traj_rows = traj_stmt.query([])?;
+                if let Some(row) = traj_rows.next()?
+                    && let Some(trajectory) = row.get_ref(0)?.as_blob_or_null()?
+                {
+                    decode_trajectory(trajectory, &mut meta);
                 }
             }
             Ok(meta)
@@ -430,16 +430,12 @@ impl<'a> AntigravityParser<'a> {
 
         match kind {
             "PLANNER_RESPONSE" => {
-                if let Some(step) = object.get("step_index").and_then(Value::as_i64)
-                    && let Some(model) = self.meta.step_models.get(&step)
-                {
-                    self.current_model = Some(model.clone());
+                if let Some(step) = object.get("step_index").and_then(Value::as_i64) {
+                    self.update_current_model(step);
                 }
-                let model = self
-                    .current_model
-                    .clone()
-                    .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-                self.apply_usage(object, model);
+                if let Some(tokens) = Tokens::from_record(object) {
+                    self.apply_tokens(tokens);
+                }
                 // Results never outlive their step, so clearing prevents a short step from shifting the next step's pairing.
                 self.pending_calls.clear();
                 for call in object
@@ -461,17 +457,7 @@ impl<'a> AntigravityParser<'a> {
             // Compaction summaries are billed requests without a generation record, so attribute them to the active model.
             "CHECKPOINT" => {
                 if let Some(tokens) = Tokens::from_record(object) {
-                    self.diagnostics.record_relevant(true);
-                    let model = self
-                        .current_model
-                        .clone()
-                        .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-                    let level = self.classifier.as_mut().map_or(0, |classifier| {
-                        classifier.level(&model, tokens.request_context())
-                    });
-                    let entry = self.compaction.entry(model).or_default();
-                    entry.total.merge(tokens);
-                    entry.classify(level, tokens);
+                    self.apply_compaction_tokens(tokens);
                 }
             }
             "GENERIC" => {
@@ -494,21 +480,15 @@ impl<'a> AntigravityParser<'a> {
 
         match step.kind.as_ref() {
             "PLANNER_RESPONSE" => {
-                if let Some(idx) = step.step_index
-                    && let Some(model) = self.meta.step_models.get(&idx)
-                {
-                    self.current_model = Some(model.clone());
+                if let Some(idx) = step.step_index {
+                    self.update_current_model(idx);
                 }
-                let model = self
-                    .current_model
-                    .clone()
-                    .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
                 if let Some(tokens) = Tokens::from_borrowed(
                     step.input_tokens,
                     step.output_tokens,
                     step.cache_read_tokens,
                 ) {
-                    self.apply_tokens(tokens, model);
+                    self.apply_tokens(tokens);
                 }
                 self.pending_calls.clear();
                 for call in step.tool_calls.into_iter().flatten() {
@@ -534,17 +514,7 @@ impl<'a> AntigravityParser<'a> {
                     step.output_tokens,
                     step.cache_read_tokens,
                 ) {
-                    self.diagnostics.record_relevant(true);
-                    let model = self
-                        .current_model
-                        .clone()
-                        .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-                    let level = self.classifier.as_mut().map_or(0, |classifier| {
-                        classifier.level(&model, tokens.request_context())
-                    });
-                    let entry = self.compaction.entry(model).or_default();
-                    entry.total.merge(tokens);
-                    entry.classify(level, tokens);
+                    self.apply_compaction_tokens(tokens);
                 }
             }
             "GENERIC" => {
@@ -566,21 +536,29 @@ impl<'a> AntigravityParser<'a> {
         self.diagnostics.record_recognized_source();
     }
 
-    fn apply_usage(&mut self, object: &Map<String, Value>, model: String) {
-        let Some(tokens) = Tokens::from_record(object) else {
-            return;
-        };
-        self.apply_tokens(tokens, model);
+    fn update_current_model(&mut self, step: i64) {
+        if let Some(model) = self.meta.step_models.get(&step)
+            && self.current_model.as_deref() != Some(model.as_str())
+        {
+            self.current_model = Some(model.clone());
+        }
     }
 
-    fn apply_tokens(&mut self, tokens: Tokens, model: String) {
+    fn apply_tokens(&mut self, tokens: Tokens) {
         self.diagnostics.record_relevant(true);
-        let level = self.classifier.as_mut().map_or(0, |classifier| {
-            classifier.level(&model, tokens.request_context())
-        });
-        let entry = self.usage.entry(model).or_default();
-        entry.total.merge(tokens);
-        entry.classify(level, tokens);
+        let model = self.current_model.as_deref().unwrap_or(UNKNOWN_MODEL);
+        record_model_tokens(&mut self.usage, self.classifier.as_mut(), model, tokens);
+    }
+
+    fn apply_compaction_tokens(&mut self, tokens: Tokens) {
+        self.diagnostics.record_relevant(true);
+        let model = self.current_model.as_deref().unwrap_or(UNKNOWN_MODEL);
+        record_model_tokens(
+            &mut self.compaction,
+            self.classifier.as_mut(),
+            model,
+            tokens,
+        );
     }
 
     fn apply_result(&mut self, call: &PendingCall, result: &Map<String, Value>, timestamp: i64) {
@@ -637,15 +615,47 @@ impl<'a> AntigravityParser<'a> {
             "read_file" => arg("Path")
                 .filter(|path| !path.is_empty())
                 .is_some_and(|path| {
-                    let content = read_content()
-                        .as_deref()
-                        .map(numbered_lines)
-                        .unwrap_or_default();
-                    if content.is_empty() {
-                        self.state.tool_counts.read += 1;
-                        self.state.add_non_text_read_path(path);
+                    if matches!(self.state.mode, ParseMode::Full) {
+                        let content = read_content()
+                            .as_deref()
+                            .map(numbered_lines)
+                            .unwrap_or_default();
+                        if content.is_empty() {
+                            self.state.tool_counts.read += 1;
+                            self.state.add_non_text_read_path(path);
+                        } else {
+                            self.state.add_read_detail(path, &content, timestamp);
+                        }
                     } else {
-                        self.state.add_read_detail(path, &content, timestamp);
+                        let mut total_lines = 0usize;
+                        let mut non_empty_lines = 0usize;
+                        let mut chars_so_far = 0usize;
+                        let mut chars_up_to_last_non_empty = 0usize;
+                        if let Some(raw) = read_content() {
+                            for stripped in raw.split('\n').filter_map(strip_numbered_line) {
+                                if total_lines > 0 {
+                                    chars_so_far += 1;
+                                }
+                                chars_so_far += bytecount::num_chars(stripped.as_bytes());
+                                total_lines += 1;
+                                if !stripped.is_empty() {
+                                    non_empty_lines = total_lines;
+                                    chars_up_to_last_non_empty = chars_so_far;
+                                }
+                            }
+                        }
+                        if non_empty_lines > 0 {
+                            let resolved = self.state.normalize_path(path);
+                            if !resolved.is_empty() {
+                                self.state.unique_files.insert(resolved);
+                                self.state.total_read_lines += non_empty_lines;
+                                self.state.total_read_characters += chars_up_to_last_non_empty;
+                                self.state.tool_counts.read += 1;
+                            }
+                        } else if total_lines <= 1 {
+                            self.state.tool_counts.read += 1;
+                            self.state.add_non_text_read_path(path);
+                        }
                     }
                     true
                 }),
@@ -678,15 +688,13 @@ impl<'a> AntigravityParser<'a> {
     fn finish(self) -> ParsedAnalysis {
         let conversation_usage = self
             .usage
-            .iter()
-            .map(|(model, usage)| (model.clone(), usage_value(usage)))
+            .into_iter()
+            .map(|(model, usage)| (model, usage_value(&usage)))
             .collect();
         let mut record = self.state.into_record(conversation_usage);
         // Route compaction usage to `advisor_usage` because models in `conversation_usage` are credited with the session's tool counts.
-        for (model, usage) in &self.compaction {
-            record
-                .advisor_usage
-                .insert(model.clone(), usage_value(usage));
+        for (model, usage) in self.compaction {
+            record.advisor_usage.insert(model, usage_value(&usage));
         }
 
         ParsedAnalysis::new(
@@ -700,6 +708,24 @@ impl<'a> AntigravityParser<'a> {
             self.diagnostics,
         )
     }
+}
+
+fn record_model_tokens(
+    target: &mut FastHashMap<String, ModelUsage>,
+    classifier: Option<&mut TierClassifier<'_>>,
+    model: &str,
+    tokens: Tokens,
+) {
+    let level = classifier.map_or(0, |classifier| {
+        classifier.level(model, tokens.request_context())
+    });
+    let entry = if let Some(entry) = target.get_mut(model) {
+        entry
+    } else {
+        target.entry(model.to_owned()).or_default()
+    };
+    entry.total.merge(tokens);
+    entry.classify(level, tokens);
 }
 
 fn usage_value(usage: &ModelUsage) -> Value {
@@ -729,17 +755,25 @@ fn usage_value(usage: &ModelUsage) -> Value {
     value
 }
 
+/// Strips `<line>: ` from a single `read_file` line, returning `None` for non-numbered header lines.
+fn strip_numbered_line(line: &str) -> Option<&str> {
+    let digits = line.find(|c: char| !c.is_ascii_digit())?;
+    let rest = line[digits..].strip_prefix(':')?;
+    (digits > 0).then(|| rest.strip_prefix(' ').unwrap_or(rest))
+}
+
 /// Returns the file text from a `read_file` result by stripping the header and `<line>: ` prefixes.
 fn numbered_lines(content: &str) -> String {
-    content
-        .split('\n')
-        .filter_map(|line| {
-            let digits = line.find(|c: char| !c.is_ascii_digit())?;
-            let rest = line[digits..].strip_prefix(':')?;
-            (digits > 0).then(|| rest.strip_prefix(' ').unwrap_or(rest))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    let mut first = true;
+    for line in content.split('\n').filter_map(strip_numbered_line) {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(line);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -975,5 +1009,52 @@ mod tests {
 
         let parsed = parse_antigravity_session(&path, ParseMode::UsageOnly, None).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+    }
+
+    #[test]
+    fn read_file_usage_only_matches_full_mode_across_edge_cases() {
+        let samples = [
+            "Showing lines 1-3 of 3\n1: \n2: 你好🚀\n3: ",
+            "1: ",
+            "1: \n2: ",
+            "Binary file (no numbered lines)",
+            "1: first\n2: second\n3: third",
+        ];
+        for (idx, content) in samples.iter().enumerate() {
+            let temp = tempfile::tempdir().unwrap();
+            let mut step = planner(1, 10, 0, 5);
+            step["tool_calls"] = json!([
+                {"name": "read_file", "args": {"Path": "/w/sample.rs"}}
+            ]);
+            let result = json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-11T12:00:01Z",
+                "content": content,
+            });
+            let path = conversation(temp.path(), &[step, result], None);
+            let full = parse_antigravity_session(&path, ParseMode::Full, None).unwrap();
+            let usage_only = parse_antigravity_session(&path, ParseMode::UsageOnly, None).unwrap();
+            let full_rec = &full.analysis.records[0];
+            let usage_rec = &usage_only.analysis.records[0];
+            assert_eq!(
+                usage_rec.tool_call_counts.read, full_rec.tool_call_counts.read,
+                "sample {idx} read count"
+            );
+            assert_eq!(
+                usage_rec.total_read_lines, full_rec.total_read_lines,
+                "sample {idx} read lines"
+            );
+            assert_eq!(
+                usage_rec.total_read_characters, full_rec.total_read_characters,
+                "sample {idx} read chars"
+            );
+            assert_eq!(
+                usage_rec.total_unique_files, full_rec.total_unique_files,
+                "sample {idx} unique files"
+            );
+        }
     }
 }

@@ -14,9 +14,10 @@ use crate::session::cursor::{
     discover_cursor_store_dbs, load_conversation_model_snapshot, read_cursor_usage_store,
     read_store_analysis,
 };
-use crate::session::sqlite::is_cacheable_sqlite_failure;
+use crate::session::sqlite::{is_cacheable_sqlite_failure, optional_database_fingerprint};
 use crate::utils::{HelperPaths, get_current_user, get_machine_id};
 use anyhow::Result;
+use rayon::prelude::*;
 use std::path::Path;
 
 /// One store's `feature` half from one read.
@@ -128,19 +129,18 @@ pub(crate) fn scan_cursor_stores(
         diagnostics.record_hard_failure(provider, &failure.path, failure.error);
     }
 
-    // Read the shared tracking DB once; if it fails, fold stores without stamping or caching their unattributed results.
-    let (conv_models, tracking_fingerprint, tracking_ok) =
-        match load_conversation_model_snapshot(tracking_db) {
-            Ok(snapshot) => (snapshot.models, snapshot.fingerprint, true),
-            Err(error) => {
-                diagnostics.record_hard_failure(provider, tracking_db, format!("{error:#}"));
-                (FastHashMap::default(), None, false)
-            }
-        };
-    let user = get_current_user();
-    let machine = get_machine_id();
+    // Fingerprint the shared tracking DB upfront; only open and query it when at least one store misses the ledger (or when no stores exist to validate its readability).
+    let (initial_tracking_fp, tracking_ok) = match optional_database_fingerprint(tracking_db) {
+        Ok(fingerprint) => (fingerprint, true),
+        Err(error) => {
+            diagnostics.record_hard_failure(provider, tracking_db, format!("{error:#}"));
+            (None, false)
+        }
+    };
+    let discovery_empty = discovery.stores.is_empty();
     let roots = [chats_dir];
     let mut seen = FastHashSet::default();
+    let mut misses = Vec::new();
 
     for store in discovery.stores {
         diagnostics.candidates += 1;
@@ -149,7 +149,7 @@ pub(crate) fn scan_cursor_stores(
         let current = if tracking_ok {
             match stamp::sqlite_source(&store) {
                 Ok(mut files) => {
-                    stamp::add_dependency(&mut files, tracking_db, tracking_fingerprint.as_ref());
+                    stamp::add_dependency(&mut files, tracking_db, initial_tracking_fp.as_ref());
                     Some(ScanStamp::new(tiers.clone(), files))
                 }
                 Err(error) => {
@@ -176,48 +176,103 @@ pub(crate) fn scan_cursor_stores(
             book.mark_present(&key);
             continue;
         }
+        misses.push((store, key, current));
+    }
 
-        ledger.record_parses(1);
-        match read_store_half(&store, feature, &conv_models, &user, machine) {
-            Ok(read) => {
-                let Some(current) = current else {
-                    if read.parsed {
-                        diagnostics.parsed += 1;
-                        fold_days(provider, &read.days, cutoff.as_deref(), sink);
+    let conv_models = if tracking_ok
+        && (!misses.is_empty() || (discovery_empty && initial_tracking_fp.is_some()))
+    {
+        match load_conversation_model_snapshot(tracking_db) {
+            Ok(snapshot) => {
+                if snapshot.fingerprint != initial_tracking_fp {
+                    for (_, _, current) in &mut misses {
+                        if let Some(stamp) = current {
+                            stamp::add_dependency(
+                                &mut stamp.files,
+                                tracking_db,
+                                snapshot.fingerprint.as_ref(),
+                            );
+                        }
                     }
-                    if let Some(failure) = read.failure {
-                        diagnostics.record_failure(provider, &store, failure);
-                    }
-                    continue;
-                };
-                let entry = book.sessions.entry(key).or_default();
-                entry.replace_half(feature, read.days);
-                entry
-                    .scanned
-                    .set_half(feature, current.with_verdict(read.parsed, read.failure));
-                entry.missing_since = None;
-                fold_present(
-                    provider,
-                    &store,
-                    entry,
-                    feature,
-                    cutoff.as_deref(),
-                    sink,
-                    diagnostics,
-                );
-                book.dirty = true;
+                }
+                snapshot.models
             }
             Err(error) => {
-                let failure = format!("{error:#}");
-                diagnostics.record_hard_failure(provider, &store, failure.clone());
-                if let Some(current) = current
-                    && is_cacheable_sqlite_failure(&error)
-                {
+                diagnostics.record_hard_failure(provider, tracking_db, format!("{error:#}"));
+                for (_, _, current) in &mut misses {
+                    *current = None;
+                }
+                FastHashMap::default()
+            }
+        }
+    } else {
+        FastHashMap::default()
+    };
+
+    if !misses.is_empty() {
+        let user = get_current_user();
+        let machine = get_machine_id();
+        ledger.record_parses(misses.len());
+        let reads: Vec<_> = if misses.len() >= 2 {
+            misses
+                .into_par_iter()
+                .map(|(store, key, current)| {
+                    let read = read_store_half(&store, feature, &conv_models, &user, machine);
+                    (store, key, current, read)
+                })
+                .collect()
+        } else {
+            misses
+                .into_iter()
+                .map(|(store, key, current)| {
+                    let read = read_store_half(&store, feature, &conv_models, &user, machine);
+                    (store, key, current, read)
+                })
+                .collect()
+        };
+
+        for (store, key, current, read) in reads {
+            match read {
+                Ok(read) => {
+                    let Some(current) = current else {
+                        if read.parsed {
+                            diagnostics.parsed += 1;
+                            fold_days(provider, &read.days, cutoff.as_deref(), sink);
+                        }
+                        if let Some(failure) = read.failure {
+                            diagnostics.record_failure(provider, &store, failure);
+                        }
+                        continue;
+                    };
                     let entry = book.sessions.entry(key).or_default();
+                    entry.replace_half(feature, read.days);
                     entry
                         .scanned
-                        .set_half(feature, current.with_verdict(false, Some(failure)));
+                        .set_half(feature, current.with_verdict(read.parsed, read.failure));
+                    entry.missing_since = None;
+                    fold_present(
+                        provider,
+                        &store,
+                        entry,
+                        feature,
+                        cutoff.as_deref(),
+                        sink,
+                        diagnostics,
+                    );
                     book.dirty = true;
+                }
+                Err(error) => {
+                    let failure = format!("{error:#}");
+                    diagnostics.record_hard_failure(provider, &store, failure.clone());
+                    if let Some(current) = current
+                        && is_cacheable_sqlite_failure(&error)
+                    {
+                        let entry = book.sessions.entry(key).or_default();
+                        entry
+                            .scanned
+                            .set_half(feature, current.with_verdict(false, Some(failure)));
+                        book.dirty = true;
+                    }
                 }
             }
         }
@@ -227,4 +282,93 @@ pub(crate) fn scan_cursor_stores(
     let retained = fold_unseen(provider, &book, &seen, cutoff.as_deref(), sink, diagnostics);
     ledger.record_retained(retained);
     ledger.put_provider(provider, book);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::compact::NoopSink;
+    use crate::utils::resolve_paths_from_home;
+    use rusqlite::Connection;
+
+    fn seed_store(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); \
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn warm_cursor_scan_defers_opening_tracking_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = resolve_paths_from_home(dir.path());
+        seed_store(&paths.cursor_chats_dir.join("proj/conv-a/store.db"));
+        seed_store(&paths.cursor_chats_dir.join("proj/conv-b/store.db"));
+        std::fs::create_dir_all(paths.cursor_tracking_db.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&paths.cursor_tracking_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ai_code_hashes (conversationId TEXT, model TEXT); \
+                 INSERT INTO ai_code_hashes VALUES ('conv-a', 'model-a'), ('conv-b', 'model-b');",
+            )
+            .unwrap();
+        }
+
+        let mut ledger = SessionLedger::new();
+        let mut sink = NoopSink;
+        let mut cold_diag = ScanDiagnostics::default();
+        scan_cursor_stores(
+            &paths,
+            ScanFeature::Usage,
+            None,
+            TimeRange::All,
+            &mut ledger,
+            &mut sink,
+            &mut cold_diag,
+        );
+        assert_eq!(cold_diag.candidates, 2);
+        assert_eq!(cold_diag.parsed, 2);
+        assert!(cold_diag.failures.is_empty());
+        assert_eq!(ledger.stats().parsed_sources, 2);
+
+        // On Unix, removing read permission leaves `len` and `mtime` intact so `stat` matches while opening `tracking.db` would fail.
+        #[cfg(unix)]
+        struct RestorePerms<'a>(&'a Path);
+        #[cfg(unix)]
+        impl Drop for RestorePerms<'_> {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+        #[cfg(unix)]
+        let _guard = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &paths.cursor_tracking_db,
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            RestorePerms(&paths.cursor_tracking_db)
+        };
+
+        ledger.begin_local_scan();
+        let mut warm_diag = ScanDiagnostics::default();
+        scan_cursor_stores(
+            &paths,
+            ScanFeature::Usage,
+            None,
+            TimeRange::All,
+            &mut ledger,
+            &mut sink,
+            &mut warm_diag,
+        );
+        assert_eq!(warm_diag.candidates, 2);
+        assert_eq!(warm_diag.parsed, 2);
+        assert!(warm_diag.failures.is_empty(), "{:?}", warm_diag.failures);
+        assert_eq!(ledger.stats().parsed_sources, 0);
+    }
 }
