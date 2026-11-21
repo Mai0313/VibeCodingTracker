@@ -16,7 +16,7 @@ use crate::session::detector::{RecordClassifier, detect_extension_type};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::dsh::{has_zstd_magic, parse_dsh_session};
 use crate::session::gemini::parse_gemini_events_with_diagnostics;
-use crate::session::grok::parse_grok_session;
+use crate::session::grok::{parse_grok_session, parse_grok_session_known};
 use crate::session::state::ParseMode;
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result, bail};
@@ -312,6 +312,10 @@ fn stream_parse_known(
                 merge_extra_diagnostics(parsed, &diagnostics),
                 provider,
             )))
+        }
+        // Grok `signals.json` is pretty-printed JSON with sibling session files; open it once directly.
+        ExtensionType::Grok => {
+            Ok(parse_grok_session_known(path, mode)?.map(|parsed| finalize(parsed, provider)))
         }
         // DeepSeek logs are concatenated zstd frames by default, so `parse_dsh_session` reads them directly.
         ExtensionType::DeepSeek => Ok(Some(finalize(
@@ -610,7 +614,7 @@ fn read_next_non_empty_bytes<R: BufRead>(
     }
 }
 
-fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+pub(crate) fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())
