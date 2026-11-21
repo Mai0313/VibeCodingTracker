@@ -173,6 +173,10 @@ vct usage --text
 # JSON 輸出，每列都有 cost_usd；以其他 model 名稱計價時才會多出 matched_model 欄位
 vct usage --json
 
+# 依本地日期分組的 JSON（含 `priced` 標記與已同步的 remote 資訊，可搭配時間範圍參數）
+vct usage --json --by-day
+vct usage --json --by-day --monthly
+
 # 透過 shell redirection 儲存富化 JSON
 vct usage --json > report.json
 
@@ -184,13 +188,15 @@ vct usage --json --daily
 # 合併同一 model 在不同 provider 前綴下的多列
 # (例如 openai/gpt-5.5 + azure/gpt-5.5 + gpt-5.5 -> 一列)
 vct usage --table --merge-providers
+vct usage --json --merge-providers
+vct usage --json --by-day --merge-providers
 ```
 
 > [!NOTE]
-> `--table` 與 `--text` 的 model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後（在 `--table` 中緊鄰 `TOTAL` 列上方）；`--json` 的列則沒有固定順序。互動式介面預設依 cost 由大到小排序，按 `←` / `→` 可改用左邊或右邊那一欄排序，排序欄的表頭會標亮。表格標題右側會標出目前的排序（`sort: cost ▼`）。互動式介面也會隱藏在所選範圍內用量為 0 的 model。
+> `--table` 與 `--text` 的 model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後（在 `--table` 中緊鄰 `TOTAL` 列上方）；`--json` 的列則沒有固定順序，除非指定 `--merge-providers` 或 `--by-day`（兩者皆依 cost 由小到大、再依 model 名稱排序；`--by-day` 依日期由早到晚排序）。互動式介面預設依 cost 由大到小排序，按 `←` / `→` 可改用左邊或右邊那一欄排序，排序欄的表頭會標亮。表格標題右側會標出目前的排序（`sort: cost ▼`）。互動式介面也會隱藏在所選範圍內用量為 0 的 model。
 
 > [!TIP]
-> 同一個 model 在不同 provider 前綴下路由時會帶有不同前綴（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。預設情況下，`vct` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加（可在 `Settings > Usage > Merge models across providers` 切換，對應 `~/.vct/config.toml` 的 `usage.merge_models = true`）。若在 Settings 中關閉，`--merge-providers` 可在單次執行時強制開啟合併。`--json` 保持為逐一 model 的原始輸出。
+> 同一個 model 在不同 provider 前綴下路由時會帶有不同前綴（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。預設情況下，`vct` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加（可在 `Settings > Usage > Merge models across providers` 切換，對應 `~/.vct/config.toml` 的 `usage.merge_models = true`）。若在 Settings 中關閉，`--merge-providers` 可在單次執行時強制開啟合併。`--json` 預設維持逐一 model 的原始輸出，僅在明確傳入 `--merge-providers` 時合併。
 
 ### 預覽：Usage 分頁（`vct usage`）
 
@@ -470,7 +476,7 @@ vct version --json   # 機器可讀的 JSON
 
 ## Quota 指令
 
-**全螢幕的即時 quota 面板，或某個供應商的原始 quota/usage API 回應。**
+**全螢幕的即時 quota 面板、正規化的多供應商 quota JSON，或某個供應商的原始 quota/usage API 回應。**
 
 ### Quota 分頁
 
@@ -509,11 +515,19 @@ vct quota
 
 > `vct monitor` 與隱藏別名 `vct fetch` 已移除。要看卡片請用 `vct quota`，要看原始回應請用 `vct quota <provider>`。
 
+### 正規化 Quota JSON（`vct quota --json`）
+
+不帶供應商並傳入 `--json` 時，`vct quota --json` 會平行取得 `[usage.quota].panels` 中所有已啟用且具備憑證的供應商額度，執行與 Quota 分頁相同的 OAuth 刷新、Codex 工作階段回退與 `~/.vct/quota/<provider>.json` 快取寫入，並輸出正規化的 JSON 卡片陣列供腳本與外部儀表板讀取。沒有憑證的供應商會被略過；單一供應商的驗證或取得錯誤會回報於該卡片上（`needs_login` / `error`），不會中斷整個指令。
+
+```bash
+vct quota --json
+```
+
 ### 原始回應（`vct quota <provider>`）
 
 帶上供應商時，`vct quota` 會印出該供應商的原始回應，不解析、不彙整。它對 `usage` 面板使用的同一個 quota 端點（Claude / Codex / Copilot / Cursor / Grok / Antigravity）發起請求，直接印出原始 body，方便你檢視 API 的實際結構或確認憑證是否正常。對 Claude、Codex 和 Grok，它會在 OAuth token 接近過期或被拒絕時自動刷新一次，並將輪換後的 token 寫回該 CLI 的憑證檔案，行為與儀表板一致；Copilot、Cursor 與 Antigravity 為唯讀，token 被拒時請用對應供應商自己的 CLI 重新驗證（`claude` / `codex` / `copilot` / `cursor-agent` / `grok` / `agy models`）。
 
-`--json`、`--text` 與 `--table` 印出的是單一供應商的回應，所以不帶供應商的 `vct quota --json` 會回報錯誤。
+`--text` 與 `--table` 印出的是單一供應商的回應，所以不帶供應商的 `vct quota --text` 或 `vct quota --table` 會回報錯誤。
 
 ```bash
 # 原始 JSON（預設）
