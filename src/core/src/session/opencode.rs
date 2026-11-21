@@ -1,9 +1,9 @@
 //! OpenCode session reader for the local SQLite database (`~/.local/share/opencode/opencode.db`).
 //!
-//! - [`read_opencode_usage`] reads assistant messages for per-model tokens and stored cost, falling back to the legacy `session` table when no `message` table exists.
-//! - [`read_opencode_analysis`] additionally folds tracked `part` tool calls (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`) into per-message file-operation metrics.
+//! - [`read_opencode_usage`] reads assistant messages for per-model tokens and stored cost, preferring v2 (`session_v2`/`session_message`) tables with fallback to legacy `message`/`session` tables.
+//! - [`read_opencode_analysis`] additionally folds tracked tool calls (`read`, `edit`, `write`, `bash`, `shell`, `execute`, `todowrite`, `apply_patch`) from inline v2 `content[]` items or legacy `part` rows into per-message file-operation metrics.
 //!
-//! Output uses the shared [`CodeAnalysis`] shape with disjoint token buckets (`input`, `output`, `reasoning`, `cache_read`, `cache_write`). Assistant messages carry their own `providerID` and `modelID`, splitting mid-session model switches into separate rows.
+//! Output uses the shared [`CodeAnalysis`] shape with disjoint token buckets (`input`, `output`, `reasoning`, `cache_read`, `cache_write`). Assistant messages carry their own provider and model metadata, splitting mid-session model switches into separate rows.
 
 use crate::VERSION;
 use crate::constants::FastHashMap;
@@ -68,14 +68,18 @@ pub(crate) fn read_opencode_usage_contributions(
     tiers: Option<&TierThresholds>,
 ) -> Result<DatabaseUsageRead> {
     let cutoff_ms = cutoff_millis(time_range);
-    with_readonly_connection(db_path, "session", "vct-opencode-", "OpenCode", |conn| {
-        collect_usage(conn, cutoff_ms, tiers)
-    })
+    with_readonly_connection(
+        db_path,
+        "sqlite_master",
+        "vct-opencode-",
+        "OpenCode",
+        |conn| collect_usage(conn, cutoff_ms, tiers),
+    )
 }
 
 /// Returns per-message file-operation metrics from the OpenCode database at `db_path` within `time_range`.
 ///
-/// Like [`read_opencode_usage`], and also folds tracked `part` tool calls into `tool_call_counts` and `total_*` line/character metrics inside a single SQLite transaction for snapshot consistency. `mode` controls whether per-operation detail bodies are retained ([`ParseMode::Full`]) or skipped ([`ParseMode::UsageOnly`]).
+/// Like [`read_opencode_usage`], and also folds tracked tool calls (inline `content[]` items in v2 `session_message`, or legacy `part` rows) into `tool_call_counts` and `total_*` line/character metrics inside a single SQLite transaction for snapshot consistency. `mode` controls whether per-operation detail bodies are retained ([`ParseMode::Full`]) or skipped ([`ParseMode::UsageOnly`]).
 ///
 /// # Errors
 ///
@@ -131,17 +135,23 @@ pub(crate) fn read_opencode_analysis_with_diagnostics(
     mode: ParseMode,
 ) -> Result<OpenCodeAnalysisRead> {
     let cutoff_ms = cutoff_millis(time_range);
-    with_readonly_connection(db_path, "session", "vct-opencode-", "OpenCode", |conn| {
-        let transaction = conn.unchecked_transaction()?;
-        let collected = collect_analysis(&transaction, cutoff_ms, mode)?;
-        transaction.commit()?;
-        Ok(OpenCodeAnalysisRead {
-            rows: collected.rows,
-            expected_records: collected.expected_records,
-            parsed_records: collected.parsed_records,
-            failed_tool_parts: collected.failed_tool_parts,
-        })
-    })
+    with_readonly_connection(
+        db_path,
+        "sqlite_master",
+        "vct-opencode-",
+        "OpenCode",
+        |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let collected = collect_analysis(&transaction, cutoff_ms, mode)?;
+            transaction.commit()?;
+            Ok(OpenCodeAnalysisRead {
+                rows: collected.rows,
+                expected_records: collected.expected_records,
+                parsed_records: collected.parsed_records,
+                failed_tool_parts: collected.failed_tool_parts,
+            })
+        },
+    )
 }
 
 /// Parsed usage for one OpenCode assistant message.
@@ -159,6 +169,7 @@ struct AnalysisAccum {
     session_id: String,
     last_ts: i64,
     usage: Value,
+    has_nonzero_tokens: bool,
     state: Option<SessionParseState>,
 }
 
@@ -210,14 +221,45 @@ struct CollectedAnalysis {
     failed_tool_parts: usize,
 }
 
+fn has_nonzero_tokens(usage: &UsageTokenContribution) -> bool {
+    usage.input_tokens != 0
+        || usage.output_tokens != 0
+        || usage.reasoning_tokens != 0
+        || usage.cache_read_tokens != 0
+        || usage.cache_creation_tokens != 0
+}
+
+fn carries_usage(usage: &UsageTokenContribution, cost: f64) -> bool {
+    has_nonzero_tokens(usage) || cost != 0.0
+}
+
+fn has_tracked_tool_calls(state: Option<&SessionParseState>) -> bool {
+    state.is_some_and(|s| {
+        let c = &s.tool_counts;
+        c.read > 0 || c.write > 0 || c.edit > 0 || c.bash > 0 || c.todo_write > 0
+    })
+}
+
+fn resolve_v2_fallback_ts(message_updated: i64, message_created: i64, session_updated: i64) -> i64 {
+    if message_updated > 0 {
+        message_updated
+    } else if message_created > 0 {
+        message_created
+    } else {
+        session_updated
+    }
+}
+
 /// Collects the `usage` view from assistant messages when available.
 fn collect_usage(
     conn: &Connection,
     cutoff_ms: Option<i64>,
     tiers: Option<&TierThresholds>,
 ) -> Result<DatabaseUsageRead> {
-    if table_exists(conn, "message")? {
-        return collect_message_usage(conn, cutoff_ms, tiers);
+    let has_v2 = table_exists(conn, "session_message")? && table_exists(conn, "session_v2")?;
+    let has_legacy_message = table_exists(conn, "message")? && table_exists(conn, "session")?;
+    if has_v2 || has_legacy_message {
+        return collect_message_usage(conn, cutoff_ms, tiers, has_v2, has_legacy_message);
     }
 
     collect_session_usage(conn, cutoff_ms)
@@ -287,48 +329,50 @@ fn collect_session_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
     })
 }
 
-/// Collects the `usage` view from assistant messages.
+/// Collects the `usage` view from assistant messages (v2 `session_message` preferred, plus any unmigrated legacy `message` rows).
 fn collect_message_usage(
     conn: &Connection,
     cutoff_ms: Option<i64>,
     tiers: Option<&TierThresholds>,
+    has_v2: bool,
+    has_legacy_message: bool,
 ) -> Result<DatabaseUsageRead> {
-    let mut stmt = conn.prepare(
-        "SELECT message.data, session.time_updated, message.session_id, session.directory \
-         FROM message \
-         JOIN session ON session.id = message.session_id \
-         WHERE json_extract(message.data, '$.role') = 'assistant'",
-    )?;
-    let mut rows = stmt.query([])?;
-
     let mut classifier = tiers.map(TierClassifier::new);
     let mut date_cache = LocalDateCache::default();
     let mut out = Vec::new();
     let mut expected_records = 0usize;
-    while let Some(row) = rows.next()? {
-        let data_text = row.get_ref(0)?.as_str()?;
-        let session_time_updated = row.get::<_, i64>(1)?;
+    let mut parsed_records = 0usize;
+
+    #[allow(clippy::too_many_arguments)]
+    let mut fold_row = |data_text: &str,
+                        fallback_ts: i64,
+                        session_id: String,
+                        directory: Option<String>,
+                        require_assistant_role: bool| {
         let parsed = serde_json::from_str::<BorrowedMessageData<'_>>(data_text).ok();
-        let message_ts = parsed.as_ref().map_or(session_time_updated, |data| {
-            resolve_message_timestamp(data.time, session_time_updated)
+        let message_ts = parsed.as_ref().map_or(fallback_ts, |data| {
+            resolve_message_timestamp(data.time, fallback_ts)
         });
         if let Some(cutoff) = cutoff_ms
             && message_ts < cutoff
         {
-            continue;
+            return;
         }
         expected_records += 1;
         let Some(data) = parsed else {
-            continue;
+            return;
         };
-        let Some(message) = parse_borrowed_message_usage(&data) else {
-            continue;
+        let Some(message) = parse_borrowed_message_usage(&data, require_assistant_role) else {
+            return;
         };
         let Some(date) = date_cache.format_ms(message_ts) else {
-            continue;
+            return;
         };
-        let session_id = row.get::<_, String>(2)?;
-        let directory = row.get::<_, Option<String>>(3)?;
+        parsed_records += 1;
+        // Skip zero-token zero-cost failed turns so they do not create all-zero `$0.00` rows.
+        if !carries_usage(&message.usage, message.cost) {
+            return;
+        }
 
         let tier_level = classifier.as_mut().map_or(0, |classifier| {
             classifier.level(&message.model_id, request_context(&message.usage))
@@ -344,9 +388,55 @@ fn collect_message_usage(
         );
         contribution.cwd = directory.filter(|directory| !directory.is_empty());
         out.push(contribution);
+    };
+
+    if has_v2 {
+        let mut stmt = conn.prepare(
+            "SELECT session_message.data, session_message.time_updated, \
+                    session_message.time_created, session_v2.time_updated, \
+                    session_message.session_id, session_v2.directory \
+             FROM session_message \
+             JOIN session_v2 ON session_v2.id = session_message.session_id \
+             WHERE session_message.type = 'assistant'",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let data_text = row.get_ref(0)?.as_str()?;
+            let fallback_ts = resolve_v2_fallback_ts(
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            );
+            let session_id = row.get::<_, String>(4)?;
+            let directory = row.get::<_, Option<String>>(5)?;
+            fold_row(data_text, fallback_ts, session_id, directory, false);
+        }
     }
 
-    let parsed_records = out.len();
+    if has_legacy_message {
+        let sql = if has_v2 {
+            "SELECT message.data, session.time_updated, message.session_id, session.directory \
+             FROM message \
+             JOIN session ON session.id = message.session_id \
+             WHERE json_extract(message.data, '$.role') = 'assistant' \
+               AND NOT EXISTS (SELECT 1 FROM session_message sm WHERE sm.id = message.id)"
+        } else {
+            "SELECT message.data, session.time_updated, message.session_id, session.directory \
+             FROM message \
+             JOIN session ON session.id = message.session_id \
+             WHERE json_extract(message.data, '$.role') = 'assistant'"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let data_text = row.get_ref(0)?.as_str()?;
+            let session_time_updated = row.get::<_, i64>(1)?;
+            let session_id = row.get::<_, String>(2)?;
+            let directory = row.get::<_, Option<String>>(3)?;
+            fold_row(data_text, session_time_updated, session_id, directory, true);
+        }
+    }
+
     Ok(DatabaseUsageRead {
         rows: out,
         expected_records,
@@ -354,14 +444,16 @@ fn collect_message_usage(
     })
 }
 
-/// Collects the `analysis` view from assistant messages + parts when available.
+/// Collects the `analysis` view from assistant messages + tools when available.
 fn collect_analysis(
     conn: &Connection,
     cutoff_ms: Option<i64>,
     mode: ParseMode,
 ) -> Result<CollectedAnalysis> {
-    if table_exists(conn, "message")? {
-        return collect_message_analysis(conn, cutoff_ms, mode);
+    let has_v2 = table_exists(conn, "session_message")? && table_exists(conn, "session_v2")?;
+    let has_legacy_message = table_exists(conn, "message")? && table_exists(conn, "session")?;
+    if has_v2 || has_legacy_message {
+        return collect_message_analysis(conn, cutoff_ms, mode, has_v2, has_legacy_message);
     }
 
     collect_session_analysis(conn, cutoff_ms, mode)
@@ -419,8 +511,9 @@ fn collect_session_analysis(
             };
 
             // Analysis is never priced, so tier level is always 0.
-            let usage = session_usage_value(input, output, reasoning, cache_read, cache_write)
-                .into_value(0);
+            let tokens = session_usage_value(input, output, reasoning, cache_read, cache_write);
+            let nonzero_tokens = has_nonzero_tokens(&tokens);
+            let usage = tokens.into_value(0);
 
             sessions.insert(
                 id.clone(),
@@ -431,6 +524,7 @@ fn collect_session_analysis(
                     session_id: id,
                     last_ts: ts,
                     usage,
+                    has_nonzero_tokens: nonzero_tokens,
                     state: None,
                 },
             );
@@ -488,33 +582,65 @@ fn collect_session_analysis(
     })
 }
 
-/// Collects the `analysis` view from assistant messages and their parts.
+/// Converts a populated accumulator into one [`DatabaseAnalysisRow`].
+fn finalize_analysis_row(
+    source_id: String,
+    mut accum: AnalysisAccum,
+    user: &str,
+    machine: &str,
+) -> DatabaseAnalysisRow {
+    let mut usage_map = FastHashMap::default();
+    let model_id = std::mem::take(&mut accum.model_id);
+    let usage = std::mem::take(&mut accum.usage);
+    let date = std::mem::take(&mut accum.date);
+    usage_map.insert(model_id, usage);
+    let (session_id, record) = accum.into_record(usage_map);
+    DatabaseAnalysisRow {
+        session_id,
+        source_id,
+        date,
+        analysis: wrap_record(record, user, machine),
+    }
+}
+
+/// Collects the `analysis` view from assistant messages and their tools (v2 `session_message` preferred, plus any unmigrated legacy `message` + `part` rows).
 fn collect_message_analysis(
     conn: &Connection,
     cutoff_ms: Option<i64>,
     mode: ParseMode,
+    has_v2: bool,
+    has_legacy_message: bool,
 ) -> Result<CollectedAnalysis> {
     let user = get_current_user();
     let machine = get_machine_id().to_string();
     let mut date_cache = LocalDateCache::default();
 
-    let mut messages: FastHashMap<String, AnalysisAccum> = FastHashMap::default();
+    let mut out = Vec::new();
     let mut expected_records = 0usize;
-    {
+    let mut parsed_records = 0usize;
+    let mut failed_tool_parts = 0usize;
+
+    if has_v2 {
         let mut stmt = conn.prepare(
-            "SELECT message.id, message.session_id, message.data, session.directory, session.time_updated \
-             FROM message \
-             JOIN session ON session.id = message.session_id \
-             WHERE json_extract(message.data, '$.role') = 'assistant'",
+            "SELECT session_message.id, session_message.session_id, session_message.data, \
+                    session_v2.directory, session_message.time_updated, \
+                    session_message.time_created, session_v2.time_updated \
+             FROM session_message \
+             JOIN session_v2 ON session_v2.id = session_message.session_id \
+             WHERE session_message.type = 'assistant'",
         )?;
         let mut rows = stmt.query([])?;
 
         while let Some(row) = rows.next()? {
             let data_text = row.get_ref(2)?.as_str()?;
-            let session_time_updated = row.get::<_, i64>(4)?;
+            let fallback_ts = resolve_v2_fallback_ts(
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            );
             let parsed = serde_json::from_str::<BorrowedMessageData<'_>>(data_text).ok();
-            let message_ts = parsed.as_ref().map_or(session_time_updated, |data| {
-                resolve_message_timestamp(data.time, session_time_updated)
+            let message_ts = parsed.as_ref().map_or(fallback_ts, |data| {
+                resolve_message_timestamp(data.time, fallback_ts)
             });
             if let Some(cutoff) = cutoff_ms
                 && message_ts < cutoff
@@ -525,7 +651,7 @@ fn collect_message_analysis(
             let Some(data) = parsed else {
                 continue;
             };
-            let Some(message) = parse_borrowed_message_usage(&data) else {
+            let Some(message) = parse_borrowed_message_usage(&data, false) else {
                 continue;
             };
             let Some(date) = date_cache.format_ms(message_ts) else {
@@ -535,62 +661,128 @@ fn collect_message_analysis(
             let session_id = row.get::<_, String>(1)?;
             let directory = row.get::<_, String>(3)?;
 
-            messages.insert(
-                message_id,
-                AnalysisAccum {
-                    model_id: message.model_id,
-                    date: date.to_owned(),
-                    folder_path: directory,
-                    session_id,
-                    last_ts: message_ts,
-                    // Analysis is never priced, so tier level is always 0.
-                    usage: message.usage.into_value(0),
-                    state: None,
-                },
-            );
+            let nonzero_tokens = has_nonzero_tokens(&message.usage);
+            let mut accum = AnalysisAccum {
+                model_id: message.model_id,
+                date: date.to_owned(),
+                folder_path: directory,
+                session_id,
+                last_ts: message_ts,
+                // Analysis is never priced, so tier level is always 0.
+                usage: message.usage.into_value(0),
+                has_nonzero_tokens: nonzero_tokens,
+                state: None,
+            };
+            fold_inline_content_tools(&mut accum, mode, data.content, &mut failed_tool_parts);
+            parsed_records += 1;
+            if accum.has_nonzero_tokens || has_tracked_tool_calls(accum.state.as_ref()) {
+                out.push(finalize_analysis_row(message_id, accum, &user, &machine));
+            }
         }
     }
 
-    let mut failed_tool_parts = 0usize;
-    if !messages.is_empty() {
-        // Scalar counters and unique-file sets are commutative, so `UsageOnly` skips `ORDER BY id` sorting while keeping per-message granularity identical to `Full`.
-        let sql = match mode {
-            ParseMode::Full => "SELECT message_id, data FROM part ORDER BY id",
-            ParseMode::UsageOnly => "SELECT message_id, data FROM part",
-        };
-        let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
+    if has_legacy_message {
+        let mut messages: FastHashMap<String, AnalysisAccum> = FastHashMap::default();
+        {
+            let sql = if has_v2 {
+                "SELECT message.id, message.session_id, message.data, session.directory, session.time_updated \
+                 FROM message \
+                 JOIN session ON session.id = message.session_id \
+                 WHERE json_extract(message.data, '$.role') = 'assistant' \
+                   AND NOT EXISTS (SELECT 1 FROM session_message sm WHERE sm.id = message.id)"
+            } else {
+                "SELECT message.id, message.session_id, message.data, session.directory, session.time_updated \
+                 FROM message \
+                 JOIN session ON session.id = message.session_id \
+                 WHERE json_extract(message.data, '$.role') = 'assistant'"
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let mut rows = stmt.query([])?;
 
-        while let Some(row) = rows.next()? {
-            let ValueRef::Text(message_id_bytes) = row.get_ref(0)? else {
-                continue;
-            };
-            let Ok(message_id) = std::str::from_utf8(message_id_bytes) else {
-                continue;
-            };
-            let Some(accum) = messages.get_mut(message_id) else {
-                continue;
-            };
-            let data_text = row.get_ref(1)?.as_str()?;
-            fold_tool_part_str(accum, mode, data_text, &mut failed_tool_parts);
+            while let Some(row) = rows.next()? {
+                let data_text = row.get_ref(2)?.as_str()?;
+                let session_time_updated = row.get::<_, i64>(4)?;
+                let parsed = serde_json::from_str::<BorrowedMessageData<'_>>(data_text).ok();
+                let message_ts = parsed.as_ref().map_or(session_time_updated, |data| {
+                    resolve_message_timestamp(data.time, session_time_updated)
+                });
+                if let Some(cutoff) = cutoff_ms
+                    && message_ts < cutoff
+                {
+                    continue;
+                }
+                expected_records += 1;
+                let Some(data) = parsed else {
+                    continue;
+                };
+                let Some(message) = parse_borrowed_message_usage(&data, true) else {
+                    continue;
+                };
+                let Some(date) = date_cache.format_ms(message_ts) else {
+                    continue;
+                };
+                let message_id = row.get::<_, String>(0)?;
+                let session_id = row.get::<_, String>(1)?;
+                let directory = row.get::<_, String>(3)?;
+
+                let nonzero_tokens = has_nonzero_tokens(&message.usage);
+                messages.insert(
+                    message_id,
+                    AnalysisAccum {
+                        model_id: message.model_id,
+                        date: date.to_owned(),
+                        folder_path: directory,
+                        session_id,
+                        last_ts: message_ts,
+                        // Analysis is never priced, so tier level is always 0.
+                        usage: message.usage.into_value(0),
+                        has_nonzero_tokens: nonzero_tokens,
+                        state: None,
+                    },
+                );
+                parsed_records += 1;
+            }
         }
-    }
 
-    let parsed_records = messages.len();
-    let mut out = Vec::with_capacity(parsed_records);
-    for (id, mut accum) in messages {
-        let mut usage_map = FastHashMap::default();
-        let model_id = std::mem::take(&mut accum.model_id);
-        let usage = std::mem::take(&mut accum.usage);
-        let date = std::mem::take(&mut accum.date);
-        usage_map.insert(model_id, usage);
-        let (session_id, record) = accum.into_record(usage_map);
-        out.push(DatabaseAnalysisRow {
-            session_id,
-            source_id: id,
-            date,
-            analysis: wrap_record(record, &user, &machine),
-        });
+        if !messages.is_empty() {
+            // Scalar counters and unique-file sets are commutative, so `UsageOnly` skips `ORDER BY id` sorting while keeping per-message granularity identical to `Full`.
+            let sql = match (has_v2, mode) {
+                (true, ParseMode::Full) => {
+                    "SELECT part.message_id, part.data FROM part \
+                     WHERE NOT EXISTS (SELECT 1 FROM session_message sm WHERE sm.id = part.message_id) \
+                     ORDER BY part.id"
+                }
+                (true, ParseMode::UsageOnly) => {
+                    "SELECT part.message_id, part.data FROM part \
+                     WHERE NOT EXISTS (SELECT 1 FROM session_message sm WHERE sm.id = part.message_id)"
+                }
+                (false, ParseMode::Full) => "SELECT message_id, data FROM part ORDER BY id",
+                (false, ParseMode::UsageOnly) => "SELECT message_id, data FROM part",
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let mut rows = stmt.query([])?;
+
+            while let Some(row) = rows.next()? {
+                let ValueRef::Text(message_id_bytes) = row.get_ref(0)? else {
+                    continue;
+                };
+                let Ok(message_id) = std::str::from_utf8(message_id_bytes) else {
+                    continue;
+                };
+                let Some(accum) = messages.get_mut(message_id) else {
+                    continue;
+                };
+                let data_text = row.get_ref(1)?.as_str()?;
+                fold_tool_part_str(accum, mode, data_text, &mut failed_tool_parts);
+            }
+        }
+
+        out.reserve(messages.len());
+        for (id, accum) in messages {
+            if accum.has_nonzero_tokens || has_tracked_tool_calls(accum.state.as_ref()) {
+                out.push(finalize_analysis_row(id, accum, &user, &machine));
+            }
+        }
     }
 
     Ok(CollectedAnalysis {
@@ -838,7 +1030,11 @@ struct BorrowedToolPart<'a> {
     #[serde(default, borrow)]
     tool: MaybeStr<'a>,
     #[serde(default, borrow)]
+    name: MaybeStr<'a>,
+    #[serde(default, borrow)]
     state: MaybeObject<BorrowedToolState<'a>>,
+    #[serde(default)]
+    time: MaybeObject<BorrowedToolTime>,
 }
 
 #[derive(Deserialize)]
@@ -847,9 +1043,11 @@ struct BorrowedToolState<'a> {
     status: MaybeStr<'a>,
     #[serde(default, borrow)]
     input: MaybeObject<BorrowedToolInput<'a>>,
-    // Keep `output` raw so `bash`/`edit`/`write` outputs are never unescaped or allocated; only `"read"` decodes it.
+    // Keep `output` and `content` raw so non-`read` tool outputs are never unescaped or allocated; only `"read"` decodes them.
     #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
     output: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    content: Option<&'a RawValue>,
     #[serde(default)]
     time: MaybeObject<BorrowedToolTime>,
 }
@@ -858,12 +1056,18 @@ struct BorrowedToolState<'a> {
 struct BorrowedToolTime {
     #[serde(default)]
     start: MaybeI64,
+    #[serde(default)]
+    ran: MaybeI64,
+    #[serde(default)]
+    created: MaybeI64,
 }
 
 #[derive(Deserialize)]
 struct BorrowedToolInput<'a> {
     #[serde(default, borrow, rename = "filePath")]
     file_path: MaybeStr<'a>,
+    #[serde(default, borrow)]
+    path: MaybeStr<'a>,
     #[serde(default, borrow, rename = "oldString")]
     old_string: MaybeStr<'a>,
     #[serde(default, borrow, rename = "newString")]
@@ -873,13 +1077,69 @@ struct BorrowedToolInput<'a> {
     #[serde(default, borrow)]
     command: MaybeStr<'a>,
     #[serde(default, borrow)]
+    code: MaybeStr<'a>,
+    #[serde(default, borrow)]
     description: MaybeStr<'a>,
     #[serde(default, borrow, rename = "patchText")]
     patch_text: MaybeStr<'a>,
 }
 
+#[derive(Deserialize)]
+struct BorrowedToolContentItem<'a> {
+    #[serde(default, borrow, rename = "type")]
+    kind: MaybeStr<'a>,
+    #[serde(default, borrow)]
+    text: MaybeStr<'a>,
+}
+
 fn decode_raw_str(raw: Option<&RawValue>) -> Option<Cow<'_, str>> {
     serde_json::from_str::<Cow<'_, str>>(raw?.get()).ok()
+}
+
+/// Decodes a `read` tool's text body from legacy `state.output` or v2 `state.content[]`.
+fn decode_tool_read_output<'a>(state: &BorrowedToolState<'a>) -> Option<Cow<'a, str>> {
+    if let Some(output) = decode_raw_str(state.output) {
+        return Some(output);
+    }
+    let content_raw = state.content.filter(|raw| raw.get().starts_with('['))?;
+    let items = serde_json::from_str::<Vec<BorrowedToolContentItem<'a>>>(content_raw.get()).ok()?;
+    let mut texts = items.into_iter().filter_map(|item| {
+        if item.kind.0.as_deref() == Some("text") {
+            item.text.0
+        } else {
+            None
+        }
+    });
+    let first = texts.next()?;
+    let Some(second) = texts.next() else {
+        return Some(first);
+    };
+    let mut joined = first.into_owned();
+    joined.push('\n');
+    joined.push_str(&second);
+    for text in texts {
+        joined.push('\n');
+        joined.push_str(&text);
+    }
+    Some(Cow::Owned(joined))
+}
+
+/// Folds inline v2 `session_message.data.content[]` tool items into `accum`.
+fn fold_inline_content_tools(
+    accum: &mut AnalysisAccum,
+    mode: ParseMode,
+    content_raw: Option<&RawValue>,
+    failed_tool_parts: &mut usize,
+) {
+    let Some(raw) = content_raw.filter(|raw| raw.get().starts_with('[')) else {
+        return;
+    };
+    let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) else {
+        return;
+    };
+    for item in items {
+        fold_tool_part_str(accum, mode, item.get(), failed_tool_parts);
+    }
 }
 
 fn fold_tool_part_str(
@@ -905,16 +1165,21 @@ fn fold_tool_part_str(
     }
 }
 
-/// Folds one tracked `tool` part (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`) into `accum`, ignoring auxiliary tools.
+/// Folds one tracked `tool` part (`read`, `edit`, `write`, `bash`, `shell`, `execute`, `todowrite`, `apply_patch`) into `accum`, ignoring auxiliary tools.
 fn apply_tool_part(
     accum: &mut AnalysisAccum,
     mode: ParseMode,
     data: &BorrowedToolPart<'_>,
 ) -> ToolPartOutcome {
-    let tool = data.tool.0.as_deref().unwrap_or("");
+    let tool = data
+        .tool
+        .0
+        .as_deref()
+        .or(data.name.0.as_deref())
+        .unwrap_or("");
     if !matches!(
         tool,
-        "read" | "edit" | "write" | "bash" | "todowrite" | "apply_patch"
+        "read" | "edit" | "write" | "bash" | "shell" | "execute" | "todowrite" | "apply_patch"
     ) {
         return ToolPartOutcome::Irrelevant;
     }
@@ -936,26 +1201,32 @@ fn apply_tool_part(
         .time
         .0
         .as_ref()
-        .and_then(|t| t.start.0)
+        .and_then(|t| t.start.0.or(t.ran.0).or(t.created.0))
+        .or_else(|| {
+            data.time
+                .0
+                .as_ref()
+                .and_then(|t| t.start.0.or(t.ran.0).or(t.created.0))
+        })
         .unwrap_or(accum.last_ts);
+    let file_path = input.and_then(|i| {
+        i.file_path
+            .0
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .or_else(|| i.path.0.as_deref().filter(|path| !path.is_empty()))
+    });
 
     match tool {
         "read" => {
-            let (Some(path), Some(output)) = (
-                input
-                    .and_then(|i| i.file_path.0.as_deref())
-                    .filter(|path| !path.is_empty()),
-                decode_raw_str(st.output),
-            ) else {
+            let (Some(path), Some(output)) = (file_path, decode_tool_read_output(st)) else {
                 return ToolPartOutcome::Unsupported;
             };
             record_read_output(accum.state_mut(mode), path, &output, ts);
         }
         "edit" => {
             let (Some(path), Some(old), Some(new)) = (
-                input
-                    .and_then(|i| i.file_path.0.as_deref())
-                    .filter(|path| !path.is_empty()),
+                file_path,
                 input.and_then(|i| i.old_string.0.as_deref()),
                 input.and_then(|i| i.new_string.0.as_deref()),
             ) else {
@@ -964,21 +1235,23 @@ fn apply_tool_part(
             accum.state_mut(mode).add_edit_detail(path, old, new, ts);
         }
         "write" => {
-            let (Some(path), Some(content)) = (
-                input
-                    .and_then(|i| i.file_path.0.as_deref())
-                    .filter(|path| !path.is_empty()),
-                input.and_then(|i| i.content.0.as_deref()),
-            ) else {
+            let (Some(path), Some(content)) =
+                (file_path, input.and_then(|i| i.content.0.as_deref()))
+            else {
                 return ToolPartOutcome::Unsupported;
             };
             accum.state_mut(mode).add_write_detail(path, content, ts);
         }
-        "bash" => {
-            let Some(command) = input
-                .and_then(|i| i.command.0.as_deref())
-                .filter(|command| !command.trim().is_empty())
-            else {
+        "bash" | "shell" | "execute" => {
+            let command = input.and_then(|i| {
+                let primary = i.command.0.as_deref().filter(|cmd| !cmd.trim().is_empty());
+                if tool == "execute" {
+                    primary.or_else(|| i.code.0.as_deref().filter(|code| !code.trim().is_empty()))
+                } else {
+                    primary
+                }
+            });
+            let Some(command) = command else {
                 return ToolPartOutcome::Unsupported;
             };
             let desc = input.and_then(|i| i.description.0.as_deref()).unwrap_or("");
@@ -1207,6 +1480,12 @@ struct BorrowedMessageData<'a> {
     cost: Option<&'a RawValue>,
     #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
     time: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    content: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    finish: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    error: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -1272,21 +1551,33 @@ struct BorrowedNestedModel<'a> {
 #[cfg(test)]
 fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
     let data = serde_json::from_str::<BorrowedMessageData<'_>>(raw).ok()?;
-    parse_borrowed_message_usage(&data)
+    parse_borrowed_message_usage(&data, true)
 }
 
-fn parse_borrowed_message_usage(data: &BorrowedMessageData<'_>) -> Option<MessageUsage> {
-    if decode_raw_str(data.role).as_deref() != Some("assistant") {
+fn is_errored_assistant_message(data: &BorrowedMessageData<'_>) -> bool {
+    data.error.is_some_and(|raw| raw.get() != "null")
+        || decode_raw_str(data.finish).as_deref() == Some("error")
+}
+
+fn parse_borrowed_message_usage(
+    data: &BorrowedMessageData<'_>,
+    require_assistant_role: bool,
+) -> Option<MessageUsage> {
+    if require_assistant_role && decode_raw_str(data.role).as_deref() != Some("assistant") {
         return None;
     }
 
     let model_id = message_model_id(data)?;
-    let usage = serde_json::from_str::<OpenCodeTokens>(data.tokens?.get())
-        .ok()?
-        .0;
+    let usage = match data.tokens.filter(|raw| raw.get() != "null") {
+        Some(tokens) => serde_json::from_str::<OpenCodeTokens>(tokens.get()).ok()?.0,
+        // Aborted or errored v2 turns omit `tokens` (or set it to null); treat them as recognized zero-usage turns instead of schema drift.
+        None if is_errored_assistant_message(data) => UsageTokenContribution::default(),
+        None => return None,
+    };
     let cost = data
         .cost
         .and_then(|raw| serde_json::from_str::<f64>(raw.get()).ok())
+        .filter(|cost| cost.is_finite())
         .unwrap_or(0.0);
 
     Some(MessageUsage {
@@ -1485,7 +1776,24 @@ fn record_read_output(state: &mut SessionParseState, path: &str, output: &str, t
     }
 
     let mut stats = ReadContentStats::default();
-    if let Some(start) = output.find("<content>") {
+    if output.starts_with("Read file ") {
+        let mut lines = output.split('\n');
+        lines.next();
+        let mut saw_content = false;
+        for line in lines {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if has_line_number_prefix(line) {
+                stats.push(strip_line_number_prefix(line));
+                saw_content = true;
+            } else if saw_content {
+                break;
+            }
+        }
+        if !saw_content {
+            state.tool_counts.read += 1;
+            return;
+        }
+    } else if let Some(start) = output.find("<content>") {
         let after = &output[start + "<content>".len()..];
         let inner = match after.find("</content>") {
             Some(end) => &after[..end],
@@ -1584,6 +1892,9 @@ impl ReadContentStats {
 
 /// Extracts the file body from an OpenCode `read` tool output.
 fn extract_read_content(output: &str) -> String {
+    if output.starts_with("Read file ") {
+        return extract_v2_read_content(output);
+    }
     let Some(start) = output.find("<content>") else {
         return extract_plain_read_content(output);
     };
@@ -1595,6 +1906,29 @@ fn extract_read_content(output: &str) -> String {
     let inner = inner.strip_prefix('\n').unwrap_or(inner);
 
     strip_numbered_content_lines(inner)
+}
+
+/// Extracts OpenCode v2 `read` output: `Read file <path>, lines <range>\n1: line`.
+fn extract_v2_read_content(output: &str) -> String {
+    let mut lines = output.split('\n');
+    lines.next();
+
+    let mut content = Vec::new();
+    let mut saw_content = false;
+    for line in lines {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if has_line_number_prefix(line) {
+            content.push(strip_line_number_prefix(line));
+            saw_content = true;
+        } else if saw_content {
+            break;
+        }
+    }
+
+    if content.last().is_some_and(|line| line.is_empty()) {
+        content.pop();
+    }
+    content.join("\n")
 }
 
 /// Extracts current OpenCode plain read output: `path\nfile\n\n1: line`.
@@ -1883,6 +2217,23 @@ mod tests {
 
         let plain_dir_output = "/a\ndirectory\n\nx.py";
         assert_eq!(extract_read_content(plain_dir_output), "");
+
+        let v2_output = "Read file /a/b.py, lines 1-3\n1: import os\n2: \n3: print(1)";
+        assert_eq!(extract_read_content(v2_output), "import os\n\nprint(1)");
+
+        let v2_truncated = "Read file /a/b.py, lines 1-2\n1: import os\n2: print(1)\n[Output truncated. Continue reading with offset: 3]";
+        assert_eq!(extract_read_content(v2_truncated), "import os\nprint(1)");
+
+        // A v2 file body containing literal `<content>` tags must not match the legacy XML envelope branch.
+        let v2_with_content_tag =
+            "Read file /a/doc.xml, lines 1-3\n1: <doc>\n2: <content>inner</content>\n3: </doc>";
+        assert_eq!(
+            extract_read_content(v2_with_content_tag),
+            "<doc>\n<content>inner</content>\n</doc>"
+        );
+
+        assert_eq!(extract_read_content("Read file /a/empty.py, 0 lines"), "");
+        assert_eq!(extract_read_content("Image read successfully"), "");
     }
 
     #[test]
@@ -2204,7 +2555,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
-            [assistant_message("model", 0, 0, 0, 0, 0, 0.0)],
+            [assistant_message("model", 10, 5, 0, 0, 0, 0.01)],
         )
         .unwrap();
         conn.execute(
@@ -2755,6 +3106,12 @@ mod tests {
             "<content>\n</content>",
             "/a/b.py\nfile\n\n1: 你好\n2: \n3: 世界\n\n(End of file - total 3 lines)",
             "/a/b.py\r\nfile\r\n\r\n1: a\r\n2: b\r\n",
+            "Read file /a/b.py, lines 1-3\n1: 你好\n2: \n3: 世界",
+            "Read file /a/doc.xml, lines 1-3\n1: <doc>\n2: <content>inner</content>\n3: </doc>",
+            "Read file /a/b.py, lines 1-2\r\n1: a\r\n2: b\r\n[Output truncated. Continue reading with offset: 3]",
+            "Read file /a/b.py, lines 1-2\n1: \n2: ",
+            "Read file /a/empty.py, 0 lines",
+            "Image read successfully",
             "/a\ndirectory\n\nx.py",
             "<path>/a</path>\n<type>directory</type>\n<entries>\nx.py\n</entries>",
             "",
@@ -2910,5 +3267,703 @@ mod tests {
             "azure/azure-extra/gpt-4.1"
         );
         assert_eq!(provider_qualified_model_id(None, "gpt-4.1"), "gpt-4.1");
+    }
+
+    fn make_v2_db() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY,
+                 directory TEXT NOT NULL,
+                 time_created INTEGER NOT NULL DEFAULT 0,
+                 time_updated INTEGER NOT NULL
+             );
+             CREATE TABLE session_message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 type TEXT NOT NULL,
+                 seq INTEGER NOT NULL DEFAULT 0,
+                 time_created INTEGER NOT NULL DEFAULT 0,
+                 time_updated INTEGER NOT NULL DEFAULT 0,
+                 data TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        (dir, db_path)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn v2_assistant_message(
+        provider: &str,
+        model: &str,
+        timestamp: i64,
+        input: i64,
+        output: i64,
+        reasoning: i64,
+        cache_read: i64,
+        cache_write: i64,
+        cost: f64,
+        content: Value,
+    ) -> String {
+        json!({
+            "time": {
+                "created": timestamp.saturating_sub(1000),
+                "completed": timestamp,
+            },
+            "agent": "build",
+            "model": {
+                "id": model,
+                "providerID": provider,
+            },
+            "cost": cost,
+            "tokens": {
+                "input": input,
+                "output": output,
+                "reasoning": reasoning,
+                "cache": {
+                    "read": cache_read,
+                    "write": cache_write,
+                },
+            },
+            "content": content,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn v2_usage_and_analysis_parse_inline_tools_and_match_full_and_usage_only() {
+        let (_dir, db_path) = make_v2_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_created, time_updated) VALUES ('s1', '/repo', 1780757000000, 1780757089000)",
+            [],
+        )
+        .unwrap();
+        // Non-assistant rows must be ignored.
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('u1', 's1', 'user', 1, 1780757080000, 1780757080000, ?1)",
+            [r#"{"content":[{"type":"text","text":"hello"}]}"#],
+        )
+        .unwrap();
+        let content = json!([
+            {"type": "reasoning", "text": "thinking"},
+            {"type": "text", "text": "reply"},
+            {
+                "type": "tool",
+                "id": "call_read",
+                "name": "read",
+                "state": {
+                    "status": "completed",
+                    "input": {"path": "/repo/a.rs"},
+                    "content": [{"type": "text", "text": "Read file /repo/a.rs, lines 1-2\n1: fn main() {}\n2: // end\n[Output truncated. Continue reading with offset: 3]"}]
+                },
+                "time": {"created": 1780757081000i64, "ran": 1780757081100i64, "completed": 1780757081200i64}
+            },
+            {
+                "type": "tool",
+                "id": "call_read_empty",
+                "name": "read",
+                "state": {
+                    "status": "completed",
+                    "input": {"path": "/repo/empty.rs"},
+                    "content": [{"type": "text", "text": "Read file /repo/empty.rs, 0 lines"}]
+                },
+                "time": {"created": 1780757081300i64}
+            },
+            {
+                "type": "tool",
+                "id": "call_edit",
+                "name": "edit",
+                "state": {
+                    "status": "completed",
+                    "input": {"path": "src/b.rs", "oldString": "old", "newString": "new1\nnew2"},
+                    "content": [{"type": "text", "text": "Edited"}]
+                },
+                "time": {"created": 1780757082000i64, "ran": 1780757082100i64}
+            },
+            {
+                "type": "tool",
+                "id": "call_write",
+                "name": "write",
+                "state": {
+                    "status": "completed",
+                    "input": {"path": "/repo/c.rs", "content": "line1\nline2\nline3"},
+                    "content": [{"type": "text", "text": "Created"}]
+                },
+                "time": {"created": 1780757083000i64}
+            },
+            {
+                "type": "tool",
+                "id": "call_shell",
+                "name": "shell",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "cargo test"},
+                    "content": [{"type": "text", "text": "ok"}]
+                },
+                "time": {"created": 1780757084000i64, "ran": 1780757084050i64}
+            },
+            {
+                "type": "tool",
+                "id": "call_execute",
+                "name": "execute",
+                "state": {
+                    "status": "completed",
+                    "input": {"code": "return 42;"},
+                    "content": [{"type": "text", "text": "42"}]
+                },
+                "time": {"created": 1780757085000i64}
+            },
+            {
+                "type": "tool",
+                "id": "call_todowrite",
+                "name": "todowrite",
+                "state": {
+                    "status": "completed",
+                    "input": {"todos": []}
+                }
+            },
+            {
+                "type": "tool",
+                "id": "call_patch",
+                "name": "apply_patch",
+                "state": {
+                    "status": "completed",
+                    "input": {"patchText": "*** Begin Patch\n*** Update File: /repo/d.rs\n@@\n-x\n+y\n*** Add File: /repo/e.rs\n+z\n*** End Patch"}
+                }
+            },
+            {
+                "type": "tool",
+                "id": "call_err",
+                "name": "edit",
+                "state": {
+                    "status": "error",
+                    "input": {"path": "/repo/a.rs", "oldString": "x", "newString": "y"}
+                }
+            },
+            {
+                "type": "tool",
+                "id": "call_grep",
+                "name": "grep",
+                "state": {
+                    "status": "completed",
+                    "input": {"pattern": "main"}
+                }
+            },
+            {
+                "type": "tool",
+                "id": "call_bad",
+                "name": "write",
+                "state": {
+                    "status": "unknown_status",
+                    "input": {"path": "/repo/bad.rs", "content": "x"}
+                }
+            }
+        ]);
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m1', 's1', 'assistant', 2, 1780757088000, 1780757089000, ?1)",
+            [v2_assistant_message(
+                "google",
+                "gemini-4-argon",
+                DEFAULT_MESSAGE_TS,
+                1200,
+                300,
+                50,
+                4000,
+                100,
+                0.42,
+                content,
+            )],
+        )
+        .unwrap();
+        drop(conn);
+
+        let usage = read_opencode_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert!((usage[0].2 - 0.42).abs() < 1e-9);
+        let tokens = &usage[0].1.records[0].conversation_usage["google/gemini-4-argon"];
+        assert_eq!(tokens["input_tokens"], 1200);
+        assert_eq!(tokens["output_tokens"], 300);
+        assert_eq!(tokens["reasoning_output_tokens"], 50);
+        assert_eq!(tokens["cache_read_input_tokens"], 4000);
+        assert_eq!(tokens["cache_creation_input_tokens"], 100);
+
+        let full =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        let usage_only =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::UsageOnly)
+                .unwrap();
+
+        assert_eq!(full.expected_records, 1);
+        assert_eq!(full.parsed_records, 1);
+        assert_eq!(full.failed_tool_parts, 1);
+        assert_eq!(usage_only.expected_records, full.expected_records);
+        assert_eq!(usage_only.parsed_records, full.parsed_records);
+        assert_eq!(usage_only.failed_tool_parts, full.failed_tool_parts);
+        assert_eq!(full.rows.len(), 1);
+        assert_eq!(usage_only.rows.len(), 1);
+
+        let fr = &full.rows[0].analysis.records[0];
+        let ur = &usage_only.rows[0].analysis.records[0];
+        assert_eq!(fr.tool_call_counts.read, 2);
+        assert_eq!(fr.tool_call_counts.edit, 2);
+        assert_eq!(fr.tool_call_counts.write, 2);
+        assert_eq!(fr.tool_call_counts.bash, 2);
+        assert_eq!(fr.tool_call_counts.todo_write, 1);
+        assert_eq!(fr.total_read_lines, 2);
+        assert_eq!(fr.total_edit_lines, 3);
+        assert_eq!(fr.total_write_lines, 4);
+        assert_eq!(fr.total_unique_files, 5);
+        assert_eq!(fr.run_command_details.len(), 2);
+        assert_eq!(fr.run_command_details[0].command, "cargo test");
+        assert_eq!(fr.run_command_details[0].base.timestamp, 1780757084050);
+        assert_eq!(fr.run_command_details[1].command, "return 42;");
+        assert_eq!(fr.run_command_details[1].base.timestamp, 1780757085000);
+
+        assert_eq!(ur.total_unique_files, fr.total_unique_files);
+        assert_eq!(ur.total_read_lines, fr.total_read_lines);
+        assert_eq!(ur.total_write_lines, fr.total_write_lines);
+        assert_eq!(ur.total_edit_lines, fr.total_edit_lines);
+        assert_eq!(ur.total_read_characters, fr.total_read_characters);
+        assert_eq!(ur.total_write_characters, fr.total_write_characters);
+        assert_eq!(ur.total_edit_characters, fr.total_edit_characters);
+        assert_eq!(ur.tool_call_counts.read, fr.tool_call_counts.read);
+        assert_eq!(ur.tool_call_counts.write, fr.tool_call_counts.write);
+        assert_eq!(ur.tool_call_counts.edit, fr.tool_call_counts.edit);
+        assert_eq!(ur.tool_call_counts.bash, fr.tool_call_counts.bash);
+        assert_eq!(
+            ur.tool_call_counts.todo_write,
+            fr.tool_call_counts.todo_write
+        );
+        assert!(ur.read_file_details.is_empty());
+        assert!(ur.write_file_details.is_empty());
+        assert!(ur.edit_file_details.is_empty());
+        assert!(ur.run_command_details.is_empty());
+    }
+
+    #[test]
+    fn v2_free_models_preserve_zero_stored_cost_while_ghost_rows_are_skipped() {
+        let (_dir, db_path) = make_v2_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_created, time_updated) VALUES ('s1', '/repo', 1780757000000, 1780757089000)",
+            [],
+        )
+        .unwrap();
+        // Genuine free model with nonzero tokens and `cost = 0.0` must be kept.
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_free', 's1', 'assistant', 1, 1780757080000, 1780757081000, ?1)",
+            [v2_assistant_message(
+                "opencode",
+                "nemotron-3-ultra-free",
+                DEFAULT_MESSAGE_TS,
+                1000,
+                50,
+                10,
+                500,
+                0,
+                0.0,
+                json!([]),
+            )],
+        )
+        .unwrap();
+        // Zero-token zero-cost failed APIError message must be skipped in both usage and analysis.
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_ghost_zero', 's1', 'assistant', 2, 1780757082000, 1780757082000, ?1)",
+            [v2_assistant_message(
+                "azure",
+                "gpt-5.4-nano",
+                DEFAULT_MESSAGE_TS,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+                json!([]),
+            )],
+        )
+        .unwrap();
+        // Aborted v2 message with no `tokens` key and `finish: "error"` must be recognized (not drift) and skipped.
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_aborted', 's1', 'assistant', 3, 1780757083000, 1780757083000, ?1)",
+            [json!({
+                "time": {"created": DEFAULT_MESSAGE_TS, "completed": DEFAULT_MESSAGE_TS},
+                "model": {"id": "gemini-4-argon", "providerID": "google"},
+                "content": [],
+                "finish": "error",
+                "error": {"type": "aborted", "message": "Step interrupted"}
+            })
+            .to_string()],
+        )
+        .unwrap();
+        // Zero-token aborted message WITH a completed tracked tool is skipped in usage but kept in analysis.
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_zero_with_tool', 's1', 'assistant', 4, 1780757084000, 1780757084000, ?1)",
+            [v2_assistant_message(
+                "deepseek",
+                "deepseek-v4-pro",
+                DEFAULT_MESSAGE_TS,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+                json!([{
+                    "type": "tool",
+                    "name": "shell",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "git status"}
+                    }
+                }]),
+            )],
+        )
+        .unwrap();
+        // Aborted v2 message with explicit `"tokens": null` must also be recognized (not drift) and skipped.
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_aborted_null_tokens', 's1', 'assistant', 5, 1780757085000, 1780757085000, ?1)",
+            [json!({
+                "time": {"created": DEFAULT_MESSAGE_TS, "completed": DEFAULT_MESSAGE_TS},
+                "model": {"id": "gemini-4-argon", "providerID": "google"},
+                "tokens": null,
+                "content": [],
+                "finish": "error",
+                "error": {"type": "provider.auth", "message": "Unauthorized"}
+            })
+            .to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let usage = read_opencode_usage_contributions(&db_path, TimeRange::All, None).unwrap();
+        assert_eq!(usage.expected_records, 5);
+        assert_eq!(usage.parsed_records, 5);
+        assert_eq!(usage.failed_records(), 0);
+        assert_eq!(usage.rows.len(), 1);
+        assert_eq!(usage.rows[0].model, "opencode/nemotron-3-ultra-free");
+        assert_eq!(usage.rows[0].tokens.input_tokens, 1000);
+        assert_eq!(usage.rows[0].stored_cost, 0.0);
+
+        let analysis =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::UsageOnly)
+                .unwrap();
+        assert_eq!(analysis.expected_records, 5);
+        assert_eq!(analysis.parsed_records, 5);
+        assert_eq!(analysis.failed_tool_parts, 0);
+        assert_eq!(analysis.rows.len(), 2);
+        let mut ids: Vec<&str> = analysis.rows.iter().map(|r| r.source_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["m_free", "m_zero_with_tool"]);
+        let tool_row = analysis
+            .rows
+            .iter()
+            .find(|r| r.source_id == "m_zero_with_tool")
+            .unwrap();
+        assert_eq!(tool_row.analysis.records[0].tool_call_counts.bash, 1);
+    }
+
+    #[test]
+    fn legacy_message_table_skips_zero_token_ghost_rows() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m_ghost', 's1', ?1)",
+            [assistant_message_with_provider(
+                "gpt-5.1",
+                Some("openai"),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m_real', 's1', ?1)",
+            [assistant_message_with_provider(
+                "big-pickle",
+                Some("opencode"),
+                500,
+                20,
+                0,
+                0,
+                0,
+                0.0,
+            )],
+        )
+        .unwrap();
+        drop(conn);
+
+        let usage = read_opencode_usage_contributions(&db_path, TimeRange::All, None).unwrap();
+        assert_eq!(usage.expected_records, 2);
+        assert_eq!(usage.parsed_records, 2);
+        assert_eq!(usage.rows.len(), 1);
+        assert_eq!(usage.rows[0].model, "opencode/big-pickle");
+        assert_eq!(usage.rows[0].stored_cost, 0.0);
+
+        let analysis =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(analysis.expected_records, 2);
+        assert_eq!(analysis.parsed_records, 2);
+        assert_eq!(analysis.rows.len(), 1);
+        assert_eq!(analysis.rows[0].source_id, "m_real");
+    }
+
+    #[test]
+    fn upgraded_v2_db_deduplicates_migrated_rows_and_retains_unmigrated_legacy_rows() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY,
+                 directory TEXT NOT NULL,
+                 time_created INTEGER NOT NULL DEFAULT 0,
+                 time_updated INTEGER NOT NULL
+             );
+             CREATE TABLE session_message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 type TEXT NOT NULL,
+                 seq INTEGER NOT NULL DEFAULT 0,
+                 time_created INTEGER NOT NULL DEFAULT 0,
+                 time_updated INTEGER NOT NULL DEFAULT 0,
+                 data TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_created, time_updated) VALUES ('s1', '/repo', 1780757000000, 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_created, time_updated) VALUES ('s2', '/repo', 1780757100000, 1780757189000)",
+            [],
+        )
+        .unwrap();
+        // Migrated message exists in BOTH `message` (+ `part`) and `session_message` (inline tool) -> must be counted once.
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m_migrated', 's1', ?1)",
+            [assistant_message_with_provider(
+                "gemini-3.7-flash",
+                Some("google"),
+                100,
+                20,
+                5,
+                50,
+                0,
+                0.10,
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p_migrated', 'm_migrated', 's1', ?1)",
+            [r#"{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"ls"}}}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_migrated', 's1', 'assistant', 1, 1780757080000, 1780757089000, ?1)",
+            [v2_assistant_message(
+                "google",
+                "gemini-3.7-flash",
+                DEFAULT_MESSAGE_TS,
+                100,
+                20,
+                5,
+                50,
+                0,
+                0.10,
+                json!([{
+                    "type": "tool",
+                    "name": "bash",
+                    "state": {"status": "completed", "input": {"command": "ls"}}
+                }]),
+            )],
+        )
+        .unwrap();
+        // Unmigrated legacy message exists ONLY in `message` (+ `part`) -> must be retained.
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m_legacy_only', 's1', ?1)",
+            [assistant_message_with_provider(
+                "deepseek-v4-pro",
+                Some("deepseek"),
+                200,
+                40,
+                0,
+                0,
+                0,
+                0.20,
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p_legacy', 'm_legacy_only', 's1', ?1)",
+            [r#"{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"/repo/legacy.rs","content":"fn a() {}"}}}"#],
+        )
+        .unwrap();
+        // Unmigrated legacy ghost row must be skipped.
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m_legacy_ghost', 's1', ?1)",
+            [assistant_message_with_provider(
+                "gpt-5.1",
+                Some("openai"),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+            )],
+        )
+        .unwrap();
+        // New v2-only message exists ONLY in `session_message`.
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_v2_only', 's2', 'assistant', 1, 1780757180000, 1780757189000, ?1)",
+            [v2_assistant_message(
+                "google",
+                "gemini-4-argon",
+                DEFAULT_MESSAGE_TS + 100_000,
+                300,
+                60,
+                10,
+                0,
+                0,
+                0.30,
+                json!([{
+                    "type": "tool",
+                    "name": "shell",
+                    "state": {"status": "completed", "input": {"command": "pwd"}}
+                }]),
+            )],
+        )
+        .unwrap();
+        drop(conn);
+
+        let usage = read_opencode_usage_contributions(&db_path, TimeRange::All, None).unwrap();
+        assert_eq!(usage.expected_records, 4);
+        assert_eq!(usage.parsed_records, 4);
+        assert_eq!(usage.rows.len(), 3);
+        let total_input: i64 = usage.rows.iter().map(|r| r.tokens.input_tokens).sum();
+        let total_cost: f64 = usage.rows.iter().map(|r| r.stored_cost).sum();
+        assert_eq!(total_input, 600);
+        assert!((total_cost - 0.60).abs() < 1e-9);
+
+        for mode in [ParseMode::Full, ParseMode::UsageOnly] {
+            let analysis =
+                read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, mode).unwrap();
+            assert_eq!(analysis.expected_records, 4);
+            assert_eq!(analysis.parsed_records, 4);
+            assert_eq!(analysis.failed_tool_parts, 0);
+            assert_eq!(analysis.rows.len(), 3);
+            let bash_sum: usize = analysis
+                .rows
+                .iter()
+                .map(|r| r.analysis.records[0].tool_call_counts.bash)
+                .sum();
+            let write_sum: usize = analysis
+                .rows
+                .iter()
+                .map(|r| r.analysis.records[0].tool_call_counts.write)
+                .sum();
+            assert_eq!(bash_sum, 2);
+            assert_eq!(write_sum, 1);
+        }
+    }
+
+    #[test]
+    fn v2_schema_drift_still_reports_unknown_assistant_payload() {
+        let (_dir, db_path) = make_v2_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_created, time_updated) VALUES ('s1', '/repo', 1780757000000, 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m1', 's1', 'assistant', 1, 1780757089000, 1780757089000, ?1)",
+            [r#"{"futureUsage":{"input":10}}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m2', 's1', 'assistant', 2, 1780757089000, 1780757089000, ?1)",
+            [r#"{"model":{"id":"m","providerID":"p"},"tokens":null}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let usage = read_opencode_usage_contributions(&db_path, TimeRange::All, None).unwrap();
+        assert_eq!(usage.expected_records, 2);
+        assert_eq!(usage.parsed_records, 0);
+        assert!(read_opencode_usage(&db_path, TimeRange::All).is_err());
+        assert!(read_opencode_analysis(&db_path, TimeRange::All, ParseMode::Full).is_err());
+    }
+
+    #[test]
+    fn v2_time_range_and_tier_classification() {
+        let (_dir, db_path) = make_v2_db();
+        let conn = Connection::open(&db_path).unwrap();
+        let now_ms = chrono::Local::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_created, time_updated) VALUES ('s1', '/repo', 1000000000000, ?1)",
+            rusqlite::params![now_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_old', 's1', 'assistant', 1, 1000000000000, 1000000000000, ?1)",
+            [v2_assistant_message(
+                "azure",
+                "gpt-5.5",
+                1000000000000,
+                100,
+                10,
+                0,
+                0,
+                0,
+                0.01,
+                json!([]),
+            )],
+        )
+        .unwrap();
+        // Omit `data.time` so fallback uses `session_message.time_updated`.
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('m_new', 's1', 'assistant', 2, ?1, ?1, ?2)",
+            rusqlite::params![
+                now_ms,
+                json!({
+                    "model": {"id": "gpt-5.5", "providerID": "azure"},
+                    "cost": 0.5,
+                    "tokens": {"input": 200_000, "output": 100, "reasoning": 10, "cache": {"read": 80_000, "write": 0}},
+                    "content": []
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tiers = tier_snapshot();
+        let daily =
+            read_opencode_usage_contributions(&db_path, TimeRange::Daily, Some(&tiers)).unwrap();
+        assert_eq!(daily.rows.len(), 1);
+        assert_eq!(daily.rows[0].tier_level, 1);
+        assert_eq!(daily.rows[0].tokens.input_tokens, 200_000);
     }
 }
