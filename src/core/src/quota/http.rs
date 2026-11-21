@@ -94,10 +94,15 @@ fn write_cached_version_in(dir: &Path, provider: &str, version: &str) -> Result<
 
 /// Runs `<bin> --version` and parses the version token from stdout.
 fn run_cli_version(bin: &str) -> Option<String> {
-    let output = std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(bin);
+    command.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().ok()?;
     output.status.success().then_some(())?;
     parse_version(&String::from_utf8_lossy(&output.stdout))
 }

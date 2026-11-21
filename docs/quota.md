@@ -184,9 +184,9 @@ Reactive. The `accessToken` is valid ~60 days (`offline_access` scope) and the o
 
 Credential file (Linux / fallback) `~/.gemini/antigravity-cli/antigravity-oauth-token`: plain JSON, `.token.access_token`, `.token.refresh_token`, `.token.expiry`, plus `.auth_method` (`consumer` for a personal Google account, `gcp` for a Google Cloud sign-in) and, for Cloud sign-ins, `.project_id`. On Windows and macOS the same blob lives in the OS credential store instead — Windows Credential Manager generic credential `gemini:antigravity`, and macOS Keychain generic password with service `gemini` and account `antigravity` — sometimes wrapped with a `go-keyring-base64:` prefix; the field names are the same once unwrapped.
 
-Antigravity also has a second, richer source when the app (or the `agy` CLI) is **running**: a local Connect-RPC language server on loopback (`RetrieveUserQuotaSummary` on `https://127.0.0.1:<port>/...`), discovered by scanning for the process and reading its `--csrf_token`. That path needs no OAuth but only works while the app is up. The recipe below is the **app-closed** path, the one that fits this file: credential file in, HTTP out, works over plain SSH.
+Antigravity also exposes a local Connect-RPC Language Server on loopback when the Desktop app or local hub is **running**: `POST http://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` with `Connect-Protocol-Version: 1`, both `x-codeium-csrf-token` and `x-antigravity-csrf-token` headers, and body `{"forceRefresh": true}`. Endpoints are advertised in `$ANTIGRAVITY_APP_DATA_DIR/daemon` and `~/.gemini/*/daemon/{ls_,hub_}*.json` (`pid`, `httpPort`, `csrfToken`), or via `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN` (with `GET /` `window.__APP_CONFIG__` CSRF extraction), and on Linux via own-user `*-hub-server` / `agy --hub` listening loopback ports in `/proc`. That path needs no OAuth and works whenever the local Language Server or hub is running. When no local Language Server is running, vct falls back to the direct Cloud Code HTTP recipe below using the stored OAuth token (read-only, with no OAuth refresh or embedded client secret).
 
-Unlike the other providers, the stored `access_token` is short-lived (~1h) and nothing keeps it fresh in the background, so in practice you refresh first (see **Refresh token**) and use that token to fetch.
+Unlike the other providers, the stored `access_token` is short-lived (~1h) and nothing keeps it fresh in the background, so the app-closed curl recipe below may need a refresh first (see **Refresh token**, or `agy models` to let `agy` refresh the stored token in place).
 
 ### Fetch quota
 
@@ -239,7 +239,7 @@ Older builds lack that RPC; the legacy fallbacks are 5h-only and take the same b
 
 ### Refresh token
 
-vct does not run this recipe: its Antigravity panel and `vct quota antigravity` run `agy -p /usage --output-format json`, and agy refreshes an expired token in place before answering (seen with agy 1.5.5), so vct needs neither the refresh token nor the client secret below.
+vct does not run this recipe: it queries the local Language Server first (no OAuth token needed) and falls back to direct Cloud Code HTTP read-only without embedding any OAuth `client_secret` or refreshing tokens. When the stored OAuth token expires and no local Language Server is running, re-refresh it with `agy models`.
 
 ```bash
 CRED=~/.gemini/antigravity-cli/antigravity-oauth-token

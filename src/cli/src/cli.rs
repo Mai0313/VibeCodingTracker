@@ -20,7 +20,7 @@ pub enum QuotaProvider {
     Cursor,
     /// Grok CLI (`GET /v1/billing?format=credits`).
     Grok,
-    /// Antigravity CLI (`agy -p /usage --output-format json`).
+    /// Antigravity (local Language Server `RetrieveUserQuotaSummary` or Cloud Code `v1internal:retrieveUserQuotaSummary`).
     Antigravity,
 }
 

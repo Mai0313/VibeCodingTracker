@@ -35,9 +35,9 @@ use vct_core::models::{
 };
 use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::quota::{
-    ANTIGRAVITY_LOGIN_HINT, ANTIGRAVITY_MIN_REFRESH_SECS, AntigravityState, CLAUDE_LOGIN_HINT,
-    CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState, CodexState, CopilotState,
-    CursorState, GROK_LOGIN_HINT, GrokState, antigravity_quota_present, load_antigravity_cache,
+    ANTIGRAVITY_LOGIN_HINT, AntigravityState, CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT,
+    COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState, CodexState, CopilotState, CursorState,
+    GROK_LOGIN_HINT, GrokState, antigravity_quota_present, load_antigravity_cache,
     load_claude_cache, load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache,
     save_antigravity_cache, save_claude_cache, save_codex_cache, save_copilot_cache,
     save_cursor_cache, save_grok_cache, spawn_quota_worker,
@@ -243,29 +243,21 @@ impl QuotaRuntime {
                 .flatten()
                 .unwrap_or_default(),
         ));
-        let antigravity_cached = present
-            .antigravity
-            .then(load_antigravity_cache)
-            .flatten()
-            .unwrap_or_default();
-        let antigravity = Arc::new(Mutex::new(antigravity_cached.clone()));
+        let antigravity = Arc::new(Mutex::new(
+            present
+                .antigravity
+                .then(load_antigravity_cache)
+                .flatten()
+                .unwrap_or_default(),
+        ));
 
-        // Antigravity sends no HTTP request of its own, so it needs no client.
-        if present.antigravity {
-            let mut state = AntigravityState::resume(antigravity_cached);
-            spawn_quota_worker(
-                "antigravity",
-                Arc::clone(&antigravity),
-                Arc::clone(&shutdown),
-                quota_refresh_secs.max(ANTIGRAVITY_MIN_REFRESH_SECS),
-                move || state.resolve(),
-                |snapshot| {
-                    let _ = save_antigravity_cache(snapshot);
-                },
-            );
-        }
-
-        if present.claude || present.codex || present.copilot || present.cursor || present.grok {
+        if present.claude
+            || present.codex
+            || present.copilot
+            || present.cursor
+            || present.grok
+            || present.antigravity
+        {
             match vct_core::quota::http::build_client() {
                 Ok(client) => {
                     if present.claude {
@@ -340,6 +332,24 @@ impl QuotaRuntime {
                             move || state.resolve(&client),
                             |snapshot| {
                                 let _ = save_grok_cache(snapshot);
+                            },
+                        );
+                    }
+                    if present.antigravity {
+                        let (client, shutdown, shared) = (
+                            client.clone(),
+                            Arc::clone(&shutdown),
+                            Arc::clone(&antigravity),
+                        );
+                        let mut state = AntigravityState::default();
+                        spawn_quota_worker(
+                            "antigravity",
+                            shared,
+                            shutdown,
+                            quota_refresh_secs,
+                            move || state.resolve(&client),
+                            |snapshot| {
+                                let _ = save_antigravity_cache(snapshot);
                             },
                         );
                     }
@@ -2361,7 +2371,7 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16, wide: bool) -> Quot
     }
 }
 
-/// Builds the Antigravity card with age-only header (no plan name in `/usage`), grouped by pool with `5h` limits first.
+/// Builds the Antigravity card with age-only header (no plan name in the quota summary), grouped by pool with `5h` limits first.
 fn antigravity_card(
     antigravity: &AntigravityQuotaSnapshot,
     now: i64,
