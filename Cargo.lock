@@ -3653,6 +3653,7 @@ dependencies = [
  "owo-colors",
  "ratatui",
  "rayon",
+ "rusqlite",
  "serde_json",
  "sysinfo",
  "tempfile",
