@@ -1248,14 +1248,39 @@ impl<'a> ClaudeFold<'a> {
                 | "bridge-session"
                 | "permission-mode"
                 | "mode"
+                | "mode-change"
                 | "last-prompt"
                 | "ai-title"
+                | "custom-title"
                 | "agent-name"
+                | "agent-color"
+                | "agent-setting"
                 | "pr-link"
+                | "frame-link"
+                | "launched"
                 | "started"
                 | "result"
-                | "agent-setting"
-                | "frame-link"
+                | "failed"
+                | "api-request"
+                | "api-request-shape"
+                | "api-request-blob"
+                | "tools-used"
+                | "cost-state"
+                | "session-owner"
+                | "atis-latch"
+                | "artifact-comment-monitor"
+                | "artifact-autoreact-ledger"
+                | "attribution-snapshot"
+                | "content-replacement"
+                | "speculation-accept"
+                | "data-flow-records"
+                | "data-flow-incomplete"
+                | "derived-from"
+                | "continued-in"
+                | "fork-context-ref"
+                | "relocated"
+                | "worktree-state"
+                | "dev-mods"
         ) || has_tool_use_result;
         if recognized {
             self.diagnostics.record_recognized_source();
@@ -3704,4 +3729,149 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recognized_lifecycle_and_telemetry_records_produce_zero_failures() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base_lines = vec![
+            serde_json::json!({
+                "type": "assistant",
+                "sessionId": "s-meta",
+                "cwd": "/workspace",
+                "timestamp": "2026-07-12T00:00:01Z",
+                "message": {
+                    "id": "msg-1",
+                    "model": "claude-opus-4-8",
+                    "usage": { "input_tokens": 42, "output_tokens": 13 },
+                    "content": [
+                        { "type": "tool_use", "id": "r1", "name": "Read", "input": { "file_path": "/workspace/a.rs" } }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "s-meta",
+                "timestamp": "2026-07-12T00:00:02Z",
+                "toolUseResult": { "type": "text", "file": { "filePath": "/workspace/a.rs", "content": "fn main() {}\n" } },
+                "message": { "content": [{ "type": "tool_result", "tool_use_id": "r1", "content": "ok" }] }
+            }),
+        ];
+
+        let mut extra_lines = base_lines.clone();
+        for record_type in [
+            "api-request",
+            "api-request-shape",
+            "api-request-blob",
+            "tools-used",
+            "cost-state",
+            "session-owner",
+            "atis-latch",
+            "artifact-comment-monitor",
+            "artifact-autoreact-ledger",
+            "custom-title",
+            "agent-color",
+            "attribution-snapshot",
+            "mode-change",
+            "content-replacement",
+            "speculation-accept",
+            "data-flow-records",
+            "data-flow-incomplete",
+            "derived-from",
+            "continued-in",
+            "fork-context-ref",
+            "relocated",
+            "worktree-state",
+            "dev-mods",
+            "launched",
+            "failed",
+        ] {
+            let mut record = serde_json::json!({
+                "type": record_type,
+                "sessionId": "s-meta",
+                "timestamp": "2026-07-12T00:00:03Z"
+            });
+            if record_type == "api-request-blob" {
+                record["message"] = serde_json::json!({ "role": "user", "content": "blob" });
+            }
+            extra_lines.push(record);
+        }
+
+        let base_path = dir.path().join("base.jsonl");
+        let extra_path = dir.path().join("extra.jsonl");
+        std::fs::write(
+            &base_path,
+            base_lines
+                .iter()
+                .map(|v| format!("{v}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        std::fs::write(
+            &extra_path,
+            extra_lines
+                .iter()
+                .map(|v| format!("{v}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let base_owned: Vec<ClaudeCodeLog> = base_lines
+            .iter()
+            .cloned()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let extra_owned: Vec<ClaudeCodeLog> = extra_lines
+            .iter()
+            .cloned()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+
+        for mode in [ParseMode::Full, ParseMode::UsageOnly] {
+            let base_stream = parse_claude_jsonl_path(&base_path, mode, None)
+                .unwrap()
+                .unwrap();
+            let extra_stream = parse_claude_jsonl_path(&extra_path, mode, None)
+                .unwrap()
+                .unwrap();
+            let extra_val =
+                parse_claude_logs_with_diagnostics(extra_owned.clone(), mode, None).unwrap();
+            let base_val =
+                parse_claude_logs_with_diagnostics(base_owned.clone(), mode, None).unwrap();
+
+            for (actual, expected) in [(&extra_stream, &base_stream), (&extra_val, &base_val)] {
+                assert_eq!(actual.diagnostics.partial_failure_count(), 0);
+                let a = &actual.analysis.records[0];
+                let e = &expected.analysis.records[0];
+                assert_eq!(a.conversation_usage, e.conversation_usage);
+                assert_eq!(a.advisor_usage, e.advisor_usage);
+                assert_eq!(a.total_read_lines, e.total_read_lines);
+                assert_eq!(a.total_read_characters, e.total_read_characters);
+                assert_eq!(a.total_unique_files, e.total_unique_files);
+                assert_eq!(
+                    serde_json::to_value(&a.tool_call_counts).unwrap(),
+                    serde_json::to_value(&e.tool_call_counts).unwrap()
+                );
+            }
+        }
+
+        // Truly unknown record types still report schema drift.
+        let mut drift_lines = base_lines;
+        drift_lines.push(serde_json::json!({
+            "type": "future-unrecognized-record",
+            "sessionId": "s-meta",
+            "timestamp": "2026-07-12T00:00:04Z"
+        }));
+        let drift_path = dir.path().join("drift.jsonl");
+        std::fs::write(
+            &drift_path,
+            drift_lines
+                .iter()
+                .map(|v| format!("{v}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let drift = parse_claude_jsonl_path(&drift_path, ParseMode::UsageOnly, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(drift.diagnostics.partial_failure_count(), 1);
+    }
 }
