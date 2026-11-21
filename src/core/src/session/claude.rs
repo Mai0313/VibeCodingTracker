@@ -80,6 +80,7 @@ where
             match &mut log.message {
                 None => fold.diagnostics.record_relevant(false),
                 Some(message) => {
+                    let model_idx = fold.observe_assistant_model(message.model.as_deref());
                     let usage = message
                         .usage
                         .take()
@@ -92,7 +93,7 @@ where
                     );
                     for item in std::mem::take(&mut message.content) {
                         if let ClaudeContentItem::ToolUse { id, name, input } = item {
-                            fold.observe_tool_use_full(id, &name, input, ts);
+                            fold.observe_tool_use_full(id, &name, input, ts, model_idx);
                         }
                     }
                 }
@@ -226,6 +227,7 @@ pub(crate) fn parse_claude_jsonl_path(
                     match &mut message {
                         None => fold.diagnostics.record_relevant(false),
                         Some(msg) => {
+                            let model_idx = fold.observe_assistant_model(msg.model.as_deref());
                             let usage = msg.usage.take();
                             fold.observe_assistant_usage(
                                 msg.id.as_deref(),
@@ -241,6 +243,7 @@ pub(crate) fn parse_claude_jsonl_path(
                                             tool_use.name.as_ref(),
                                             input,
                                             ts,
+                                            model_idx,
                                         );
                                     }
                                     ParsedToolInput::Full(input) => {
@@ -249,6 +252,7 @@ pub(crate) fn parse_claude_jsonl_path(
                                             tool_use.name.as_ref(),
                                             input,
                                             ts,
+                                            model_idx,
                                         );
                                     }
                                 }
@@ -297,6 +301,7 @@ pub(crate) fn parse_claude_jsonl_path(
                 match &mut message {
                     None => fold.diagnostics.record_relevant(false),
                     Some(msg) => {
+                        let model_idx = fold.observe_assistant_model(msg.model.as_deref());
                         let usage = msg.usage.take();
                         fold.observe_assistant_usage(
                             msg.id.as_deref(),
@@ -311,6 +316,7 @@ pub(crate) fn parse_claude_jsonl_path(
                                     tool_use.name.as_ref(),
                                     input,
                                     ts,
+                                    model_idx,
                                 );
                             }
                         }
@@ -1194,8 +1200,10 @@ enum RequestSlots {
 struct ClaudeFold<'a> {
     classifier: Option<TierClassifier<'a>>,
     state: SessionParseState,
-    // Interned model names referenced by index from `billed_requests` to avoid cloning per API block.
+    // Interned model names referenced by index from `billed_requests` and pending tool uses to avoid cloning per API block.
     models: Vec<String>,
+    // Most recent non-synthetic assistant model index, used as fallback for uncorrelated tool results.
+    last_model_idx: Option<usize>,
     // Keyed by `tool_use_id` so top-level results dispatch by originating tool rather than ambiguous fields like `filePath` (also set by `ExitPlanMode`).
     pending_tool_uses: FastHashMap<String, PendingClaudeTool>,
     diagnostics: ParseDiagnostics,
@@ -1210,6 +1218,7 @@ impl<'a> ClaudeFold<'a> {
             classifier: tiers.map(TierClassifier::new),
             state: SessionParseState::with_mode(mode),
             models: Vec::with_capacity(capacity::MODELS_PER_SESSION),
+            last_model_idx: None,
             pending_tool_uses: FastHashMap::with_capacity(64),
             diagnostics: ParseDiagnostics::default(),
             billed_requests: Vec::with_capacity(64),
@@ -1224,6 +1233,14 @@ impl<'a> ClaudeFold<'a> {
         let index = self.models.len();
         self.models.push(model.to_string());
         index
+    }
+
+    fn observe_assistant_model(&mut self, model: Option<&str>) -> Option<usize> {
+        let model = model.filter(|m| !m.is_empty() && !m.contains("<synthetic>"))?;
+        self.state.note_model(model);
+        let idx = self.intern_model(model);
+        self.last_model_idx = Some(idx);
+        Some(idx)
     }
 
     fn observe_envelope(
@@ -1374,17 +1391,21 @@ impl<'a> ClaudeFold<'a> {
         name: &str,
         input: Option<ClaudeToolInput>,
         ts: i64,
+        model_idx: Option<usize>,
     ) {
         let kind = PendingToolKind::from_name(name);
         let tracked_file_tool = kind.is_tracked_file_tool();
         let input_supported =
             tracked_file_tool && tracked_tool_input_supported(name, input.as_ref());
+        let model = model_idx.map(|idx| self.models[idx].as_str());
 
         match name {
             "Read" => {
                 if input_supported {
                     self.diagnostics.record_relevant(true);
-                    self.state.tool_counts.read += 1;
+                    self.state.record_for_model(model, |state| {
+                        state.tool_counts.read += 1;
+                    });
                 } else if id.is_empty() {
                     self.diagnostics.record_relevant(false);
                 }
@@ -1392,7 +1413,9 @@ impl<'a> ClaudeFold<'a> {
             "Write" => {
                 if input_supported {
                     self.diagnostics.record_relevant(true);
-                    self.state.tool_counts.write += 1;
+                    self.state.record_for_model(model, |state| {
+                        state.tool_counts.write += 1;
+                    });
                 } else if id.is_empty() {
                     self.diagnostics.record_relevant(false);
                 }
@@ -1400,14 +1423,18 @@ impl<'a> ClaudeFold<'a> {
             "Edit" => {
                 if input_supported {
                     self.diagnostics.record_relevant(true);
-                    self.state.tool_counts.edit += 1;
+                    self.state.record_for_model(model, |state| {
+                        state.tool_counts.edit += 1;
+                    });
                 } else if id.is_empty() {
                     self.diagnostics.record_relevant(false);
                 }
             }
             "TodoWrite" | "TaskCreate" | "TaskUpdate" | "TaskStop" => {
                 self.diagnostics.record_relevant(true);
-                self.state.tool_counts.todo_write += 1;
+                self.state.record_for_model(model, |state| {
+                    state.tool_counts.todo_write += 1;
+                });
             }
             "Bash" => {
                 self.diagnostics
@@ -1415,7 +1442,9 @@ impl<'a> ClaudeFold<'a> {
                 if let Some(input) = input.as_ref() {
                     let command = input.command.as_deref().unwrap_or("");
                     let description = input.description.as_deref().unwrap_or("");
-                    self.state.add_run_command(command, description, ts);
+                    self.state.record_for_model(model, |state| {
+                        state.add_run_command(command, description, ts);
+                    });
                 }
             }
             _ => {}
@@ -1431,6 +1460,7 @@ impl<'a> ClaudeFold<'a> {
                         .flatten()
                         .map(PendingToolInput::Full),
                     input_supported,
+                    model_idx,
                 },
             );
         }
@@ -1442,17 +1472,21 @@ impl<'a> ClaudeFold<'a> {
         name: &str,
         input: Option<UsageOnlyClaudeToolInput<'_>>,
         ts: i64,
+        model_idx: Option<usize>,
     ) {
         let kind = PendingToolKind::from_name(name);
         let tracked_file_tool = kind.is_tracked_file_tool();
         let input_supported =
             tracked_file_tool && usage_only_tool_input_supported(name, input.as_ref());
+        let model = model_idx.map(|idx| self.models[idx].as_str());
 
         match name {
             "Read" => {
                 if input_supported {
                     self.diagnostics.record_relevant(true);
-                    self.state.tool_counts.read += 1;
+                    self.state.record_for_model(model, |state| {
+                        state.tool_counts.read += 1;
+                    });
                 } else if id.is_empty() {
                     self.diagnostics.record_relevant(false);
                 }
@@ -1460,7 +1494,9 @@ impl<'a> ClaudeFold<'a> {
             "Write" => {
                 if input_supported {
                     self.diagnostics.record_relevant(true);
-                    self.state.tool_counts.write += 1;
+                    self.state.record_for_model(model, |state| {
+                        state.tool_counts.write += 1;
+                    });
                 } else if id.is_empty() {
                     self.diagnostics.record_relevant(false);
                 }
@@ -1468,21 +1504,27 @@ impl<'a> ClaudeFold<'a> {
             "Edit" => {
                 if input_supported {
                     self.diagnostics.record_relevant(true);
-                    self.state.tool_counts.edit += 1;
+                    self.state.record_for_model(model, |state| {
+                        state.tool_counts.edit += 1;
+                    });
                 } else if id.is_empty() {
                     self.diagnostics.record_relevant(false);
                 }
             }
             "TodoWrite" | "TaskCreate" | "TaskUpdate" | "TaskStop" => {
                 self.diagnostics.record_relevant(true);
-                self.state.tool_counts.todo_write += 1;
+                self.state.record_for_model(model, |state| {
+                    state.tool_counts.todo_write += 1;
+                });
             }
             "Bash" => {
                 self.diagnostics
                     .record_relevant(usage_only_tool_input_supported(name, input.as_ref()));
                 if let Some(input) = input.as_ref() {
                     let command = input.command.as_deref().unwrap_or("");
-                    self.state.add_run_command(command, "", ts);
+                    self.state.record_for_model(model, |state| {
+                        state.add_run_command(command, "", ts);
+                    });
                 }
             }
             _ => {}
@@ -1506,6 +1548,7 @@ impl<'a> ClaudeFold<'a> {
                     kind,
                     input: stored_input,
                     input_supported,
+                    model_idx,
                 },
             );
         }
@@ -1544,7 +1587,14 @@ impl<'a> ClaudeFold<'a> {
                 }
                 TopLevelToolResult::Supported(kind) => {
                     self.diagnostics.record_relevant(true);
-                    dispatch_top_level_tool_result(&mut self.state, tur, kind, ts);
+                    let model = correlated
+                        .as_ref()
+                        .and_then(|(pending, _)| pending.model_idx)
+                        .or(self.last_model_idx)
+                        .map(|idx| self.models[idx].as_str());
+                    self.state.record_for_model(model, |state| {
+                        dispatch_top_level_tool_result(state, tur, kind, ts);
+                    });
                 }
             }
         }
@@ -1581,7 +1631,14 @@ impl<'a> ClaudeFold<'a> {
                 }
                 TopLevelToolResult::Supported(kind) => {
                     self.diagnostics.record_relevant(true);
-                    dispatch_top_level_tool_result_usage_only(&mut self.state, tur, kind);
+                    let model = correlated
+                        .as_ref()
+                        .and_then(|(pending, _)| pending.model_idx)
+                        .or(self.last_model_idx)
+                        .map(|idx| self.models[idx].as_str());
+                    self.state.record_for_model(model, |state| {
+                        dispatch_top_level_tool_result_usage_only(state, tur, kind);
+                    });
                 }
             }
         }
@@ -1631,7 +1688,13 @@ impl<'a> ClaudeFold<'a> {
             } else {
                 Cow::Borrowed("")
             };
-            dispatch_subagent_tool_result(&mut self.state, pending.kind, input, &body, ts);
+            let model = pending
+                .model_idx
+                .or(self.last_model_idx)
+                .map(|idx| self.models[idx].as_str());
+            self.state.record_for_model(model, |state| {
+                dispatch_subagent_tool_result(state, pending.kind, input, &body, ts);
+            });
         }
     }
 
@@ -1662,27 +1725,32 @@ impl<'a> ClaudeFold<'a> {
             let Some(file_path) = input.file_path.as_deref() else {
                 return;
             };
-            match pending.kind {
-                PendingToolKind::Read => {
-                    let metrics = count_raw_tool_result_metrics(raw_content);
-                    preserve_file_tool_counts(&mut self.state, |state| {
-                        state.add_read_counts(file_path, metrics.lines, metrics.chars);
-                    });
-                }
-                PendingToolKind::Write => {
-                    let metrics = input.content.unwrap_or_default();
-                    preserve_file_tool_counts(&mut self.state, |state| {
-                        state.add_write_counts(file_path, metrics.lines, metrics.chars);
-                    });
-                }
-                PendingToolKind::Edit => {
-                    let metrics = input.new_metrics.unwrap_or_default();
-                    preserve_file_tool_counts(&mut self.state, |state| {
-                        state.add_edit_counts_raw(file_path, metrics.lines, metrics.chars);
-                    });
-                }
-                PendingToolKind::Other => {}
-            }
+            let model = pending
+                .model_idx
+                .or(self.last_model_idx)
+                .map(|idx| self.models[idx].as_str());
+            self.state
+                .record_for_model(model, |state| match pending.kind {
+                    PendingToolKind::Read => {
+                        let metrics = count_raw_tool_result_metrics(raw_content);
+                        preserve_file_tool_counts(state, |state| {
+                            state.add_read_counts(file_path, metrics.lines, metrics.chars);
+                        });
+                    }
+                    PendingToolKind::Write => {
+                        let metrics = input.content.unwrap_or_default();
+                        preserve_file_tool_counts(state, |state| {
+                            state.add_write_counts(file_path, metrics.lines, metrics.chars);
+                        });
+                    }
+                    PendingToolKind::Edit => {
+                        let metrics = input.new_metrics.unwrap_or_default();
+                        preserve_file_tool_counts(state, |state| {
+                            state.add_edit_counts_raw(file_path, metrics.lines, metrics.chars);
+                        });
+                    }
+                    PendingToolKind::Other => {}
+                });
         }
     }
 
@@ -2317,6 +2385,7 @@ struct PendingClaudeTool {
     kind: PendingToolKind,
     input: Option<PendingToolInput>,
     input_supported: bool,
+    model_idx: Option<usize>,
 }
 
 impl PendingClaudeTool {

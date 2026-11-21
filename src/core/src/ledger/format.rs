@@ -1138,29 +1138,29 @@ pub(crate) struct ActiveFlags {
 }
 
 impl DayEntry {
-    /// Folds a parsed file session into both halves; every non-`<synthetic>` model in `conversation_usage` receives the record's tool counters, while `advisor_usage` contributes tokens only.
+    /// Folds a parsed file session into both halves; uses `per_model_analysis` when populated so multi-model sessions do not duplicate tool counts across models, while `advisor_usage` contributes tokens only.
     pub(crate) fn add_file_records(&mut self, analysis: CodeAnalysis, emit: bool) {
         for record in analysis.records {
+            let has_per_model = !record.per_model_analysis.is_empty();
+            let fallback_totals = (emit && !has_per_model).then(|| record_totals(&record));
             for (model, usage) in record.conversation_usage {
                 let compact = CompactUsage::from_value(&usage);
                 if compact.has_activity() {
                     self.active.usage = true;
                 }
-                if emit && !model.contains("<synthetic>") {
-                    let row = self
-                        .analysis
-                        .entry(model.clone())
-                        .or_insert_with(|| empty_row(&model));
-                    row.edit_lines += record.total_edit_lines;
-                    row.read_lines += record.total_read_lines;
-                    row.write_lines += record.total_write_lines;
-                    row.bash_count += record.tool_call_counts.bash;
-                    row.edit_count += record.tool_call_counts.edit;
-                    row.read_count += record.tool_call_counts.read;
-                    row.todo_write_count += record.tool_call_counts.todo_write;
-                    row.write_count += record.tool_call_counts.write;
+                if let Some(totals) = &fallback_totals
+                    && !model.contains("<synthetic>")
+                {
+                    add_analysis_row(&mut self.analysis, model.clone(), totals);
                 }
                 merge_model_usage(&mut self.usage, model, compact);
+            }
+            if emit && has_per_model {
+                for (model, row) in record.per_model_analysis {
+                    if !model.contains("<synthetic>") {
+                        add_analysis_row(&mut self.analysis, model, &row);
+                    }
+                }
             }
             for (model, usage) in record.advisor_usage {
                 let compact = CompactUsage::from_value(&usage);
@@ -1205,25 +1205,19 @@ impl DayEntry {
     /// Folds one database analysis row into the analysis half.
     pub(crate) fn add_analysis_records(&mut self, analysis: &CodeAnalysis) {
         for record in &analysis.records {
-            for model in record.conversation_usage.keys() {
-                if model.contains("<synthetic>") {
-                    continue;
+            if !record.per_model_analysis.is_empty() {
+                for (model, row) in &record.per_model_analysis {
+                    if !model.contains("<synthetic>") {
+                        add_analysis_row(&mut self.analysis, model.clone(), row);
+                    }
                 }
-                let row = if let Some(existing) = self.analysis.get_mut(model) {
-                    existing
-                } else {
-                    self.analysis
-                        .entry(model.clone())
-                        .or_insert_with(|| empty_row(model))
-                };
-                row.edit_lines += record.total_edit_lines;
-                row.read_lines += record.total_read_lines;
-                row.write_lines += record.total_write_lines;
-                row.bash_count += record.tool_call_counts.bash;
-                row.edit_count += record.tool_call_counts.edit;
-                row.read_count += record.tool_call_counts.read;
-                row.todo_write_count += record.tool_call_counts.todo_write;
-                row.write_count += record.tool_call_counts.write;
+            } else {
+                let totals = record_totals(record);
+                for model in record.conversation_usage.keys() {
+                    if !model.contains("<synthetic>") {
+                        add_analysis_row(&mut self.analysis, model.clone(), &totals);
+                    }
+                }
             }
         }
         self.active.analysis = true;
@@ -1259,16 +1253,34 @@ impl DayEntry {
 }
 
 fn empty_row(model: &str) -> AggregatedAnalysisRow {
+    AggregatedAnalysisRow::empty(model)
+}
+
+fn record_totals(record: &crate::models::CodeAnalysisRecord) -> AggregatedAnalysisRow {
     AggregatedAnalysisRow {
-        model: model.to_string(),
-        edit_lines: 0,
-        read_lines: 0,
-        write_lines: 0,
-        bash_count: 0,
-        edit_count: 0,
-        read_count: 0,
-        todo_write_count: 0,
-        write_count: 0,
+        model: String::new(),
+        edit_lines: record.total_edit_lines,
+        read_lines: record.total_read_lines,
+        write_lines: record.total_write_lines,
+        bash_count: record.tool_call_counts.bash,
+        edit_count: record.tool_call_counts.edit,
+        read_count: record.tool_call_counts.read,
+        todo_write_count: record.tool_call_counts.todo_write,
+        write_count: record.tool_call_counts.write,
+    }
+}
+
+fn add_analysis_row(
+    target: &mut TinyMap<String, AggregatedAnalysisRow>,
+    model: String,
+    source: &AggregatedAnalysisRow,
+) {
+    if let Some(existing) = target.get_mut(&model) {
+        existing.add_assign(source);
+    } else {
+        let mut row = empty_row(&model);
+        row.add_assign(source);
+        target.insert(model, row);
     }
 }
 
@@ -1337,6 +1349,7 @@ mod tests {
                 tool_call_counts: CodeAnalysisToolCalls::default(),
                 conversation_usage: usage,
                 advisor_usage: FastHashMap::default(),
+                per_model_analysis: FastHashMap::default(),
                 task_id: String::new(),
                 timestamp: 0,
                 folder_path: String::new(),

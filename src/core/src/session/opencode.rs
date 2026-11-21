@@ -204,6 +204,7 @@ impl AnalysisAccum {
                 tool_call_counts: CodeAnalysisToolCalls::default(),
                 conversation_usage: usage_map,
                 advisor_usage: FastHashMap::default(),
+                per_model_analysis: FastHashMap::default(),
                 task_id: session_id.clone(),
                 timestamp: self.last_ts,
                 folder_path: self.folder_path,

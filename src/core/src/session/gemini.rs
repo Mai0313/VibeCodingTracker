@@ -387,6 +387,9 @@ impl<'a> GeminiFold<'a> {
             if message.last_ts > state.last_ts {
                 state.last_ts = message.last_ts;
             }
+            if let Some(model) = message.model.as_deref() {
+                state.note_model(model);
+            }
             if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
                 // `tokens.input` already includes cached tokens, so it is the full request prompt size.
                 let level = classifier
@@ -395,7 +398,9 @@ impl<'a> GeminiFold<'a> {
                 process_gemini_usage(&mut conversation_usage, model, tokens, level);
             }
             if let Some(msg_state) = message.state {
-                state.merge(msg_state);
+                state.record_for_model(message.model.as_deref(), |state| {
+                    state.merge(msg_state);
+                });
             }
         }
 

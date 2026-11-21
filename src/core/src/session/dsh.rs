@@ -360,6 +360,8 @@ struct PendingCall {
     kind: DshToolKind,
     /// Raw JSON argument string from the model, parsed only when the paired result succeeds.
     arguments: String,
+    /// Active model when `tool/call` was recorded, or empty if no model had appeared yet.
+    model: String,
 }
 
 /// Parses one `dsh` session log into a [`ParsedAnalysis`].
@@ -679,6 +681,8 @@ struct DshParser<'a> {
     classifier: Option<TierClassifier<'a>>,
     /// Model from the latest `request/context`, which is only emitted on route changes.
     route_model: String,
+    /// Most recent explicit `assistant/message` model, used if no `request/context` preceded a tool call.
+    last_model: String,
     pending_usage: Option<UsageSample>,
     pending_calls: FastHashMap<i64, PendingCall>,
     /// Set when the header declares a format version this parser cannot read.
@@ -693,9 +697,20 @@ impl<'a> DshParser<'a> {
             diagnostics: ParseDiagnostics::default(),
             classifier: tiers.map(TierClassifier::new),
             route_model: String::new(),
+            last_model: String::new(),
             pending_usage: None,
             pending_calls: FastHashMap::default(),
             unsupported_version: None,
+        }
+    }
+
+    fn active_model(&self) -> Option<&str> {
+        if !self.last_model.is_empty() {
+            Some(self.last_model.as_str())
+        } else if !self.route_model.is_empty() {
+            Some(self.route_model.as_str())
+        } else {
+            None
         }
     }
 
@@ -820,8 +835,10 @@ impl<'a> DshParser<'a> {
                     self.state.last_ts = self.state.last_ts.max(time);
                 }
                 if let Some(model) = model {
+                    self.last_model.clear();
                     self.route_model.clear();
                     self.route_model.push_str(&model);
+                    self.state.note_model(&self.route_model);
                 }
                 self.diagnostics.record_recognized_source();
                 true
@@ -873,15 +890,24 @@ impl<'a> DshParser<'a> {
                 if let Some(time) = env.time {
                     self.state.last_ts = self.state.last_ts.max(time);
                 }
+                let explicit_model = parsed_msg
+                    .message
+                    .and_then(|m| m.source)
+                    .and_then(|s| s.model);
+                if let Some(model) = explicit_model.as_deref().filter(|m| !m.is_empty()) {
+                    self.last_model.clear();
+                    self.last_model.push_str(model);
+                    self.state.note_model(model);
+                } else if !self.route_model.is_empty() {
+                    self.last_model.clear();
+                }
                 if let Some(usage) = parsed_msg.usage {
                     let turn = parsed_msg.turn.unwrap_or(0);
                     let step = parsed_msg.step.unwrap_or(0);
-                    let explicit_model = parsed_msg
-                        .message
-                        .and_then(|m| m.source)
-                        .and_then(|s| s.model);
                     match explicit_model {
-                        Some(model) => self.apply_parsed_usage(turn, step, usage, model.as_ref()),
+                        Some(model) => {
+                            self.apply_parsed_usage(turn, step, usage, model.as_ref());
+                        }
                         None => {
                             let route_model = std::mem::take(&mut self.route_model);
                             self.apply_parsed_usage(turn, step, usage, &route_model);
@@ -916,11 +942,13 @@ impl<'a> DshParser<'a> {
                     } else {
                         String::new()
                     };
+                    let model = self.active_model().unwrap_or_default().to_string();
                     self.pending_calls.insert(
                         seq,
                         PendingCall {
                             kind,
                             arguments: stored_args,
+                            model,
                         },
                     );
                 }
@@ -970,9 +998,17 @@ impl<'a> DshParser<'a> {
         meta_raw: Option<&RawValue>,
         timestamp: i64,
     ) {
+        let fallback_model = self.active_model().map(str::to_string);
+        let attr_model = if !call.model.is_empty() {
+            Some(call.model.as_str())
+        } else {
+            fallback_model.as_deref()
+        };
         match call.kind {
             DshToolKind::TodoWrite => {
-                self.state.tool_counts.todo_write += 1;
+                self.state.record_for_model(attr_model, |state| {
+                    state.tool_counts.todo_write += 1;
+                });
                 self.diagnostics.record_relevant(true);
                 return;
             }
@@ -988,96 +1024,97 @@ impl<'a> DshParser<'a> {
         };
         let usage_only = matches!(self.state.mode, ParseMode::UsageOnly);
 
-        let applied = match call.kind {
-            DshToolKind::Read => {
-                let meta = meta_raw
-                    .filter(|raw| raw.get().starts_with('{'))
-                    .and_then(|raw| serde_json::from_str::<BorrowedDshReadMeta<'_>>(raw.get()).ok())
-                    .unwrap_or_default();
-                let path = raw_as_str(meta.path)
-                    .or_else(|| raw_as_str(args.file_path))
-                    .unwrap_or(Cow::Borrowed(""));
-                if path.is_empty() {
-                    false
-                } else if usage_only {
-                    let stats = count_borrowed_read_lines(meta.lines);
-                    if stats.content_is_empty {
-                        self.state.tool_counts.read += 1;
-                        self.state.add_non_text_read_path(&path);
+        let applied = self
+            .state
+            .record_for_model(attr_model, |state| match call.kind {
+                DshToolKind::Read => {
+                    let meta = meta_raw
+                        .filter(|raw| raw.get().starts_with('{'))
+                        .and_then(|raw| {
+                            serde_json::from_str::<BorrowedDshReadMeta<'_>>(raw.get()).ok()
+                        })
+                        .unwrap_or_default();
+                    let path = raw_as_str(meta.path)
+                        .or_else(|| raw_as_str(args.file_path))
+                        .unwrap_or(Cow::Borrowed(""));
+                    if path.is_empty() {
+                        false
+                    } else if usage_only {
+                        let stats = count_borrowed_read_lines(meta.lines);
+                        if stats.content_is_empty {
+                            state.tool_counts.read += 1;
+                            state.add_non_text_read_path(&path);
+                        } else {
+                            state.add_read_counts(&path, stats.metrics.lines, stats.metrics.chars);
+                        }
+                        true
                     } else {
-                        self.state
-                            .add_read_counts(&path, stats.metrics.lines, stats.metrics.chars);
+                        let content = join_borrowed_read_lines(meta.lines);
+                        if content.is_empty() {
+                            state.tool_counts.read += 1;
+                            state.add_non_text_read_path(&path);
+                        } else {
+                            state.add_read_detail(&path, &content, timestamp);
+                        }
+                        true
                     }
-                    true
-                } else {
-                    let content = join_borrowed_read_lines(meta.lines);
-                    if content.is_empty() {
-                        self.state.tool_counts.read += 1;
-                        self.state.add_non_text_read_path(&path);
-                    } else {
-                        self.state.add_read_detail(&path, &content, timestamp);
+                }
+                DshToolKind::Write => match raw_as_str(args.file_path) {
+                    None => false,
+                    Some(path) => {
+                        if usage_only {
+                            let metrics = args
+                                .content
+                                .and_then(|raw| count_json_string_metrics(raw.get()))
+                                .unwrap_or_default();
+                            state.add_write_counts(&path, metrics.lines, metrics.chars);
+                        } else {
+                            let content = raw_as_str(args.content).unwrap_or(Cow::Borrowed(""));
+                            state.add_write_detail(&path, &content, timestamp);
+                        }
+                        true
                     }
-                    true
-                }
-            }
-            DshToolKind::Write => match raw_as_str(args.file_path) {
-                None => false,
-                Some(path) => {
-                    if usage_only {
-                        let metrics = args
-                            .content
-                            .and_then(|raw| count_json_string_metrics(raw.get()))
-                            .unwrap_or_default();
-                        self.state
-                            .add_write_counts(&path, metrics.lines, metrics.chars);
-                    } else {
-                        let content = raw_as_str(args.content).unwrap_or(Cow::Borrowed(""));
-                        self.state.add_write_detail(&path, &content, timestamp);
+                },
+                DshToolKind::Edit => match raw_as_str(args.file_path) {
+                    None => false,
+                    Some(path) => {
+                        if usage_only {
+                            let old_is_empty = args
+                                .old_string
+                                .and_then(|raw| count_json_string_metrics(raw.get()))
+                                .is_none_or(|m| m.is_empty());
+                            let new_metrics = args
+                                .new_string
+                                .and_then(|raw| count_json_string_metrics(raw.get()))
+                                .unwrap_or_default();
+                            state.add_edit_counts(
+                                &path,
+                                old_is_empty,
+                                new_metrics.lines,
+                                new_metrics.chars,
+                            );
+                        } else {
+                            let old = raw_as_str(args.old_string).unwrap_or(Cow::Borrowed(""));
+                            let new = raw_as_str(args.new_string).unwrap_or(Cow::Borrowed(""));
+                            state.add_edit_detail(&path, &old, &new, timestamp);
+                        }
+                        true
                     }
-                    true
-                }
-            },
-            DshToolKind::Edit => match raw_as_str(args.file_path) {
-                None => false,
-                Some(path) => {
-                    if usage_only {
-                        let old_is_empty = args
-                            .old_string
-                            .and_then(|raw| count_json_string_metrics(raw.get()))
-                            .is_none_or(|m| m.is_empty());
-                        let new_metrics = args
-                            .new_string
-                            .and_then(|raw| count_json_string_metrics(raw.get()))
-                            .unwrap_or_default();
-                        self.state.add_edit_counts(
-                            &path,
-                            old_is_empty,
-                            new_metrics.lines,
-                            new_metrics.chars,
-                        );
-                    } else {
-                        let old = raw_as_str(args.old_string).unwrap_or(Cow::Borrowed(""));
-                        let new = raw_as_str(args.new_string).unwrap_or(Cow::Borrowed(""));
-                        self.state.add_edit_detail(&path, &old, &new, timestamp);
+                },
+                DshToolKind::Bash => match raw_as_str(args.command) {
+                    None => false,
+                    Some(command) => {
+                        let description = if usage_only {
+                            Cow::Borrowed("")
+                        } else {
+                            raw_as_str(args.description).unwrap_or(Cow::Borrowed(""))
+                        };
+                        state.add_run_command(&command, &description, timestamp);
+                        true
                     }
-                    true
-                }
-            },
-            DshToolKind::Bash => match raw_as_str(args.command) {
-                None => false,
-                Some(command) => {
-                    let description = if usage_only {
-                        Cow::Borrowed("")
-                    } else {
-                        raw_as_str(args.description).unwrap_or(Cow::Borrowed(""))
-                    };
-                    self.state
-                        .add_run_command(&command, &description, timestamp);
-                    true
-                }
-            },
-            DshToolKind::TodoWrite | DshToolKind::Unmapped => unreachable!(),
-        };
+                },
+                DshToolKind::TodoWrite | DshToolKind::Unmapped => unreachable!(),
+            });
         self.diagnostics.record_relevant(applied);
     }
 
@@ -1100,7 +1137,9 @@ impl<'a> DshParser<'a> {
             "session" => self.apply_header(object),
             "request/context" => {
                 if let Some(model) = data.get("model").and_then(Value::as_str) {
+                    self.last_model.clear();
                     self.route_model = model.to_string();
+                    self.state.note_model(&self.route_model);
                 }
             }
             "assistant/message" => self.apply_assistant_message(data),
@@ -1137,11 +1176,17 @@ impl<'a> DshParser<'a> {
     }
 
     fn apply_assistant_message(&mut self, data: &Value) {
-        let model = data
+        let explicit = data
             .pointer("/message/source/model")
-            .and_then(Value::as_str)
-            .unwrap_or(&self.route_model)
-            .to_string();
+            .and_then(Value::as_str);
+        if let Some(model) = explicit.filter(|m| !m.is_empty()) {
+            self.last_model.clear();
+            self.last_model.push_str(model);
+            self.state.note_model(model);
+        } else if !self.route_model.is_empty() {
+            self.last_model.clear();
+        }
+        let model = explicit.unwrap_or(&self.route_model).to_string();
         self.apply_usage(data, data.get("usage"), &model);
     }
 
@@ -1225,6 +1270,7 @@ impl<'a> DshParser<'a> {
             return;
         };
         let kind = DshToolKind::from_name(name);
+        let model = self.active_model().unwrap_or_default().to_string();
         self.pending_calls.insert(
             seq,
             PendingCall {
@@ -1234,6 +1280,7 @@ impl<'a> DshParser<'a> {
                 } else {
                     String::new()
                 },
+                model,
             },
         );
     }
@@ -1261,122 +1308,32 @@ impl<'a> DshParser<'a> {
             .get("time")
             .and_then(Value::as_i64)
             .unwrap_or(self.state.last_ts);
-
-        let applied = match call.kind {
-            DshToolKind::Read => self.apply_read(&arguments, meta, timestamp),
-            DshToolKind::Write => self.apply_write(&arguments, timestamp),
-            DshToolKind::Edit => self.apply_edit(&arguments, timestamp),
-            DshToolKind::Bash => self.apply_bash(&arguments, timestamp),
-            DshToolKind::TodoWrite => {
-                self.state.tool_counts.todo_write += 1;
-                true
-            }
-            // Tool sets are plugin-composable, so unmapped tool names are expected.
-            DshToolKind::Unmapped => return,
-        };
-        self.diagnostics.record_relevant(applied);
-    }
-
-    fn apply_read(&mut self, arguments: &Value, meta: &Value, timestamp: i64) -> bool {
-        // Prefer `meta.path` (resolved absolute path) over `arguments.file_path`, which may be relative to cwd.
-        let path = meta
-            .get("path")
-            .and_then(Value::as_str)
-            .or_else(|| arguments.get("file_path").and_then(Value::as_str))
-            .unwrap_or_default();
-        if path.is_empty() {
-            return false;
-        }
-
-        if matches!(self.state.mode, ParseMode::UsageOnly) {
-            let mut text_count = 0_usize;
-            let mut any_non_empty = false;
-            let mut counter = StreamingTextCounter::default();
-            if let Some(lines) = meta.get("lines").and_then(Value::as_array) {
-                for line in lines {
-                    if let Some(text) = line.get("text").and_then(Value::as_str) {
-                        if text_count > 0 {
-                            counter.push_newline();
-                        }
-                        text_count += 1;
-                        if !text.is_empty() {
-                            any_non_empty = true;
-                            counter.push_str(text);
-                        }
-                    }
-                }
-            }
-            if text_count == 0 || (text_count == 1 && !any_non_empty) {
-                self.state.tool_counts.read += 1;
-                self.state.add_non_text_read_path(path);
-            } else {
-                let metrics = counter.finish();
-                self.state
-                    .add_read_counts(path, metrics.lines, metrics.chars);
-            }
-            return true;
-        }
-
-        let content = meta
-            .get("lines")
-            .and_then(Value::as_array)
-            .map(|lines| {
-                lines
-                    .iter()
-                    .filter_map(|line| line.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        if content.is_empty() {
-            // An empty file, or an image read, which reports no text lines.
-            self.state.tool_counts.read += 1;
-            self.state.add_non_text_read_path(path);
+        let fallback_model = self.active_model().map(str::to_string);
+        let attr_model = if !call.model.is_empty() {
+            Some(call.model.as_str())
         } else {
-            self.state.add_read_detail(path, &content, timestamp);
+            fallback_model.as_deref()
+        };
+
+        if call.kind == DshToolKind::Unmapped {
+            // Tool sets are plugin-composable, so unmapped tool names are expected.
+            return;
         }
-        true
-    }
 
-    fn apply_write(&mut self, arguments: &Value, timestamp: i64) -> bool {
-        // Use the call's `content` because diff meta is empty for new files and pads hunks with context lines.
-        let Some(path) = arguments.get("file_path").and_then(Value::as_str) else {
-            return false;
-        };
-        let content = arguments
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        self.state.add_write_detail(path, content, timestamp);
-        true
-    }
-
-    fn apply_edit(&mut self, arguments: &Value, timestamp: i64) -> bool {
-        let Some(path) = arguments.get("file_path").and_then(Value::as_str) else {
-            return false;
-        };
-        let old = arguments
-            .get("old_string")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let new = arguments
-            .get("new_string")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        self.state.add_edit_detail(path, old, new, timestamp);
-        true
-    }
-
-    fn apply_bash(&mut self, arguments: &Value, timestamp: i64) -> bool {
-        let Some(command) = arguments.get("command").and_then(Value::as_str) else {
-            return false;
-        };
-        let description = arguments
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        self.state.add_run_command(command, description, timestamp);
-        true
+        let applied = self
+            .state
+            .record_for_model(attr_model, |state| match call.kind {
+                DshToolKind::Read => apply_dsh_read(state, &arguments, meta, timestamp),
+                DshToolKind::Write => apply_dsh_write(state, &arguments, timestamp),
+                DshToolKind::Edit => apply_dsh_edit(state, &arguments, timestamp),
+                DshToolKind::Bash => apply_dsh_bash(state, &arguments, timestamp),
+                DshToolKind::TodoWrite => {
+                    state.tool_counts.todo_write += 1;
+                    true
+                }
+                DshToolKind::Unmapped => unreachable!(),
+            });
+        self.diagnostics.record_relevant(applied);
     }
 
     fn finish(mut self) -> ParsedAnalysis {
@@ -1423,6 +1380,112 @@ impl<'a> DshParser<'a> {
             self.diagnostics,
         )
     }
+}
+
+fn apply_dsh_read(
+    state: &mut SessionParseState,
+    arguments: &Value,
+    meta: &Value,
+    timestamp: i64,
+) -> bool {
+    // Prefer `meta.path` (resolved absolute path) over `arguments.file_path`, which may be relative to cwd.
+    let path = meta
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| arguments.get("file_path").and_then(Value::as_str))
+        .unwrap_or_default();
+    if path.is_empty() {
+        return false;
+    }
+
+    if matches!(state.mode, ParseMode::UsageOnly) {
+        let mut text_count = 0_usize;
+        let mut any_non_empty = false;
+        let mut counter = StreamingTextCounter::default();
+        if let Some(lines) = meta.get("lines").and_then(Value::as_array) {
+            for line in lines {
+                if let Some(text) = line.get("text").and_then(Value::as_str) {
+                    if text_count > 0 {
+                        counter.push_newline();
+                    }
+                    text_count += 1;
+                    if !text.is_empty() {
+                        any_non_empty = true;
+                        counter.push_str(text);
+                    }
+                }
+            }
+        }
+        if text_count == 0 || (text_count == 1 && !any_non_empty) {
+            state.tool_counts.read += 1;
+            state.add_non_text_read_path(path);
+        } else {
+            let metrics = counter.finish();
+            state.add_read_counts(path, metrics.lines, metrics.chars);
+        }
+        return true;
+    }
+
+    let content = meta
+        .get("lines")
+        .and_then(Value::as_array)
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(|line| line.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if content.is_empty() {
+        // An empty file, or an image read, which reports no text lines.
+        state.tool_counts.read += 1;
+        state.add_non_text_read_path(path);
+    } else {
+        state.add_read_detail(path, &content, timestamp);
+    }
+    true
+}
+
+fn apply_dsh_write(state: &mut SessionParseState, arguments: &Value, timestamp: i64) -> bool {
+    // Use the call's `content` because diff meta is empty for new files and pads hunks with context lines.
+    let Some(path) = arguments.get("file_path").and_then(Value::as_str) else {
+        return false;
+    };
+    let content = arguments
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    state.add_write_detail(path, content, timestamp);
+    true
+}
+
+fn apply_dsh_edit(state: &mut SessionParseState, arguments: &Value, timestamp: i64) -> bool {
+    let Some(path) = arguments.get("file_path").and_then(Value::as_str) else {
+        return false;
+    };
+    let old = arguments
+        .get("old_string")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let new = arguments
+        .get("new_string")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    state.add_edit_detail(path, old, new, timestamp);
+    true
+}
+
+fn apply_dsh_bash(state: &mut SessionParseState, arguments: &Value, timestamp: i64) -> bool {
+    let Some(command) = arguments.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let description = arguments
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    state.add_run_command(command, description, timestamp);
+    true
 }
 
 #[cfg(test)]
@@ -2023,5 +2086,152 @@ mod tests {
         assert_eq!(fr.tool_call_counts.edit, 1);
         assert_eq!(fr.tool_call_counts.bash, 1);
         assert_eq!(fr.tool_call_counts.todo_write, 1);
+    }
+
+    #[test]
+    fn multi_model_tool_attribution_prefers_explicit_model_and_matches_value_path() {
+        let dir = TempDir::new().unwrap();
+        let lines = vec![
+            HEADER.to_string(),
+            json!({"type": "request/context", "seq": 1, "time": 100, "data": {"model": "model-a"}})
+                .to_string(),
+            json!({
+                "type": "tool/call",
+                "seq": 2,
+                "time": 101,
+                "data": {"name": "read", "arguments": r#"{"file_path":"src/a.rs"}"#}
+            })
+            .to_string(),
+            json!({
+                "type": "tool/result",
+                "seq": 3,
+                "time": 102,
+                "sourceEventSeqs": [2],
+                "data": {"meta": {"path": "/repo/src/a.rs", "lines": [{"text": "line1"}, {"text": "line2"}]}}
+            })
+            .to_string(),
+            // Explicit model override on assistant/message without a new request/context.
+            json!({
+                "type": "assistant/message",
+                "seq": 4,
+                "time": 103,
+                "data": {
+                    "turn": 1,
+                    "step": 0,
+                    "message": {"source": {"model": "model-b"}},
+                    "usage": {"inputTokens": 20, "outputTokens": 10}
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "tool/call",
+                "seq": 5,
+                "time": 104,
+                "data": {"name": "edit", "arguments": r#"{"file_path":"src/b.rs","old_string":"a","new_string":"b\nc\n"}"#}
+            })
+            .to_string(),
+            json!({
+                "type": "tool/result",
+                "seq": 6,
+                "time": 105,
+                "sourceEventSeqs": [5],
+                "data": {"meta": {}}
+            })
+            .to_string(),
+            // Usage-less assistant/message with explicit model must still switch active attribution.
+            json!({
+                "type": "assistant/message",
+                "seq": 7,
+                "time": 106,
+                "data": {
+                    "turn": 2,
+                    "step": 0,
+                    "message": {"source": {"model": "model-c"}}
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "tool/call",
+                "seq": 8,
+                "time": 107,
+                "data": {"name": "bash", "arguments": r#"{"command":"echo ok"}"#}
+            })
+            .to_string(),
+            json!({
+                "type": "tool/result",
+                "seq": 9,
+                "time": 108,
+                "sourceEventSeqs": [8],
+                "data": {"meta": {}}
+            })
+            .to_string(),
+            // New request/context clears stale explicit last_model.
+            json!({"type": "request/context", "seq": 10, "time": 109, "data": {"model": "model-a"}})
+                .to_string(),
+            json!({
+                "type": "assistant/message",
+                "seq": 11,
+                "time": 110,
+                "data": {
+                    "turn": 3,
+                    "step": 0,
+                    "usage": {"inputTokens": 15, "outputTokens": 5}
+                }
+            })
+            .to_string(),
+            json!({
+                "type": "tool/call",
+                "seq": 12,
+                "time": 111,
+                "data": {"name": "write", "arguments": r#"{"file_path":"src/c.rs","content":"x\ny\n"}"#}
+            })
+            .to_string(),
+            json!({
+                "type": "tool/result",
+                "seq": 13,
+                "time": 112,
+                "sourceEventSeqs": [12],
+                "data": {"meta": {}}
+            })
+            .to_string(),
+        ];
+        let path = write_frames(&dir, "multi_model.jsonl.zstd", std::slice::from_ref(&lines));
+
+        let full = parse_dsh_session(&path, ParseMode::Full, None).expect("full");
+        let usage = parse_dsh_session(&path, ParseMode::UsageOnly, None).expect("usage_only");
+        let mut via_value = DshParser::new(ParseMode::Full, None);
+        for line in &lines {
+            let value: Value = serde_json::from_str(line).expect("valid json");
+            via_value.push(&value);
+        }
+        let value_parsed = via_value.finish();
+
+        let fr = &full.analysis.records[0];
+        let ur = &usage.analysis.records[0];
+        let vr = &value_parsed.analysis.records[0];
+
+        assert_eq!(fr.per_model_analysis, ur.per_model_analysis);
+        assert_eq!(fr.per_model_analysis, vr.per_model_analysis);
+
+        let row_a = &fr.per_model_analysis["model-a"];
+        assert_eq!(row_a.read_count, 1);
+        assert_eq!(row_a.read_lines, 2);
+        assert_eq!(row_a.write_count, 1);
+        assert_eq!(row_a.write_lines, 2);
+        assert_eq!(row_a.edit_count, 0);
+        assert_eq!(row_a.bash_count, 0);
+
+        let row_b = &fr.per_model_analysis["model-b"];
+        assert_eq!(row_b.edit_count, 1);
+        assert_eq!(row_b.edit_lines, 2);
+        assert_eq!(row_b.read_count, 0);
+        assert_eq!(row_b.bash_count, 0);
+        assert_eq!(row_b.write_count, 0);
+
+        let row_c = &fr.per_model_analysis["model-c"];
+        assert_eq!(row_c.bash_count, 1);
+        assert_eq!(row_c.read_count, 0);
+        assert_eq!(row_c.edit_count, 0);
+        assert_eq!(row_c.write_count, 0);
     }
 }

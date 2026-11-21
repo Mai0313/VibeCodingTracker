@@ -489,7 +489,7 @@ struct CodexFold<'a> {
     shell_calls: FastHashMap<String, PendingCodexShellCall>,
     custom_calls: FastHashMap<String, CodexCustomCall>,
     // Completed outer `exec` cells buffered until `finish()`, where they flush only if modern `item_completed` `CommandExecution` events did not already report individual shell commands.
-    pending_exec_cells: Vec<(Option<String>, i64)>,
+    pending_exec_cells: Vec<(Option<String>, i64, Option<String>)>,
     saw_item_command_execution: bool,
     // Call ids already counted by a confirmed direct `apply_patch` output, a successful `patch_apply_end`, or a completed `FileChange` item; first to count wins, and unconfirmed direct outputs never register here.
     patch_counted_ids: FastHashSet<String>,
@@ -563,11 +563,12 @@ impl<'a> CodexFold<'a> {
                 {
                     self.state.folder_path.push_str(cwd);
                 }
-                if let Some(model) = entry.model.filter(|model| !model.is_empty())
-                    && self.current_model != model
-                {
-                    self.current_model.clear();
-                    self.current_model.push_str(model);
+                if let Some(model) = entry.model.filter(|model| !model.is_empty()) {
+                    self.state.note_model(model);
+                    if self.current_model != model {
+                        self.current_model.clear();
+                        self.current_model.push_str(model);
+                    }
                 }
             }
             "event_msg" => {
@@ -716,9 +717,13 @@ impl<'a> CodexFold<'a> {
                     if matches!(entry.success, Some(true)) && !already_counted {
                         match parse_patch_changes(entry.changes) {
                             Some(patches) => {
-                                for patch in patches {
-                                    self.state.handle_patch(patch, ts);
-                                }
+                                let current = (!self.current_model.is_empty())
+                                    .then_some(self.current_model.as_str());
+                                self.state.record_for_model(current, |state| {
+                                    for patch in patches {
+                                        state.handle_patch(patch, ts);
+                                    }
+                                });
                                 if let Some(id) = entry.call_id {
                                     self.patch_counted_ids.insert(id.to_string());
                                 }
@@ -734,6 +739,8 @@ impl<'a> CodexFold<'a> {
                 if entry.payload_type == Some("item_completed")
                     && let Some(item) = entry.completed_item
                 {
+                    let current =
+                        (!self.current_model.is_empty()).then_some(self.current_model.as_str());
                     match item {
                         CompletedItem::FileChange {
                             id,
@@ -746,9 +753,11 @@ impl<'a> CodexFold<'a> {
                             if status.as_deref() == Some("completed") && !already_counted {
                                 match parse_patch_changes(changes.as_deref()) {
                                     Some(patches) => {
-                                        for patch in patches {
-                                            self.state.handle_patch(patch, ts);
-                                        }
+                                        self.state.record_for_model(current, |state| {
+                                            for patch in patches {
+                                                state.handle_patch(patch, ts);
+                                            }
+                                        });
                                         if let Some(id) = id {
                                             self.patch_counted_ids.insert(id.into_owned());
                                         }
@@ -772,15 +781,17 @@ impl<'a> CodexFold<'a> {
                                 .is_some_and(|id| self.command_counted_ids.contains(id));
                             if !already_counted {
                                 self.diagnostics.record_relevant(true);
-                                handle_command_execution(
-                                    &mut self.state,
-                                    status.as_deref(),
-                                    cwd.as_deref(),
-                                    &command,
-                                    &parsed_cmd,
-                                    aggregated_output,
-                                    ts,
-                                );
+                                self.state.record_for_model(current, |state| {
+                                    handle_command_execution(
+                                        state,
+                                        status.as_deref(),
+                                        cwd.as_deref(),
+                                        &command,
+                                        &parsed_cmd,
+                                        aggregated_output,
+                                        ts,
+                                    );
+                                });
                                 if let Some(id) = id {
                                     self.command_counted_ids.insert(id.into_owned());
                                 }
@@ -800,9 +811,11 @@ impl<'a> CodexFold<'a> {
                         if let Some(call_id) = entry.call_id {
                             if let Some(call) = call {
                                 self.diagnostics.record_relevant(true);
+                                let model = (!self.current_model.is_empty())
+                                    .then(|| self.current_model.clone());
                                 self.shell_calls.insert(
                                     call_id.to_string(),
-                                    PendingCodexShellCall::Parsed(call),
+                                    PendingCodexShellCall::Parsed(call, model),
                                 );
                             } else {
                                 // Defer the schema verdict until the paired output, since Codex logs model argument errors as normal lifecycle records.
@@ -821,10 +834,16 @@ impl<'a> CodexFold<'a> {
                         && let Some(call) = self.shell_calls.remove(call_id)
                     {
                         match call {
-                            PendingCodexShellCall::Parsed(call) => {
+                            PendingCodexShellCall::Parsed(call, model) => {
                                 self.diagnostics.record_relevant(true);
                                 if self.command_counted_ids.insert(call_id.to_string()) {
-                                    self.state.handle_shell_call(call, entry.output);
+                                    let attr_model = model.as_deref().or_else(|| {
+                                        (!self.current_model.is_empty())
+                                            .then_some(self.current_model.as_str())
+                                    });
+                                    self.state.record_for_model(attr_model, |state| {
+                                        state.handle_shell_call(call, entry.output);
+                                    });
                                 }
                             }
                             PendingCodexShellCall::InvalidArguments => {
@@ -838,9 +857,11 @@ impl<'a> CodexFold<'a> {
                     if let Some(name) = entry.name
                         && matches!(name, "exec" | "apply_patch")
                     {
+                        let model =
+                            (!self.current_model.is_empty()).then(|| self.current_model.clone());
                         let call = entry
                             .arguments
-                            .and_then(|input| parse_custom_call(name, input, ts, self.mode));
+                            .and_then(|input| parse_custom_call(name, input, ts, self.mode, model));
                         let normalized = call.is_some() && entry.call_id.is_some();
                         self.diagnostics.record_relevant(normalized);
                         if let (Some(call), Some(call_id)) = (call, entry.call_id) {
@@ -852,11 +873,14 @@ impl<'a> CodexFold<'a> {
                     if let Some(call_id) = entry.call_id
                         && let Some(call) = self.custom_calls.remove(call_id)
                     {
+                        let fallback_model =
+                            (!self.current_model.is_empty()).then_some(self.current_model.as_str());
                         let normalized = dispatch_custom_call(
                             &mut self.state,
                             call,
                             entry.output,
                             call_id,
+                            fallback_model,
                             &mut self.patch_counted_ids,
                             &mut self.pending_exec_cells,
                         );
@@ -871,13 +895,15 @@ impl<'a> CodexFold<'a> {
 
     fn finish(mut self) -> ParsedAnalysis {
         if !self.saw_item_command_execution {
-            for (source, timestamp) in self.pending_exec_cells {
+            for (source, timestamp, model) in self.pending_exec_cells {
                 // Nested tool calls in JavaScript source cannot be proven to have executed; count the completed `exec` cell as one command.
-                if let Some(source) = source {
-                    self.state.add_run_command(&source, "", timestamp);
-                } else {
-                    self.state.tool_counts.bash += 1;
-                }
+                self.state.record_for_model(model.as_deref(), |state| {
+                    if let Some(source) = source {
+                        state.add_run_command(&source, "", timestamp);
+                    } else {
+                        state.tool_counts.bash += 1;
+                    }
+                });
             }
         }
         for call in self.shell_calls.into_values() {
@@ -1137,7 +1163,7 @@ fn is_supported_codex_usage(info: &Value) -> bool {
 }
 
 enum PendingCodexShellCall {
-    Parsed(CodexShellCall),
+    Parsed(CodexShellCall, Option<String>),
     InvalidArguments,
 }
 
@@ -1145,7 +1171,7 @@ impl PendingCodexShellCall {
     fn needs_output(&self) -> bool {
         match self {
             Self::InvalidArguments => true,
-            Self::Parsed(call) => {
+            Self::Parsed(call, _) => {
                 !call.script.contains("*** Begin Patch")
                     && (extract_sed_file_path(&call.script).is_some()
                         || extract_cat_file_path(&call.script).is_some())
@@ -1239,10 +1265,12 @@ enum CodexCustomCall {
     Exec {
         source: Option<String>,
         timestamp: i64,
+        model: Option<String>,
     },
     ApplyPatch {
         patches: Vec<CodexPatch>,
         timestamp: i64,
+        model: Option<String>,
     },
 }
 
@@ -1257,18 +1285,24 @@ fn parse_custom_call(
     input: &str,
     timestamp: i64,
     mode: ParseMode,
+    model: Option<String>,
 ) -> Option<CodexCustomCall> {
     match name {
         "exec" if !input.trim().is_empty() => Some(CodexCustomCall::Exec {
             source: matches!(mode, ParseMode::Full).then(|| input.to_string()),
             timestamp,
+            model,
         }),
         "apply_patch" => {
             let patches: Vec<_> = parse_apply_patch_script(input)
                 .into_iter()
                 .filter(|patch| !patch.file_path.is_empty())
                 .collect();
-            (!patches.is_empty()).then_some(CodexCustomCall::ApplyPatch { patches, timestamp })
+            (!patches.is_empty()).then_some(CodexCustomCall::ApplyPatch {
+                patches,
+                timestamp,
+                model,
+            })
         }
         _ => None,
     }
@@ -1279,28 +1313,39 @@ fn dispatch_custom_call(
     call: CodexCustomCall,
     output: Option<&str>,
     call_id: &str,
+    fallback_model: Option<&str>,
     patch_counted_ids: &mut FastHashSet<String>,
-    pending_exec_cells: &mut Vec<(Option<String>, i64)>,
+    pending_exec_cells: &mut Vec<(Option<String>, i64, Option<String>)>,
 ) -> bool {
     match call {
-        CodexCustomCall::Exec { source, timestamp } => {
-            pending_exec_cells.push((source, timestamp));
+        CodexCustomCall::Exec {
+            source,
+            timestamp,
+            model,
+        } => {
+            let model = model.or_else(|| fallback_model.map(str::to_string));
+            pending_exec_cells.push((source, timestamp, model));
             true
         }
-        CodexCustomCall::ApplyPatch { patches, timestamp } => {
-            match custom_apply_patch_result(output) {
-                CustomApplyPatchResult::Success => {
-                    if patch_counted_ids.insert(call_id.to_string()) {
+        CodexCustomCall::ApplyPatch {
+            patches,
+            timestamp,
+            model,
+        } => match custom_apply_patch_result(output) {
+            CustomApplyPatchResult::Success => {
+                if patch_counted_ids.insert(call_id.to_string()) {
+                    let attr_model = model.as_deref().or(fallback_model);
+                    state.record_for_model(attr_model, |state| {
                         for patch in patches {
                             state.handle_patch(patch, timestamp);
                         }
-                    }
-                    true
+                    });
                 }
-                CustomApplyPatchResult::Failure => true,
-                CustomApplyPatchResult::Unknown => false,
+                true
             }
-        }
+            CustomApplyPatchResult::Failure => true,
+            CustomApplyPatchResult::Unknown => false,
+        },
     }
 }
 
@@ -2516,7 +2561,7 @@ mod tests {
     fn custom_apply_patch_requires_supported_nonempty_file_headers() {
         let drifted = "*** Begin Patch\n*** Future File: src/lib.rs\n+new\n*** End Patch";
         assert!(
-            parse_custom_call("apply_patch", drifted, 1, ParseMode::Full).is_none(),
+            parse_custom_call("apply_patch", drifted, 1, ParseMode::Full, None).is_none(),
             "an unknown file header must not normalize as a successful patch"
         );
 
@@ -2525,7 +2570,7 @@ mod tests {
             "*** Begin Patch\n*** Delete File: empty.txt\n*** End Patch",
         ] {
             let Some(CodexCustomCall::ApplyPatch { patches, .. }) =
-                parse_custom_call("apply_patch", patch, 1, ParseMode::Full)
+                parse_custom_call("apply_patch", patch, 1, ParseMode::Full, None)
             else {
                 panic!("supported empty-body patch was rejected");
             };
@@ -2534,7 +2579,7 @@ mod tests {
         }
 
         let empty_path = "*** Begin Patch\n*** Add File:\n+new\n*** End Patch";
-        assert!(parse_custom_call("apply_patch", empty_path, 1, ParseMode::Full).is_none());
+        assert!(parse_custom_call("apply_patch", empty_path, 1, ParseMode::Full, None).is_none());
     }
 
     #[test]

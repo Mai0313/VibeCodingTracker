@@ -145,6 +145,11 @@ pub struct CodeAnalysisRecord {
     /// Kept separate from `conversation_usage` and skipped during serialization so usage roll-ups bill these tokens without attributing the session's tool counts to them in analysis.
     #[serde(skip)]
     pub advisor_usage: FastHashMap<String, serde_json::Value>,
+    /// Per-model file-operation and tool-call breakdown for multi-model sessions.
+    ///
+    /// Skipped during serialization so single-file JSON output stays unchanged; when non-empty, analysis roll-ups emit these rows directly instead of duplicating session-wide totals across every key in `conversation_usage`.
+    #[serde(skip)]
+    pub per_model_analysis: FastHashMap<String, AggregatedAnalysisRow>,
     /// Session / task identifier from the source log.
     pub task_id: String,
     /// Unix epoch timestamp (milliseconds) of the session's last activity.
@@ -174,7 +179,7 @@ pub struct CodeAnalysis {
 /// Aggregated file-operation line counts and tool-call counts for a single model across sessions.
 ///
 /// Serializes with camelCase field names.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AggregatedAnalysisRow {
     /// Model name the metrics are grouped under.
@@ -195,6 +200,35 @@ pub struct AggregatedAnalysisRow {
     pub todo_write_count: usize,
     /// Number of `Write` tool calls.
     pub write_count: usize,
+}
+
+impl AggregatedAnalysisRow {
+    /// Returns a zeroed analysis row for `model`.
+    pub(crate) fn empty(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            edit_lines: 0,
+            read_lines: 0,
+            write_lines: 0,
+            bash_count: 0,
+            edit_count: 0,
+            read_count: 0,
+            todo_write_count: 0,
+            write_count: 0,
+        }
+    }
+
+    /// Adds all line and tool-call counts from `other` into `self`.
+    pub(crate) fn add_assign(&mut self, other: &Self) {
+        self.edit_lines += other.edit_lines;
+        self.read_lines += other.read_lines;
+        self.write_lines += other.write_lines;
+        self.bash_count += other.bash_count;
+        self.edit_count += other.edit_count;
+        self.read_count += other.read_count;
+        self.todo_write_count += other.todo_write_count;
+        self.write_count += other.write_count;
+    }
 }
 
 /// Concrete AI coding assistant a session came from.
@@ -513,6 +547,7 @@ mod tests {
             tool_call_counts: CodeAnalysisToolCalls::default(),
             conversation_usage: FastHashMap::default(),
             advisor_usage: FastHashMap::default(),
+            per_model_analysis: FastHashMap::default(),
             task_id: "task-123".to_string(),
             timestamp: 1234567890,
             folder_path: "/workspace".to_string(),
@@ -545,6 +580,7 @@ mod tests {
             tool_call_counts: CodeAnalysisToolCalls::default(),
             conversation_usage: FastHashMap::default(),
             advisor_usage: FastHashMap::default(),
+            per_model_analysis: FastHashMap::default(),
             task_id: String::new(),
             timestamp: 0,
             folder_path: String::new(),

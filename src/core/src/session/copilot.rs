@@ -317,6 +317,7 @@ impl CopilotFold {
                         raw_as_str(data.new_model).filter(|model| !model.is_empty())
                 {
                     self.current_model = canonicalize_model_name(new_model.as_ref());
+                    self.state.note_model(&self.current_model);
                 }
             }
             "session.shutdown" => {
@@ -363,6 +364,8 @@ impl CopilotFold {
                                 tool,
                                 payload,
                                 timestamp: ts,
+                                model: (!self.current_model.is_empty())
+                                    .then(|| self.current_model.clone()),
                             },
                         );
                     }
@@ -376,6 +379,7 @@ impl CopilotFold {
                                     tool: None,
                                     payload: PendingToolPayload::Untracked,
                                     timestamp: ts,
+                                    model: None,
                                 },
                             );
                         }
@@ -429,12 +433,23 @@ impl CopilotFold {
                 if pending.tool.is_none() {
                     return;
                 }
-                let complete = apply_borrowed_pending_tool(
-                    pending.payload,
-                    data.result,
-                    &mut self.state,
-                    pending.timestamp,
-                );
+                let complete_model = raw_as_str(data.model)
+                    .filter(|model| !model.is_empty())
+                    .map(|model| canonicalize_model_name(model.as_ref()));
+                let attr_model = complete_model
+                    .as_deref()
+                    .or(pending.model.as_deref())
+                    .or_else(|| {
+                        (!self.current_model.is_empty()).then_some(self.current_model.as_str())
+                    });
+                let complete = self.state.record_for_model(attr_model, |state| {
+                    apply_borrowed_pending_tool(
+                        pending.payload,
+                        data.result,
+                        state,
+                        pending.timestamp,
+                    )
+                });
                 self.diagnostics.record_relevant(complete);
             }
             _ => {}
@@ -473,6 +488,7 @@ impl CopilotFold {
                     .filter(|s| !s.is_empty());
                 if let Some(new_model) = new_model {
                     self.current_model = canonicalize_model_name(new_model);
+                    self.state.note_model(&self.current_model);
                 }
             }
             "session.shutdown" => {
@@ -540,6 +556,8 @@ impl CopilotFold {
                                 tool,
                                 payload,
                                 timestamp: ts,
+                                model: (!self.current_model.is_empty())
+                                    .then(|| self.current_model.clone()),
                             },
                         );
                     }
@@ -553,6 +571,7 @@ impl CopilotFold {
                                     tool: None,
                                     payload: PendingToolPayload::Untracked,
                                     timestamp: ts,
+                                    model: None,
                                 },
                             );
                         }
@@ -611,7 +630,17 @@ impl CopilotFold {
                         .record_relevant(folded.as_ref().is_some_and(ToolArgs::is_complete));
                 }
                 if let Some(folded) = folded {
-                    folded.record(&mut self.state, pending.timestamp);
+                    let complete_model =
+                        (!data.model.is_empty()).then(|| canonicalize_model_name(&data.model));
+                    let attr_model = complete_model
+                        .as_deref()
+                        .or(pending.model.as_deref())
+                        .or_else(|| {
+                            (!self.current_model.is_empty()).then_some(self.current_model.as_str())
+                        });
+                    self.state.record_for_model(attr_model, |state| {
+                        folded.record(state, pending.timestamp);
+                    });
                 }
             }
             _ => {}
@@ -1544,6 +1573,8 @@ struct PendingTool {
     payload: PendingToolPayload,
     /// Start-event timestamp in epoch milliseconds.
     timestamp: i64,
+    /// Active model when `tool.execution_start` was observed, used if `tool.execution_complete` omits `model`.
+    model: Option<String>,
 }
 
 /// Attaches read line/file details without incrementing `tool_counts.read` a second time.

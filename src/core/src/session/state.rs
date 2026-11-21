@@ -217,6 +217,83 @@ pub enum ParseMode {
     UsageOnly,
 }
 
+/// Compact snapshot of the eight analysis counters tracked per model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ModelAnalysisCounts {
+    edit_lines: usize,
+    read_lines: usize,
+    write_lines: usize,
+    bash_count: usize,
+    edit_count: usize,
+    read_count: usize,
+    todo_write_count: usize,
+    write_count: usize,
+}
+
+impl ModelAnalysisCounts {
+    #[inline]
+    fn is_empty(self) -> bool {
+        self.edit_lines == 0
+            && self.read_lines == 0
+            && self.write_lines == 0
+            && self.bash_count == 0
+            && self.edit_count == 0
+            && self.read_count == 0
+            && self.todo_write_count == 0
+            && self.write_count == 0
+    }
+
+    #[inline]
+    fn diff_since(self, before: Self) -> Self {
+        debug_assert!(self.edit_lines >= before.edit_lines);
+        debug_assert!(self.read_lines >= before.read_lines);
+        debug_assert!(self.write_lines >= before.write_lines);
+        debug_assert!(self.bash_count >= before.bash_count);
+        debug_assert!(self.edit_count >= before.edit_count);
+        debug_assert!(self.read_count >= before.read_count);
+        debug_assert!(self.todo_write_count >= before.todo_write_count);
+        debug_assert!(self.write_count >= before.write_count);
+        Self {
+            edit_lines: self.edit_lines.saturating_sub(before.edit_lines),
+            read_lines: self.read_lines.saturating_sub(before.read_lines),
+            write_lines: self.write_lines.saturating_sub(before.write_lines),
+            bash_count: self.bash_count.saturating_sub(before.bash_count),
+            edit_count: self.edit_count.saturating_sub(before.edit_count),
+            read_count: self.read_count.saturating_sub(before.read_count),
+            todo_write_count: self
+                .todo_write_count
+                .saturating_sub(before.todo_write_count),
+            write_count: self.write_count.saturating_sub(before.write_count),
+        }
+    }
+
+    #[inline]
+    fn add_assign(&mut self, other: Self) {
+        self.edit_lines += other.edit_lines;
+        self.read_lines += other.read_lines;
+        self.write_lines += other.write_lines;
+        self.bash_count += other.bash_count;
+        self.edit_count += other.edit_count;
+        self.read_count += other.read_count;
+        self.todo_write_count += other.todo_write_count;
+        self.write_count += other.write_count;
+    }
+
+    fn into_row(self, model: String) -> AggregatedAnalysisRow {
+        AggregatedAnalysisRow {
+            model,
+            edit_lines: self.edit_lines,
+            read_lines: self.read_lines,
+            write_lines: self.write_lines,
+            bash_count: self.bash_count,
+            edit_count: self.edit_count,
+            read_count: self.read_count,
+            todo_write_count: self.todo_write_count,
+            write_count: self.write_count,
+        }
+    }
+}
+
 /// Accumulator for a single session's file operations, tool counts, and metadata.
 ///
 /// Populate `folder_path`, `git_remote`, and `task_id` from provider metadata, record operations via the `add_*` methods, and call [`SessionParseState::into_record`] to build a [`CodeAnalysisRecord`].
@@ -255,6 +332,12 @@ pub struct SessionParseState {
     pub task_id: String,
     /// Latest event timestamp seen, in epoch milliseconds.
     pub last_ts: i64,
+    /// First non-synthetic model observed in the session, used to adopt operations recorded before a model id appeared.
+    first_seen_model: Option<String>,
+    /// Sole model owning all recorded counters while `per_model` remains unallocated.
+    single_model: Option<String>,
+    /// Per-model counters populated lazily only once a second distinct model records activity.
+    per_model: FastHashMap<String, ModelAnalysisCounts>,
 }
 
 impl SessionParseState {
@@ -312,7 +395,94 @@ impl SessionParseState {
             git_remote: String::new(),
             task_id: String::new(),
             last_ts: 0,
+            first_seen_model: None,
+            single_model: None,
+            per_model: FastHashMap::default(),
         }
+    }
+
+    #[inline]
+    fn metric_snapshot(&self) -> ModelAnalysisCounts {
+        ModelAnalysisCounts {
+            edit_lines: self.total_edit_lines,
+            read_lines: self.total_read_lines,
+            write_lines: self.total_write_lines,
+            bash_count: self.tool_counts.bash,
+            edit_count: self.tool_counts.edit,
+            read_count: self.tool_counts.read,
+            todo_write_count: self.tool_counts.todo_write,
+            write_count: self.tool_counts.write,
+        }
+    }
+
+    /// Notes a non-synthetic model observed in the session so operations seen before the first model id adopt it.
+    pub(crate) fn note_model(&mut self, model: &str) {
+        if self.first_seen_model.is_some() || model.is_empty() || model.contains("<synthetic>") {
+            return;
+        }
+        let owned = model.to_string();
+        if self.per_model.is_empty()
+            && self.single_model.is_none()
+            && !self.metric_snapshot().is_empty()
+        {
+            self.single_model = Some(owned.clone());
+        }
+        self.first_seen_model = Some(owned);
+    }
+
+    /// Runs `f` against `self` and attributes any resulting counter delta to `model` without allocating a per-model map on single-model sessions.
+    pub(crate) fn record_for_model<R>(
+        &mut self,
+        model: Option<&str>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let before = self.metric_snapshot();
+        let result = f(self);
+        let after = self.metric_snapshot();
+        let delta = after.diff_since(before);
+        if delta.is_empty() {
+            return result;
+        }
+
+        let target = model.filter(|m| !m.is_empty() && !m.contains("<synthetic>"));
+        if let Some(m) = target {
+            if self.first_seen_model.is_none() {
+                self.first_seen_model = Some(m.to_string());
+            }
+            if self.per_model.is_empty() {
+                match self.single_model.as_deref() {
+                    Some(existing) if existing == m => {}
+                    None => {
+                        self.single_model = Some(m.to_string());
+                    }
+                    Some(_) => {
+                        if let Some(existing) = self.single_model.take()
+                            && !before.is_empty()
+                        {
+                            self.per_model.insert(existing, before);
+                        }
+                        self.per_model.insert(m.to_string(), delta);
+                    }
+                }
+            } else if let Some(entry) = self.per_model.get_mut(m) {
+                entry.add_assign(delta);
+            } else {
+                self.per_model.insert(m.to_string(), delta);
+            }
+        } else if self.per_model.is_empty() {
+            if self.single_model.is_none()
+                && let Some(first) = &self.first_seen_model
+            {
+                self.single_model = Some(first.clone());
+            }
+        } else if let Some(first) = self.first_seen_model.as_deref() {
+            if let Some(entry) = self.per_model.get_mut(first) {
+                entry.add_assign(delta);
+            } else {
+                self.per_model.insert(first.to_string(), delta);
+            }
+        }
+        result
     }
 
     /// Records a `Read` operation for `path` with `content` at epoch-millisecond timestamp `ts`.
@@ -564,6 +734,9 @@ impl SessionParseState {
         self.git_remote.clear();
         self.task_id.clear();
         self.last_ts = 0;
+        self.first_seen_model = None;
+        self.single_model = None;
+        self.per_model.clear();
     }
 
     /// Combines `other` into `self`, summing counts and totals, taking the maximum `last_ts`, and filling empty metadata fields from `other`.
@@ -606,6 +779,40 @@ impl SessionParseState {
 
     /// Consumes this state and returns a [`CodeAnalysisRecord`] carrying `conversation_usage`.
     pub fn into_record(self, conversation_usage: FastHashMap<String, Value>) -> CodeAnalysisRecord {
+        let totals = self.metric_snapshot();
+        let mut per_model_analysis = FastHashMap::default();
+        if !self.per_model.is_empty() {
+            per_model_analysis.reserve(self.per_model.len());
+            for (model, counts) in self.per_model {
+                if !counts.is_empty() && !model.contains("<synthetic>") {
+                    per_model_analysis.insert(model.clone(), counts.into_row(model));
+                }
+            }
+        } else if !totals.is_empty() {
+            let mut non_synth_count = 0usize;
+            let mut smallest_non_synth: Option<&str> = None;
+            for key in conversation_usage.keys() {
+                if !key.contains("<synthetic>") {
+                    non_synth_count += 1;
+                    if smallest_non_synth.is_none_or(|best| key.as_str() < best) {
+                        smallest_non_synth = Some(key.as_str());
+                    }
+                }
+            }
+            if let Some(owner) = self.single_model.or(self.first_seen_model) {
+                let single_matching_conv =
+                    non_synth_count == 1 && smallest_non_synth == Some(owner.as_str());
+                if !single_matching_conv && !owner.contains("<synthetic>") {
+                    per_model_analysis.insert(owner.clone(), totals.into_row(owner));
+                }
+            } else if non_synth_count > 1
+                && let Some(fallback) = smallest_non_synth
+            {
+                let model = fallback.to_string();
+                per_model_analysis.insert(model.clone(), totals.into_row(model));
+            }
+        }
+
         CodeAnalysisRecord {
             total_unique_files: self.unique_files.len(),
             total_write_lines: self.total_write_lines,
@@ -621,6 +828,7 @@ impl SessionParseState {
             tool_call_counts: self.tool_counts,
             conversation_usage,
             advisor_usage: FastHashMap::default(),
+            per_model_analysis,
             task_id: self.task_id,
             timestamp: self.last_ts,
             folder_path: self.folder_path,
@@ -1062,5 +1270,106 @@ mod tests {
                 "mismatch for chunks {chunks:?}"
             );
         }
+    }
+
+    #[test]
+    fn single_model_session_keeps_per_model_map_unallocated() {
+        let mut state = SessionParseState::new();
+        state.note_model("model-a");
+        state.record_for_model(Some("model-a"), |s| {
+            s.add_read_detail("/repo/a.rs", "one\ntwo", 1);
+            s.add_run_command("cargo test", "", 2);
+        });
+        assert!(state.per_model.is_empty());
+
+        let mut usage = FastHashMap::default();
+        usage.insert(
+            "model-a".to_string(),
+            serde_json::json!({"input_tokens": 10}),
+        );
+        let record = state.into_record(usage);
+        assert!(record.per_model_analysis.is_empty());
+        assert_eq!(record.total_read_lines, 2);
+        assert_eq!(record.tool_call_counts.bash, 1);
+    }
+
+    #[test]
+    fn multi_model_session_splits_counts_and_adopts_pre_model_operations() {
+        let mut state = SessionParseState::new();
+        // Tool call before any model id is seen must be adopted by the first real model.
+        state.record_for_model(None, |s| {
+            s.add_read_detail("/repo/pre.rs", "pre1\npre2", 1);
+        });
+        state.note_model("<synthetic>");
+        state.note_model("model-a");
+        state.record_for_model(Some("model-a"), |s| {
+            s.add_run_command("git status", "", 2);
+        });
+        state.record_for_model(Some("model-b"), |s| {
+            s.add_edit_detail("/repo/b.rs", "old", "new1\nnew2\nnew3", 3);
+            s.add_write_detail("/repo/c.rs", "w1\nw2", 4);
+        });
+
+        let mut usage = FastHashMap::default();
+        usage.insert(
+            "model-a".to_string(),
+            serde_json::json!({"input_tokens": 10}),
+        );
+        usage.insert(
+            "model-b".to_string(),
+            serde_json::json!({"input_tokens": 20}),
+        );
+        usage.insert(
+            "model-c".to_string(),
+            serde_json::json!({"input_tokens": 30}),
+        );
+        let record = state.into_record(usage);
+
+        assert_eq!(record.per_model_analysis.len(), 2);
+        let a = &record.per_model_analysis["model-a"];
+        assert_eq!(a.read_count, 1);
+        assert_eq!(a.read_lines, 2);
+        assert_eq!(a.bash_count, 1);
+        assert_eq!(a.edit_count, 0);
+        assert_eq!(a.write_count, 0);
+
+        let b = &record.per_model_analysis["model-b"];
+        assert_eq!(b.edit_count, 1);
+        assert_eq!(b.edit_lines, 3);
+        assert_eq!(b.write_count, 1);
+        assert_eq!(b.write_lines, 2);
+        assert_eq!(b.read_count, 0);
+        assert_eq!(b.bash_count, 0);
+
+        assert!(!record.per_model_analysis.contains_key("model-c"));
+        assert_eq!(a.read_lines + b.read_lines, record.total_read_lines);
+        assert_eq!(a.edit_lines + b.edit_lines, record.total_edit_lines);
+        assert_eq!(a.write_lines + b.write_lines, record.total_write_lines);
+    }
+
+    #[test]
+    fn multi_model_usage_with_single_tool_model_does_not_credit_idle_model() {
+        let mut state = SessionParseState::new();
+        state.note_model("idle-model");
+        state.record_for_model(Some("active-model"), |s| {
+            s.add_write_detail("/repo/x.rs", "line1\nline2", 1);
+        });
+
+        let mut usage = FastHashMap::default();
+        usage.insert(
+            "idle-model".to_string(),
+            serde_json::json!({"input_tokens": 100}),
+        );
+        usage.insert(
+            "active-model".to_string(),
+            serde_json::json!({"input_tokens": 50}),
+        );
+        let record = state.into_record(usage);
+
+        assert_eq!(record.per_model_analysis.len(), 1);
+        let active = &record.per_model_analysis["active-model"];
+        assert_eq!(active.write_count, 1);
+        assert_eq!(active.write_lines, 2);
+        assert!(!record.per_model_analysis.contains_key("idle-model"));
     }
 }

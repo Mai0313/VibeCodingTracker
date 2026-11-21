@@ -961,12 +961,27 @@ fn local_date_from_millis(timestamp: i64) -> Option<String> {
     })
 }
 
-/// Folds one session's line and tool-call counts into `aggregated` for each non-`<synthetic>` model in `conversation_usage`.
+/// Folds one session's line and tool-call counts into `aggregated`, preferring `per_model_analysis` when populated and falling back to each non-`<synthetic>` model in `conversation_usage`.
 fn aggregate_analysis_result(
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     analysis: &CodeAnalysis,
 ) {
     for record in &analysis.records {
+        if !record.per_model_analysis.is_empty() {
+            for (model, row) in &record.per_model_analysis {
+                if model.contains("<synthetic>") {
+                    continue;
+                }
+                let entry = match aggregated.get_mut(model) {
+                    Some(entry) => entry,
+                    None => aggregated
+                        .entry(model.clone())
+                        .or_insert_with(|| AggregatedAnalysisRow::empty(model)),
+                };
+                entry.add_assign(row);
+            }
+            continue;
+        }
         for model in record.conversation_usage.keys() {
             if model.contains("<synthetic>") {
                 continue;
@@ -976,17 +991,7 @@ fn aggregate_analysis_result(
                 Some(entry) => entry,
                 None => aggregated
                     .entry(model.clone())
-                    .or_insert_with(|| AggregatedAnalysisRow {
-                        model: model.clone(),
-                        edit_lines: 0,
-                        read_lines: 0,
-                        write_lines: 0,
-                        bash_count: 0,
-                        edit_count: 0,
-                        read_count: 0,
-                        todo_write_count: 0,
-                        write_count: 0,
-                    }),
+                    .or_insert_with(|| AggregatedAnalysisRow::empty(model)),
             };
 
             entry.edit_lines += record.total_edit_lines;
@@ -1038,6 +1043,7 @@ mod tests {
             },
             conversation_usage,
             advisor_usage,
+            per_model_analysis: FastHashMap::default(),
             task_id: String::new(),
             timestamp: 0,
             folder_path: String::new(),
