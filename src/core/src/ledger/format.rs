@@ -13,7 +13,6 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::fmt;
 
 /// Schema version of the on-disk ledger format; files with a newer version are left untouched.
@@ -27,8 +26,17 @@ pub(crate) struct LedgerFile {
     /// Whole-database read stamps for single-SQLite providers (OpenCode, Hermes); absent for other providers.
     #[serde(default, skip_serializing_if = "HalfStamps::is_empty")]
     pub(crate) source: HalfStamps,
-    #[serde(default)]
-    pub(crate) sessions: BTreeMap<String, SessionEntry>,
+    #[serde(default, serialize_with = "serialize_sessions_sorted")]
+    pub(crate) sessions: FastHashMap<String, SessionEntry>,
+}
+
+fn serialize_sessions_sorted<S: Serializer>(
+    sessions: &FastHashMap<String, SessionEntry>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut entries: Vec<(&String, &SessionEntry)> = sessions.iter().collect();
+    entries.sort_unstable_by_key(|(left, _)| *left);
+    serializer.collect_map(entries)
 }
 
 /// Minimal header decoded to inspect `schema_version` when full deserialization fails.
@@ -1487,10 +1495,7 @@ mod tests {
             "the moved day must not keep the old total"
         );
         assert!(old.active.analysis, "the other half stays");
-        assert_eq!(
-            entry.days["2026-09-02"].usage["model"].input_tokens,
-            3_000
-        );
+        assert_eq!(entry.days["2026-09-02"].usage["model"].input_tokens, 3_000);
     }
 
     #[test]
@@ -1567,7 +1572,10 @@ mod tests {
 
             let compact_json = serde_json::to_string(&decoded).unwrap();
             let reparsed: CompactUsage = serde_json::from_str(&compact_json).unwrap();
-            assert_eq!(reparsed, expected, "compact round-trip mismatch for {sample}");
+            assert_eq!(
+                reparsed, expected,
+                "compact round-trip mismatch for {sample}"
+            );
 
             // Older v1 builds parse the serialized JSON via `extract_token_counts` and `merge_usage_values`.
             let v1_value: Value = serde_json::from_str(&compact_json).unwrap();

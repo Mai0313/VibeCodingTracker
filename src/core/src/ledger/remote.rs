@@ -62,7 +62,7 @@ pub(crate) struct RemoteSnapshot {
 struct RemoteBook {
     /// Modification time and length of the snapshot file last read, or `None` if absent.
     stamp: Option<(SystemTime, u64)>,
-    sessions: BTreeMap<String, SessionEntry>,
+    sessions: FastHashMap<String, SessionEntry>,
 }
 
 impl SessionLedger {
@@ -209,9 +209,9 @@ fn export_key(key: &str) -> String {
     format!("{hash:032x}")
 }
 
-fn read_snapshot(path: &Path) -> BTreeMap<String, SessionEntry> {
+fn read_snapshot(path: &Path) -> FastHashMap<String, SessionEntry> {
     let Ok(body) = std::fs::read(path) else {
-        return BTreeMap::new();
+        return FastHashMap::default();
     };
     match serde_json::from_slice::<LedgerFile>(&body) {
         Ok(file) if file.schema_version == SCHEMA_VERSION => file.sessions,
@@ -221,11 +221,11 @@ fn read_snapshot(path: &Path) -> BTreeMap<String, SessionEntry> {
                 path.display(),
                 file.schema_version
             );
-            BTreeMap::new()
+            FastHashMap::default()
         }
         Err(error) => {
             log::warn!("remote snapshot {} is unreadable: {error}", path.display());
-            BTreeMap::new()
+            FastHashMap::default()
         }
     }
 }

@@ -20,7 +20,6 @@ pub(crate) use format::{
 };
 use format::{LedgerFile, LedgerHeader, SCHEMA_VERSION};
 pub use remote::{EXPORT_LINE_PREFIX, REMOTES_DIR_NAME, prune_remotes, remote_dir, store_export};
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -143,47 +142,40 @@ impl SessionLedger {
         let Some(dir) = &self.dir else {
             return Ok(());
         };
+        let dirty: Vec<(ExtensionType, &mut ProviderLedger)> = self
+            .providers
+            .iter_mut()
+            .filter(|(_, book)| book.dirty && !book.read_only)
+            .map(|(provider, book)| (*provider, book))
+            .collect();
         let mut first_error = None;
-        for (provider, book) in &mut self.providers {
-            if !book.dirty || book.read_only {
-                continue;
+        if dirty.len() <= 1 {
+            if let Some((provider, book)) = dirty.into_iter().next()
+                && let Err(error) = save_provider_book(dir, provider, book)
+            {
+                first_error = Some(error);
             }
-            let path = provider_path(dir, *provider);
-            let unchanged = book.disk_state != DiskState::Unknown
-                && current_disk_state(&path) == Some(book.disk_state);
-            if !unchanged {
-                match adopt_unseen_sessions(&path, &mut book.sessions) {
-                    Adoption::Writable => {}
-                    Adoption::Skip => continue,
-                    Adoption::Freeze => {
-                        book.read_only = true;
-                        continue;
-                    }
-                }
-            }
-            let file = LedgerFile {
-                schema_version: SCHEMA_VERSION,
-                provider: provider_file_stem(*provider).to_string(),
-                source: book.source.clone(),
-                sessions: std::mem::take(&mut book.sessions),
-            };
-            let written = write_json_atomic_metadata(&path, &file);
-            book.sessions = file.sessions;
-            match written {
-                Ok(metadata) => {
-                    book.dirty = false;
-                    book.disk_state = metadata.as_ref().map_or(DiskState::Unknown, |meta| {
-                        DiskState::Present(DiskFileStamp::from_metadata(meta))
-                    });
-                }
-                Err(error) => {
-                    log::warn!(
-                        "failed to write the {} session ledger: {error:#}",
-                        file.provider
-                    );
+        } else {
+            std::thread::scope(|scope| {
+                let mut iter = dirty.into_iter();
+                let first = iter.next();
+                let handles: Vec<_> = iter
+                    .map(|(provider, book)| {
+                        scope.spawn(move || save_provider_book(dir, provider, book))
+                    })
+                    .collect();
+                if let Some((provider, book)) = first
+                    && let Err(error) = save_provider_book(dir, provider, book)
+                {
                     first_error.get_or_insert(error);
                 }
-            }
+                for handle in handles {
+                    let result = handle.join().expect("ledger saver thread panicked");
+                    if let Err(error) = result {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            });
         }
         self.last_saved = Some(Instant::now());
         first_error.map_or(Ok(()), Err)
@@ -260,10 +252,54 @@ impl SessionLedger {
 #[derive(Default)]
 pub(crate) struct ProviderLedger {
     pub(crate) source: HalfStamps,
-    pub(crate) sessions: BTreeMap<String, SessionEntry>,
+    pub(crate) sessions: FastHashMap<String, SessionEntry>,
     pub(crate) dirty: bool,
     read_only: bool,
     disk_state: DiskState,
+}
+
+fn save_provider_book(
+    dir: &Path,
+    provider: ExtensionType,
+    book: &mut ProviderLedger,
+) -> Result<()> {
+    let path = provider_path(dir, provider);
+    let unchanged =
+        book.disk_state != DiskState::Unknown && current_disk_state(&path) == Some(book.disk_state);
+    if !unchanged {
+        match adopt_unseen_sessions(&path, &mut book.sessions) {
+            Adoption::Writable => {}
+            Adoption::Skip => return Ok(()),
+            Adoption::Freeze => {
+                book.read_only = true;
+                return Ok(());
+            }
+        }
+    }
+    let file = LedgerFile {
+        schema_version: SCHEMA_VERSION,
+        provider: provider_file_stem(provider).to_string(),
+        source: book.source.clone(),
+        sessions: std::mem::take(&mut book.sessions),
+    };
+    let written = write_json_atomic_metadata(&path, &file);
+    book.sessions = file.sessions;
+    match written {
+        Ok(metadata) => {
+            book.dirty = false;
+            book.disk_state = metadata.as_ref().map_or(DiskState::Unknown, |meta| {
+                DiskState::Present(DiskFileStamp::from_metadata(meta))
+            });
+            Ok(())
+        }
+        Err(error) => {
+            log::warn!(
+                "failed to write the {} session ledger: {error:#}",
+                file.provider
+            );
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -399,7 +435,10 @@ enum Adoption {
 /// Merges non-empty sessions present on disk at `path` but absent from `sessions`, keeping in-memory entries on conflict.
 ///
 /// Empty disk entries are ignored so settled blank/failed sessions are not resurrected.
-fn adopt_unseen_sessions(path: &Path, sessions: &mut BTreeMap<String, SessionEntry>) -> Adoption {
+fn adopt_unseen_sessions(
+    path: &Path,
+    sessions: &mut FastHashMap<String, SessionEntry>,
+) -> Adoption {
     let body = match std::fs::read(path) {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Adoption::Writable,
@@ -767,5 +806,41 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw.lines().count(), 1);
         assert_eq!(SessionLedger::open(dir.path()).stats().entries, 1);
+    }
+
+    #[test]
+    fn parallel_save_persists_multiple_dirty_providers_with_sorted_session_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = SessionLedger::open(dir.path());
+        for (provider, keys) in [
+            (
+                ExtensionType::ClaudeCode,
+                &["z.jsonl", "a.jsonl", "m.jsonl"][..],
+            ),
+            (ExtensionType::Codex, &["b.jsonl", "a.jsonl"][..]),
+            (ExtensionType::Gemini, &["c.jsonl"][..]),
+        ] {
+            let mut book = ledger.take_provider(provider);
+            for key in keys {
+                book.sessions
+                    .insert((*key).to_string(), entry_with_day("2026-09-08"));
+            }
+            book.dirty = true;
+            ledger.put_provider(provider, book);
+        }
+
+        ledger.save().unwrap();
+
+        let reopened = SessionLedger::open(dir.path());
+        assert_eq!(reopened.stats().entries, 6);
+        let claude_raw = std::fs::read_to_string(provider_path(
+            &dir.path().join(LEDGER_DIR_NAME),
+            ExtensionType::ClaudeCode,
+        ))
+        .unwrap();
+        let a_pos = claude_raw.find("\"a.jsonl\"").unwrap();
+        let m_pos = claude_raw.find("\"m.jsonl\"").unwrap();
+        let z_pos = claude_raw.find("\"z.jsonl\"").unwrap();
+        assert!(a_pos < m_pos && m_pos < z_pos, "keys must serialize sorted");
     }
 }
