@@ -11,8 +11,8 @@ mod text;
 pub use averages::*;
 pub use interactive::UsageFrameBenchmark;
 pub(crate) use interactive::{
-    QuotaRuntime, QuotaSnapshots, QuotaView, UsageRefreshPayload, UsageScanner, UsageSort,
-    UsageTableColumns, UsageUiState, build_usage_detail_sections, build_usage_table_row,
+    QuotaRuntime, QuotaSnapshots, QuotaView, UsageRefreshPayload, UsageScanOutcome, UsageScanner,
+    UsageSort, UsageTableColumns, UsageUiState, build_usage_detail_sections, build_usage_table_row,
     layout_usage_columns, provider_digest, provider_share_bar, render_provider_pane,
     render_provider_panel,
 };

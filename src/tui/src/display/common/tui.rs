@@ -26,11 +26,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, ScrollbarState, TableState},
 };
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Tracks whether the alternate-screen TUI currently owns the terminal for [`force_restore_terminal`].
 static IN_TUI: AtomicBool = AtomicBool::new(false);
@@ -216,6 +217,36 @@ impl std::fmt::Display for RefreshWorkerError {
 
 /// Minimum interval between disk writes of a refresh worker's session ledger.
 pub const LEDGER_SAVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Returns sorted `(path, mtime, len)` stamps for every remote provider snapshot under `<cache_dir>/remotes/`.
+///
+/// Fast-paths to an empty vector with a single directory check when no remote snapshots directory exists.
+pub(crate) fn remote_snapshot_stamps(cache_dir: &Path) -> Vec<(PathBuf, Option<SystemTime>, u64)> {
+    let remotes_root = cache_dir.join(vct_core::ledger::REMOTES_DIR_NAME);
+    let Ok(hosts) = std::fs::read_dir(&remotes_root) else {
+        return Vec::new();
+    };
+    let mut stamps = Vec::new();
+    for host in hosts.flatten() {
+        let sessions_dir = host.path().join(vct_core::ledger::LEDGER_DIR_NAME);
+        let Ok(files) = std::fs::read_dir(&sessions_dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(&path)
+                && meta.is_file()
+            {
+                stamps.push((path, meta.modified().ok(), meta.len()));
+            }
+        }
+    }
+    stamps.sort_by(|a, b| a.0.cmp(&b.0));
+    stamps
+}
 
 /// Single background loader with one active and one coalesced pending refresh.
 pub struct RefreshWorker<T> {

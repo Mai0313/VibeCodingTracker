@@ -370,14 +370,13 @@ fn open_app(start: Tab, period: [bool; 4], merge_providers: bool) -> Result<()> 
         all,
         config.general.default_time_range,
     );
-    let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
     prune_remotes(&config.remotes)?;
     run_app(AppOptions {
         start,
         time_range,
         merge: merge_providers || config.usage.merge_models,
         config,
-        scan_pool,
+        scan_pool: None,
     })
 }
 

@@ -8,7 +8,9 @@ use crate::display::common::table::{
     render_scrollable_table, render_too_small,
 };
 use crate::display::common::theme::theme;
-use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
+use crate::display::common::tui::{
+    LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker, remote_snapshot_stamps,
+};
 use crate::display::common::{ProviderTotal, provider_tui_color};
 use crate::display::usage::averages::{
     ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
@@ -663,11 +665,33 @@ impl UsageUiState {
     }
 }
 
+/// Result of one [`UsageScanner::scan`] run.
+pub(crate) enum UsageScanOutcome {
+    /// New or changed priced usage data to apply to the UI.
+    Updated(UsageRefreshPayload),
+    /// Zero sources changed and every input affecting the priced summary matched the prior emission.
+    Unchanged,
+}
+
+#[derive(PartialEq)]
+struct UsageSnapshotKey {
+    time_range: vct_core::models::TimeRange,
+    providers: ProvidersConfig,
+    pricing_date: Option<chrono::NaiveDate>,
+    local_date: chrono::NaiveDate,
+    remote_stamps: Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>,
+    total_parsed_sources: usize,
+    ledger_entries: usize,
+    retained: usize,
+    failure_count: usize,
+}
+
 /// Stateful usage scanner that caches one pricing map per UTC day across refreshes.
 pub(crate) struct UsageScanner {
     pricing: ModelPricingMap,
     scan_options: vct_core::usage::UsageScanOptions,
     loaded_pricing_utc_date: Option<chrono::NaiveDate>,
+    last_emitted: Option<UsageSnapshotKey>,
 }
 
 impl UsageScanner {
@@ -676,10 +700,11 @@ impl UsageScanner {
             pricing: ModelPricingMap::new(HashMap::new()),
             scan_options: vct_core::usage::UsageScanOptions::default(),
             loaded_pricing_utc_date: None,
+            last_emitted: None,
         }
     }
 
-    /// Scans `paths` for `time_range` and prices the result.
+    /// Scans `paths` for `time_range` and prices the result, returning [`UsageScanOutcome::Unchanged`] when nothing affecting the displayed summary changed since the previous emission.
     ///
     /// # Errors
     ///
@@ -691,7 +716,7 @@ impl UsageScanner {
         providers: ProvidersConfig,
         ledger: &mut SessionLedger,
         pool: &rayon::ThreadPool,
-    ) -> anyhow::Result<UsageRefreshPayload> {
+    ) -> anyhow::Result<UsageScanOutcome> {
         let today = chrono::Utc::now().date_naive();
         if self.loaded_pricing_utc_date != Some(today) {
             match fetch_model_pricing() {
@@ -707,7 +732,9 @@ impl UsageScanner {
             }
         }
 
-        let collection = pool.install(|| {
+        let local_date = chrono::Local::now().date_naive();
+        let remote_before = remote_snapshot_stamps(&paths.cache_dir);
+        let collection = match pool.install(|| {
             vct_core::usage::aggregate_usage_from_paths_with_cache_opts(
                 paths,
                 time_range,
@@ -715,12 +742,19 @@ impl UsageScanner {
                 ledger,
                 &self.scan_options,
             )
-        })?;
+        }) {
+            Ok(collection) => collection,
+            Err(error) => {
+                self.last_emitted = None;
+                return Err(error);
+            }
+        };
         // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every refresh.
         if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
             log::warn!("failed to save the session ledger: {error:#}");
         }
         if collection.diagnostics.all_failed() {
+            self.last_emitted = None;
             let first = collection
                 .diagnostics
                 .failures
@@ -739,6 +773,26 @@ impl UsageScanner {
             );
         }
 
+        let stats = ledger.stats();
+        let remote_after = remote_snapshot_stamps(&paths.cache_dir);
+        let key = UsageSnapshotKey {
+            time_range,
+            providers,
+            pricing_date: self.loaded_pricing_utc_date,
+            local_date,
+            remote_stamps: remote_after,
+            total_parsed_sources: stats.total_parsed_sources,
+            ledger_entries: stats.entries,
+            retained: stats.retained,
+            failure_count: collection.diagnostics.failures.len(),
+        };
+        if stats.parsed_sources == 0
+            && remote_before == key.remote_stamps
+            && self.last_emitted.as_ref() == Some(&key)
+        {
+            return Ok(UsageScanOutcome::Unchanged);
+        }
+
         let mut summary = build_usage_summary(
             &collection.data.models,
             &collection.data.per_provider,
@@ -748,12 +802,13 @@ impl UsageScanner {
         );
         summary.rows.retain(|row| row.total != 0 || row.cost != 0.0);
         let merged_rows = merge_rows_by_base_model(&summary.rows);
-        Ok(UsageRefreshPayload {
+        self.last_emitted = Some(key);
+        Ok(UsageScanOutcome::Updated(UsageRefreshPayload {
             rows: summary.rows,
             merged_rows,
             totals: summary.totals,
             provider_totals: summary.provider_totals,
-        })
+        }))
     }
 }
 
@@ -3748,5 +3803,79 @@ mod tests {
         assert!(details.contains("claude-sonnet-4-6"), "got:\n{details}");
         assert!(details.contains("Merged from"), "got:\n{details}");
         assert!(details.contains("Cache hit rate"), "got:\n{details}");
+    }
+
+    #[test]
+    fn usage_scanner_short_circuits_unchanged_refreshes_and_invalidates_on_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vct_core::utils::resolve_paths_from_home(dir.path());
+        let project = paths.claude_session_dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = project.join("session.jsonl");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/sessions/claude_code.jsonl");
+        std::fs::copy(fixture, &session).unwrap();
+
+        let pool = vct_core::scan::build_scan_pool(1).unwrap();
+        let mut ledger = SessionLedger::new();
+        let mut scanner = UsageScanner::new();
+        // Pre-stamp today's pricing date so the test stays hermetic without touching network or ~/.vct.
+        scanner.loaded_pricing_utc_date = Some(chrono::Utc::now().date_naive());
+        let providers = ProvidersConfig::default();
+
+        let first = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(first, UsageScanOutcome::Updated(_)));
+
+        let second = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(
+            matches!(second, UsageScanOutcome::Unchanged),
+            "identical refresh with zero changed sources must short-circuit"
+        );
+
+        let range_changed = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::Daily,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(range_changed, UsageScanOutcome::Updated(_)));
+
+        // Adding a remote snapshot file invalidates the short-circuit even with zero local parses.
+        let remote_sessions = paths
+            .cache_dir
+            .join(vct_core::ledger::REMOTES_DIR_NAME)
+            .join("host-a")
+            .join(vct_core::ledger::LEDGER_DIR_NAME);
+        std::fs::create_dir_all(&remote_sessions).unwrap();
+        std::fs::write(remote_sessions.join("claude.json"), "{}").unwrap();
+        let remote_changed = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::Daily,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(remote_changed, UsageScanOutcome::Updated(_)));
     }
 }

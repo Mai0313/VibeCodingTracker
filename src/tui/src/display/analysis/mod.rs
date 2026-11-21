@@ -9,8 +9,8 @@ mod text;
 
 pub use averages::*;
 pub(crate) use interactive::{
-    AnalysisSort, AnalysisTableColumns, AnalysisUiState, build_analysis_detail_sections,
-    build_analysis_table_row, layout_analysis_columns, scan_analysis,
+    AnalysisScanOutcome, AnalysisScanner, AnalysisSort, AnalysisTableColumns, AnalysisUiState,
+    build_analysis_detail_sections, build_analysis_table_row, layout_analysis_columns,
 };
 pub use table::display_analysis_table;
 pub use text::display_analysis_text;

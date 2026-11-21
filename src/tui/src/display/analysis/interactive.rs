@@ -6,7 +6,9 @@ use crate::display::common::table::{
     ColumnSpec, DetailItem, DetailSection, fit_columns, styled_row,
 };
 use crate::display::common::theme::theme;
-use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
+use crate::display::common::tui::{
+    LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker, remote_snapshot_stamps,
+};
 use ratatui::{layout::Constraint, style::Style, widgets::Row as RatatuiRow};
 use vct_core::analysis::AnalysisData;
 use vct_core::config::ProvidersConfig;
@@ -239,46 +241,109 @@ impl AnalysisUiState {
     }
 }
 
-/// Runs one analysis scan of `paths` for `time_range` on `pool` using `ledger`.
-///
-/// # Errors
-///
-/// Returns an error if the scan fails or every candidate source failed to parse; partial failures are logged and kept.
-pub(crate) fn scan_analysis(
-    paths: &vct_core::utils::HelperPaths,
+/// Result of one [`AnalysisScanner::scan`] run.
+pub(crate) enum AnalysisScanOutcome {
+    /// New or changed analysis data to apply to the UI.
+    Updated(AnalysisData),
+    /// Zero sources changed and every input affecting the analysis summary matched the prior emission.
+    Unchanged,
+}
+
+#[derive(PartialEq)]
+struct AnalysisSnapshotKey {
     time_range: vct_core::models::TimeRange,
     providers: ProvidersConfig,
-    ledger: &mut SessionLedger,
-    pool: &rayon::ThreadPool,
-) -> anyhow::Result<AnalysisData> {
-    let aggregation = pool.install(|| {
-        vct_core::analysis::aggregate_sessions_by_model_from_paths_with_cache(
-            paths, time_range, providers, ledger,
-        )
-    })?;
-    // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every tick.
-    if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
-        log::warn!("failed to save the session ledger: {error:#}");
+    local_date: chrono::NaiveDate,
+    remote_stamps: Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>,
+    total_parsed_sources: usize,
+    ledger_entries: usize,
+    retained: usize,
+    failure_count: usize,
+}
+
+/// Stateful analysis scanner that short-circuits unchanged background refreshes.
+#[derive(Default)]
+pub(crate) struct AnalysisScanner {
+    last_emitted: Option<AnalysisSnapshotKey>,
+}
+
+impl AnalysisScanner {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
-    if aggregation.diagnostics.all_failed() {
-        let first = aggregation
-            .diagnostics
-            .failures
-            .first()
-            .map(|failure| failure.error.as_str())
-            .unwrap_or("unknown source failure");
-        anyhow::bail!(
-            "failed to parse all {} analysis sources: {first}",
-            aggregation.diagnostics.candidates
-        );
+
+    /// Runs one analysis scan of `paths` for `time_range` on `pool` using `ledger`, returning [`AnalysisScanOutcome::Unchanged`] when nothing affecting the summary changed since the previous emission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or every candidate source failed to parse; partial failures are logged and kept.
+    pub(crate) fn scan(
+        &mut self,
+        paths: &vct_core::utils::HelperPaths,
+        time_range: vct_core::models::TimeRange,
+        providers: ProvidersConfig,
+        ledger: &mut SessionLedger,
+        pool: &rayon::ThreadPool,
+    ) -> anyhow::Result<AnalysisScanOutcome> {
+        let local_date = chrono::Local::now().date_naive();
+        let remote_before = remote_snapshot_stamps(&paths.cache_dir);
+        let aggregation = match pool.install(|| {
+            vct_core::analysis::aggregate_sessions_by_model_from_paths_with_cache(
+                paths, time_range, providers, ledger,
+            )
+        }) {
+            Ok(aggregation) => aggregation,
+            Err(error) => {
+                self.last_emitted = None;
+                return Err(error);
+            }
+        };
+        // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every tick.
+        if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
+            log::warn!("failed to save the session ledger: {error:#}");
+        }
+        if aggregation.diagnostics.all_failed() {
+            self.last_emitted = None;
+            let first = aggregation
+                .diagnostics
+                .failures
+                .first()
+                .map(|failure| failure.error.as_str())
+                .unwrap_or("unknown source failure");
+            anyhow::bail!(
+                "failed to parse all {} analysis sources: {first}",
+                aggregation.diagnostics.candidates
+            );
+        }
+        if aggregation.diagnostics.partially_failed() {
+            log::warn!(
+                "analysis refresh kept partial data after {} source failures",
+                aggregation.diagnostics.failures.len()
+            );
+        }
+
+        let stats = ledger.stats();
+        let remote_after = remote_snapshot_stamps(&paths.cache_dir);
+        let key = AnalysisSnapshotKey {
+            time_range,
+            providers,
+            local_date,
+            remote_stamps: remote_after,
+            total_parsed_sources: stats.total_parsed_sources,
+            ledger_entries: stats.entries,
+            retained: stats.retained,
+            failure_count: aggregation.diagnostics.failures.len(),
+        };
+        if stats.parsed_sources == 0
+            && remote_before == key.remote_stamps
+            && self.last_emitted.as_ref() == Some(&key)
+        {
+            return Ok(AnalysisScanOutcome::Unchanged);
+        }
+
+        self.last_emitted = Some(key);
+        Ok(AnalysisScanOutcome::Updated(aggregation.data))
     }
-    if aggregation.diagnostics.partially_failed() {
-        log::warn!(
-            "analysis refresh kept partial data after {} source failures",
-            aggregation.diagnostics.failures.len()
-        );
-    }
-    Ok(aggregation.data)
 }
 
 const ANALYSIS_NUMERIC_COLS: [ColumnSpec; 8] = [
@@ -611,5 +676,60 @@ mod tests {
         assert!(screen.contains("1,700 (50.0%)"), "got:\n{screen}");
         assert!(screen.contains("File Operations"), "got:\n{screen}");
         assert!(screen.contains("~12/op"), "got:\n{screen}");
+    }
+
+    #[test]
+    fn analysis_scanner_short_circuits_unchanged_refreshes_and_invalidates_on_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vct_core::utils::resolve_paths_from_home(dir.path());
+        let project = paths.claude_session_dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = project.join("session.jsonl");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/sessions/claude_code.jsonl");
+        std::fs::copy(fixture, &session).unwrap();
+
+        let pool = vct_core::scan::build_scan_pool(1).unwrap();
+        let mut ledger = SessionLedger::new();
+        let mut scanner = AnalysisScanner::new();
+        let providers = ProvidersConfig::default();
+
+        let first = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(first, AnalysisScanOutcome::Updated(_)));
+
+        let second = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(
+            matches!(second, AnalysisScanOutcome::Unchanged),
+            "identical refresh with zero changed sources must short-circuit"
+        );
+
+        let mut toggled = providers;
+        toggled.claude = false;
+        let providers_changed = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                toggled,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(providers_changed, AnalysisScanOutcome::Updated(_)));
     }
 }
