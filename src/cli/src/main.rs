@@ -14,8 +14,11 @@ use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use serde::Serialize;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
+
+/// Capacity for buffered CLI stdout writers (pretty JSON and ledger export).
+const STDOUT_BUFFER_BYTES: usize = 128 * 1024;
 
 // Opt-in only: mimalloc's lazy page purge retains roughly 10× the RSS of the system allocator across repeated TUI scan loops.
 #[cfg(feature = "mimalloc")]
@@ -26,7 +29,7 @@ use vct_core::scan::build_scan_pool;
 use vct_core::session::{ParseMode, parse_session_file_with_diagnostics};
 use vct_core::usage::scan_usage_priced;
 use vct_tui::display::app::{AppOptions, Tab, run_app};
-use vct_tui::display::usage::{display_usage_table, display_usage_text};
+use vct_tui::display::usage::{display_usage_table_with_pricing, display_usage_text_with_pricing};
 
 /// Runs process-wide setup before argument parsing, short-circuits bare `--version`/`-V`, and dispatches via [`run`].
 fn main() -> Result<()> {
@@ -192,8 +195,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
             prepare_remotes(&config.remotes)?;
 
+            let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
             if json {
-                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
                 if let Some(error) = &scan.pricing_error {
                     eprintln!(
                         "Warning: Failed to fetch pricing data: {error}. Costs will be unavailable."
@@ -204,13 +207,16 @@ fn dispatch(cli: Cli) -> Result<()> {
                     vct_core::usage::price_usage_data(&scan.collection.data, &scan.pricing);
                 write_pretty_json(&priced)?;
             } else if text {
-                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
                 report_usage_collection(&scan.collection.diagnostics)?;
-                display_usage_text(&scan.collection.data, merge);
+                display_usage_text_with_pricing(&scan.collection.data, &scan.pricing, merge);
             } else {
-                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
                 report_usage_collection(&scan.collection.diagnostics)?;
-                display_usage_table(&scan.collection.data, merge);
+                display_usage_table_with_pricing(
+                    &scan.collection.data,
+                    &scan.pricing,
+                    scan.pricing_error.as_deref(),
+                    merge,
+                );
             }
         }
 
@@ -290,7 +296,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             // rewrite this one's settings.
             let config = vct_core::config::load_read_only();
             let scan_pool = build_scan_pool(config.performance.resolved_scan_threads())?;
-            vct_core::remote::export(config.providers, &scan_pool, io::stdout().lock())?;
+            let stdout = io::stdout();
+            let mut writer = BufWriter::with_capacity(STDOUT_BUFFER_BYTES, stdout.lock());
+            vct_core::remote::export(config.providers, &scan_pool, &mut writer)?;
+            writer.flush()?;
         }
 
         Commands::Config { action } => {
@@ -392,14 +401,18 @@ fn opens_interactive_app(cli: &Cli) -> bool {
     )
 }
 
-/// Spawns a background auto-update check for one-shot commands other than `update` and `config`, returning `None` when skipped or disabled.
-fn spawn_cli_auto_update(cli: &Cli) -> Option<std::thread::JoinHandle<()>> {
-    if opens_interactive_app(cli)
-        || matches!(
+/// Returns whether `cli` is a one-shot command eligible for background startup auto-update checks.
+fn auto_update_eligible_command(cli: &Cli) -> bool {
+    !opens_interactive_app(cli)
+        && !matches!(
             &cli.command,
-            Some(Commands::Update { .. } | Commands::Config { .. })
+            Some(Commands::Update { .. } | Commands::Config { .. } | Commands::Ledger { .. })
         )
-    {
+}
+
+/// Spawns a background auto-update check for eligible one-shot commands (`update`, `config`, and `ledger` are excluded), returning `None` when skipped, not due today, or disabled.
+fn spawn_cli_auto_update(cli: &Cli) -> Option<std::thread::JoinHandle<()>> {
+    if !auto_update_eligible_command(cli) || !vct_core::update::auto_update_is_due() {
         return None;
     }
 
@@ -505,9 +518,10 @@ fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
 /// Writes one pretty-printed JSON value to stdout followed by a newline.
 fn write_pretty_json(value: &impl Serialize) -> Result<()> {
     let stdout = io::stdout();
-    let mut writer = stdout.lock();
+    let mut writer = BufWriter::with_capacity(STDOUT_BUFFER_BYTES, stdout.lock());
     serde_json::to_writer_pretty(&mut writer, value)?;
     writeln!(writer)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -579,7 +593,7 @@ fn report_usage_collection(diagnostics: &vct_core::usage::ScanDiagnostics) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::opens_interactive_app;
+    use super::{auto_update_eligible_command, opens_interactive_app};
     use crate::cli::Cli;
     use clap::Parser;
 
@@ -613,6 +627,38 @@ mod tests {
             assert!(
                 !opens_interactive_app(&Cli::parse_from(args)),
                 "{args:?} must be classified as one-shot"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_update_excludes_interactive_update_config_and_ledger_commands() {
+        for args in [
+            &["vct", "usage", "--table"][..],
+            &["vct", "usage", "--json"],
+            &["vct", "analysis", "--text"],
+            &["vct", "analysis", "session.jsonl"],
+            &["vct", "quota", "claude"],
+            &["vct", "version"],
+        ] {
+            assert!(
+                auto_update_eligible_command(&Cli::parse_from(args)),
+                "{args:?} must stay eligible for startup auto-update"
+            );
+        }
+
+        for args in [
+            &["vct"][..],
+            &["vct", "usage"],
+            &["vct", "analysis"],
+            &["vct", "quota"],
+            &["vct", "update"],
+            &["vct", "config", "show"],
+            &["vct", "ledger", "export"],
+        ] {
+            assert!(
+                !auto_update_eligible_command(&Cli::parse_from(args)),
+                "{args:?} must skip CLI startup auto-update"
             );
         }
     }

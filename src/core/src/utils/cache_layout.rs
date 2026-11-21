@@ -33,6 +33,9 @@ pub fn remove_legacy_cache_files() {
 
 /// Deletes legacy flat-layout cache files in `dir`, ignoring missing files and I/O errors without creating `dir`.
 pub(crate) fn remove_legacy_cache_files_in(dir: &Path) {
+    if !dir.is_dir() {
+        return;
+    }
     for name in LEGACY_FILES {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
