@@ -9,6 +9,7 @@ use crate::display::usage::averages::{
 use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
+use std::io::{self, Write};
 use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::usage::UsageData;
 use vct_core::utils::format_number;
@@ -22,30 +23,70 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         return;
     }
 
-    println!("{}", "Token Usage Statistics".bright_cyan().bold());
-    println!();
-
-    let pricing_map = match fetch_model_pricing() {
-        Ok(map) => map,
+    let (pricing_map, pricing_error) = match fetch_model_pricing() {
+        Ok(map) => (map, None),
         Err(e) => {
             log::warn!("failed to fetch pricing data: {e}; costs shown as $0.00");
-            eprintln!("Warning: Failed to fetch pricing data: {}", e);
-            eprintln!("Costs will be shown as $0.00");
-            ModelPricingMap::new(HashMap::new())
+            (ModelPricingMap::new(HashMap::new()), Some(e.to_string()))
         }
     };
+
+    display_usage_table_with_pricing(usage_data, &pricing_map, pricing_error.as_deref(), merge);
+}
+
+/// Prints `usage_data` to stdout as a colored per-model table and per-provider totals footer using a pre-fetched `pricing_map`.
+///
+/// When `pricing_error` is `Some` and `usage_data` is non-empty, warns on stderr that costs are shown as `$0.00`. See [`display_usage_table`] for column and `merge` semantics.
+pub fn display_usage_table_with_pricing(
+    usage_data: &UsageData,
+    pricing_map: &ModelPricingMap,
+    pricing_error: Option<&str>,
+    merge: bool,
+) {
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    let _ = write_usage_table_with_pricing(
+        usage_data,
+        pricing_map,
+        pricing_error,
+        merge,
+        &mut stdout,
+        &mut stderr,
+    );
+}
+
+fn write_usage_table_with_pricing(
+    usage_data: &UsageData,
+    pricing_map: &ModelPricingMap,
+    pricing_error: Option<&str>,
+    merge: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<()> {
+    if usage_data.models.is_empty() {
+        writeln!(out, "No usage data found in enabled provider sessions")?;
+        return Ok(());
+    }
+
+    writeln!(out, "{}", "Token Usage Statistics".bright_cyan().bold())?;
+    writeln!(out)?;
+
+    if let Some(error) = pricing_error {
+        writeln!(err, "Warning: Failed to fetch pricing data: {}", error)?;
+        writeln!(err, "Costs will be shown as $0.00")?;
+    }
 
     let mut summary = build_usage_summary(
         &usage_data.models,
         &usage_data.per_provider,
         &usage_data.provider_days,
-        &pricing_map,
+        pricing_map,
         &usage_data.stored_costs,
     );
 
     if summary.rows.is_empty() {
-        println!("No usage data found in enabled provider sessions");
-        return;
+        writeln!(out, "No usage data found in enabled provider sessions")?;
+        return Ok(());
     }
 
     // Totals are a row-wise sum, so they are identical merged or not.
@@ -109,13 +150,13 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         Color::Red,
     );
 
-    println!("{table}");
-    println!();
+    writeln!(out, "{table}")?;
+    writeln!(out)?;
 
     let provider_rows = build_provider_total_rows(&summary.provider_totals);
 
-    println!("{}", "Totals (by Provider)".bright_magenta().bold());
-    println!();
+    writeln!(out, "{}", "Totals (by Provider)".bright_magenta().bold())?;
+    writeln!(out)?;
 
     let mut totals_table = Table::new();
     totals_table.load_style(UTF8_FULL).set_header(vec![
@@ -146,6 +187,91 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         totals_table.add_row(vec![name_cell, tokens_cell, cost_cell]);
     }
 
-    println!("{totals_table}");
-    println!();
+    writeln!(out, "{totals_table}")?;
+    writeln!(out)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vct_core::pricing::ModelPricing;
+
+    fn empty_usage_data() -> UsageData {
+        UsageData {
+            models: Default::default(),
+            per_provider: Default::default(),
+            provider_days: Default::default(),
+            stored_costs: Default::default(),
+        }
+    }
+
+    fn sample_usage_data() -> UsageData {
+        let mut usage = empty_usage_data();
+        usage.models.insert(
+            "claude-sonnet-4".to_string(),
+            serde_json::json!({
+                "input_tokens": 1_000_000,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }),
+        );
+        usage
+    }
+
+    #[test]
+    fn empty_usage_skips_pricing_warning() {
+        let empty = empty_usage_data();
+        let pricing = ModelPricingMap::new(HashMap::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        write_usage_table_with_pricing(&empty, &pricing, Some("boom"), false, &mut out, &mut err)
+            .unwrap();
+
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No usage data found")
+        );
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn nonempty_usage_reuses_passed_pricing_and_warns_only_on_error() {
+        let usage = sample_usage_data();
+        let mut map = HashMap::new();
+        map.insert(
+            "claude-sonnet-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: 3e-6,
+                ..ModelPricing::default()
+            },
+        );
+        let priced = ModelPricingMap::new(map);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_usage_table_with_pricing(&usage, &priced, None, false, &mut out, &mut err).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("$3.00"));
+        assert!(err.is_empty());
+
+        let empty_pricing = ModelPricingMap::new(HashMap::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_usage_table_with_pricing(
+            &usage,
+            &empty_pricing,
+            Some("network down"),
+            false,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("$0.00"));
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("Warning: Failed to fetch pricing data: network down"));
+        assert!(err.contains("Costs will be shown as $0.00"));
+    }
 }
