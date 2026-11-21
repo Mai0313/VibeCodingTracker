@@ -163,6 +163,21 @@ impl SessionLedger {
             .filter(move |(key, _)| !local.contains(*key) && seen.insert(key.as_str()))
             .map(|(_, entry)| entry)
     }
+
+    /// Returns the sorted names of remote snapshots that have a `sessions` directory on disk.
+    pub(crate) fn remote_names(&self) -> Vec<String> {
+        self.remotes
+            .iter()
+            .filter(|remote| remote.dir.is_dir())
+            .filter_map(|remote| {
+                remote
+                    .dir
+                    .parent()
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect()
+    }
 }
 
 impl RemoteSnapshot {

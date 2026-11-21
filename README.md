@@ -173,6 +173,10 @@ vct usage --text
 # JSON for data processing (every row has cost_usd; matched_model only when priced under another model name)
 vct usage --json
 
+# Per-day JSON with `priced` flag and synced remote metadata (composes with time-range flags)
+vct usage --json --by-day
+vct usage --json --by-day --monthly
+
 # Save enriched JSON with shell redirection
 vct usage --json > report.json
 
@@ -184,13 +188,15 @@ vct usage --json --daily
 # Merge same model reported under different provider prefixes
 # (e.g. openai/gpt-5.5 + azure/gpt-5.5 + gpt-5.5 -> one row)
 vct usage --table --merge-providers
+vct usage --json --merge-providers
+vct usage --json --by-day --merge-providers
 ```
 
 > [!NOTE]
-> `--table` and `--text` sort model rows by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`); `--json` lists its rows in no fixed order. The app sorts by cost, highest first, and `←` / `→` move the sort to the column on that side, whose header is highlighted. The right side of the table title names the current sort (`sort: cost ▼`). The app also hides models with zero usage in the selected range.
+> `--table` and `--text` sort model rows by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`); `--json` lists its rows in no fixed order unless `--merge-providers` or `--by-day` is set (both sort model rows by ascending cost, then model name; `--by-day` sorts dates ascending). The app sorts by cost, highest first, and `←` / `→` move the sort to the column on that side, whose header is highlighted. The right side of the table title names the current sort (`sort: cost ▼`). The app also hides models with zero usage in the selected range.
 
 > [!TIP]
-> The same model can show up under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). By default, `vct` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost (`Merge models across providers` under `Settings > Usage`, `usage.merge_models = true` in `~/.vct/config.toml`). When turned off in Settings, `--merge-providers` forces merging on for that run. `--json` is left as the raw per-model export.
+> The same model can show up under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). By default, `vct` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost (`Merge models across providers` under `Settings > Usage`, `usage.merge_models = true` in `~/.vct/config.toml`). When turned off in Settings, `--merge-providers` forces merging on for that run. `--json` stays a raw per-model export unless `--merge-providers` is passed explicitly.
 
 ### Preview: Usage Tab (`vct usage`)
 
@@ -470,7 +476,7 @@ vct version --json   # Machine-readable JSON
 
 ## Quota Command
 
-**The live quota panels full screen, or one provider's raw quota/usage API response.**
+**The live quota panels full screen, normalized multi-provider quota JSON, or one provider's raw quota/usage API response.**
 
 ### Quota Tab
 
@@ -509,11 +515,19 @@ A card appears only for a provider whose credentials are present, placed on a un
 
 > `vct monitor` and the hidden alias `vct fetch` are removed. Use `vct quota` for the cards and `vct quota <provider>` for a raw response.
 
+### Normalized Quota JSON (`vct quota --json`)
+
+With `--json` and no provider, `vct quota --json` fetches every enabled provider in `[usage.quota].panels` that has credentials in parallel, runs the same OAuth refresh, Codex session fallback, and `~/.vct/quota/<provider>.json` caching as the Quota tab, and prints a normalized JSON array of cards for scripts and external dashboards. Providers without credentials are skipped; a single provider's auth or fetch error is reported on its card (`needs_login` / `error`) without aborting the command.
+
+```bash
+vct quota --json
+```
+
 ### Raw Response (`vct quota <provider>`)
 
 With a provider, `vct quota` prints that provider's raw response with no parsing or aggregation. It calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor / Grok / Antigravity) and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. For Claude, Codex, and Grok it refreshes an expiring or rejected OAuth token once and writes the rotated token back to that CLI's credential file, matching the dashboard; Copilot, Cursor, and Antigravity are read-only, and if a token is rejected you can re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent` / `grok` / `agy models`).
 
-`--json`, `--text` and `--table` print one provider's response, so `vct quota --json` without a provider is an error.
+`--text` and `--table` print one provider's response, so `vct quota --text` or `vct quota --table` without a provider is an error.
 
 ```bash
 # Raw JSON (default)
