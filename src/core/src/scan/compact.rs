@@ -336,7 +336,7 @@ where
         }
     }
 
-    // LPT scheduling: dispatch largest files first so huge logs do not stall the parallel tail.
+    // LPT scheduling: sort largest files first and cap Rayon chunks at 1 so big logs spread across workers.
     let reordered_misses = misses.len() > 1;
     if reordered_misses {
         misses.sort_unstable_by_key(|left| std::cmp::Reverse(left.0.len));
@@ -344,6 +344,7 @@ where
 
     let loaded: Vec<_> = misses
         .into_par_iter()
+        .with_max_len(1)
         .map(|(file, key, current)| {
             let result = load_file_session(&file, provider, tiers, current);
             (file.path, key, result)
