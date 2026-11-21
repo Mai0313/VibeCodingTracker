@@ -401,14 +401,18 @@ fn opens_interactive_app(cli: &Cli) -> bool {
     )
 }
 
-/// Spawns a background auto-update check for one-shot commands other than `update` and `config`, returning `None` when skipped or disabled.
-fn spawn_cli_auto_update(cli: &Cli) -> Option<std::thread::JoinHandle<()>> {
-    if opens_interactive_app(cli)
-        || matches!(
+/// Returns whether `cli` is a one-shot command eligible for background startup auto-update checks.
+fn auto_update_eligible_command(cli: &Cli) -> bool {
+    !opens_interactive_app(cli)
+        && !matches!(
             &cli.command,
-            Some(Commands::Update { .. } | Commands::Config { .. })
+            Some(Commands::Update { .. } | Commands::Config { .. } | Commands::Ledger { .. })
         )
-    {
+}
+
+/// Spawns a background auto-update check for eligible one-shot commands (`update`, `config`, and `ledger` are excluded), returning `None` when skipped, not due today, or disabled.
+fn spawn_cli_auto_update(cli: &Cli) -> Option<std::thread::JoinHandle<()>> {
+    if !auto_update_eligible_command(cli) || !vct_core::update::auto_update_is_due() {
         return None;
     }
 
@@ -589,7 +593,7 @@ fn report_usage_collection(diagnostics: &vct_core::usage::ScanDiagnostics) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::opens_interactive_app;
+    use super::{auto_update_eligible_command, opens_interactive_app};
     use crate::cli::Cli;
     use clap::Parser;
 
@@ -623,6 +627,38 @@ mod tests {
             assert!(
                 !opens_interactive_app(&Cli::parse_from(args)),
                 "{args:?} must be classified as one-shot"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_update_excludes_interactive_update_config_and_ledger_commands() {
+        for args in [
+            &["vct", "usage", "--table"][..],
+            &["vct", "usage", "--json"],
+            &["vct", "analysis", "--text"],
+            &["vct", "analysis", "session.jsonl"],
+            &["vct", "quota", "claude"],
+            &["vct", "version"],
+        ] {
+            assert!(
+                auto_update_eligible_command(&Cli::parse_from(args)),
+                "{args:?} must stay eligible for startup auto-update"
+            );
+        }
+
+        for args in [
+            &["vct"][..],
+            &["vct", "usage"],
+            &["vct", "analysis"],
+            &["vct", "quota"],
+            &["vct", "update"],
+            &["vct", "config", "show"],
+            &["vct", "ledger", "export"],
+        ] {
+            assert!(
+                !auto_update_eligible_command(&Cli::parse_from(args)),
+                "{args:?} must skip CLI startup auto-update"
             );
         }
     }

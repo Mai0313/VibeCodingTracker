@@ -11,6 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
+use std::sync::OnceLock;
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, value};
 
 /// Published JSON schema URL written into the leading `#:schema` directive of `config.toml`.
@@ -454,40 +455,40 @@ pub fn load_read_only_in(dir: &Path) -> Config {
 /// Loads settings from `config.toml` under `dir`, creating or migrating it in place.
 pub fn load_in(dir: &Path) -> Config {
     let path = dir.join("config.toml");
-    if path.exists() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // First run: materialize the generated commented template.
+            let text = default_document().to_string();
+            let _ = write_string_atomic(&path, &text);
             return Config::default();
-        };
-        // Best-effort in-place migration: write failures still yield the migrated in-memory Config, and malformed TOML is never overwritten.
-        let effective = match migrate_text(&text) {
-            Ok(Some(migrated)) => {
-                let _ = write_string_atomic(&path, &migrated);
-                migrated
-            }
-            Ok(None) => text,
-            Err(_) => return Config::default(),
-        };
-        return parse_effective_config(&effective);
+        }
+        Err(_) => return Config::default(),
+    };
+    let Ok(mut doc) = text.parse::<DocumentMut>() else {
+        return Config::default();
+    };
+    // Best-effort in-place migration: write failures still yield the migrated in-memory Config, and malformed TOML is never overwritten.
+    if migrate_document(&mut doc, &text) {
+        let _ = write_string_atomic(&path, &doc.to_string());
     }
-    // First run: materialize the generated commented template.
-    let text = default_document().to_string();
-    let _ = write_string_atomic(&path, &text);
-    toml_edit::de::from_str(&text).unwrap_or_default()
+    parse_document_config(doc)
 }
 
 /// Parses TOML text with the same in-memory migration as [`load_in`] without writing to disk.
 fn parse_config_text(text: &str) -> Config {
-    match migrate_text(text) {
-        Ok(Some(migrated)) => parse_effective_config(&migrated),
-        Ok(None) => parse_effective_config(text),
-        Err(_) => Config::default(),
-    }
+    let Ok(mut doc) = text.parse::<DocumentMut>() else {
+        return Config::default();
+    };
+    migrate_document(&mut doc, text);
+    parse_document_config(doc)
 }
 
-fn parse_effective_config(text: &str) -> Config {
-    let mut config: Config = toml_edit::de::from_str(text).unwrap_or_default();
+fn parse_document_config(doc: DocumentMut) -> Config {
     // Backstop for legacy forms the structural pass leaves alone (such as inline tables).
-    migrate_legacy(&mut config, text);
+    let legacy = LegacyOverrides::extract(&doc);
+    let mut config: Config = toml_edit::de::from_document(doc).unwrap_or_default();
+    legacy.apply(&mut config);
     config
 }
 
@@ -531,68 +532,107 @@ pub fn migrate_config_file(path: &Path) -> Result<MigrationStatus> {
 /// Returns an error if `text` is not valid TOML.
 pub fn migrate_text(text: &str) -> Result<Option<String>> {
     let mut doc: DocumentMut = text.parse()?;
-    Ok(migrate_document(&mut doc).then(|| doc.to_string()))
+    Ok(migrate_document(&mut doc, text).then(|| doc.to_string()))
+}
+
+/// Read-time fallbacks extracted from legacy keys (`quota_panels`, `refresh_interval_secs`) that structural migration leaves untouched.
+struct LegacyOverrides {
+    quota_panels: Option<Vec<String>>,
+    usage_refresh_interval: Option<u64>,
+    analysis_refresh_interval: Option<u64>,
+}
+
+impl LegacyOverrides {
+    fn extract(doc: &DocumentMut) -> Self {
+        let mut out = Self {
+            quota_panels: None,
+            usage_refresh_interval: None,
+            analysis_refresh_interval: None,
+        };
+        if let Some(usage) = doc.get("usage").and_then(Item::as_table_like) {
+            // A present `[usage.quota].panels` (even `[]`) always overrides legacy `quota_panels`.
+            let has_new_panels = usage
+                .get("quota")
+                .and_then(Item::as_table_like)
+                .is_some_and(|q| q.contains_key("panels"));
+            if !has_new_panels
+                && let Some(legacy) = usage.get("quota_panels").and_then(Item::as_array)
+            {
+                out.quota_panels = Some(
+                    legacy
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                );
+            }
+            out.usage_refresh_interval = legacy_refresh_secs(usage);
+        }
+        if let Some(analysis) = doc.get("analysis").and_then(Item::as_table_like) {
+            out.analysis_refresh_interval = legacy_refresh_secs(analysis);
+        }
+        out
+    }
+
+    fn apply(self, config: &mut Config) {
+        if let Some(panels) = self.quota_panels {
+            config.usage.quota.panels = panels;
+        }
+        if let Some(secs) = self.usage_refresh_interval {
+            config.usage.refresh_interval = secs;
+        }
+        if let Some(secs) = self.analysis_refresh_interval {
+            config.analysis.refresh_interval = secs;
+        }
+    }
 }
 
 /// Applies read-time fallbacks for legacy keys (`quota_panels`, `refresh_interval_secs`) that structural migration leaves untouched.
+#[cfg(test)]
 fn migrate_legacy(config: &mut Config, raw: &str) {
     let Ok(doc) = raw.parse::<DocumentMut>() else {
         return;
     };
-    if let Some(usage) = doc.get("usage").and_then(Item::as_table_like) {
-        // A present `[usage.quota].panels` (even `[]`) always overrides legacy `quota_panels`.
-        let has_new_panels = usage
-            .get("quota")
-            .and_then(Item::as_table_like)
-            .is_some_and(|q| q.contains_key("panels"));
-        if !has_new_panels && let Some(legacy) = usage.get("quota_panels").and_then(Item::as_array)
-        {
-            config.usage.quota.panels = legacy
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-        }
-        migrate_refresh_secs(usage, &mut config.usage.refresh_interval);
-    }
-    if let Some(analysis) = doc.get("analysis").and_then(Item::as_table_like) {
-        migrate_refresh_secs(analysis, &mut config.analysis.refresh_interval);
-    }
+    LegacyOverrides::extract(&doc).apply(config);
 }
 
-/// Copies legacy `refresh_interval_secs` into `target` when `refresh_interval` is absent, avoiding a serde `alias` that would reject files carrying both keys.
-fn migrate_refresh_secs(section: &dyn TableLike, target: &mut u64) {
-    if !section.contains_key("refresh_interval")
-        && let Some(secs) = section
-            .get("refresh_interval_secs")
-            .and_then(Item::as_integer)
-        && let Ok(v) = u64::try_from(secs)
-    {
-        *target = v;
+/// Reads legacy `refresh_interval_secs` when `refresh_interval` is absent, avoiding a serde `alias` that would reject files carrying both keys.
+fn legacy_refresh_secs(section: &dyn TableLike) -> Option<u64> {
+    if section.contains_key("refresh_interval") {
+        return None;
     }
+    section
+        .get("refresh_interval_secs")
+        .and_then(Item::as_integer)
+        .and_then(|secs| u64::try_from(secs).ok())
 }
 
 /// Runs idempotent structural migrations on standard `[header]` tables, returning whether `doc` changed.
-fn migrate_document(doc: &mut DocumentMut) -> bool {
-    let schema = json_schema();
+fn migrate_document(doc: &mut DocumentMut, raw: &str) -> bool {
     let mut changed = false;
 
     // Migrate `quota_panels` into `[usage.quota]` after leaf renames so sub-tables stay after leaf keys.
     if doc.get("usage").is_some_and(Item::is_table) {
         if let Some(usage) = doc.get_mut("usage").and_then(Item::as_table_mut) {
-            changed |= rename_refresh_key(usage, &schema, &["usage", "refresh_interval"]);
+            changed |= rename_refresh_key(usage, &["usage", "refresh_interval"]);
         }
-        changed |= migrate_quota_panels(doc, &schema);
+        changed |= migrate_quota_panels(doc);
     }
 
     if let Some(analysis) = doc.get_mut("analysis").and_then(Item::as_table_mut) {
-        changed |= rename_refresh_key(analysis, &schema, &["analysis", "refresh_interval"]);
+        changed |= rename_refresh_key(analysis, &["analysis", "refresh_interval"]);
     }
 
     // Runs after `migrate_quota_panels` so it sees any newly relocated panel list.
-    changed |= backfill_new_quota_panels(doc, &schema);
+    changed |= backfill_new_quota_panels(doc);
 
     // Runs last so the directive attaches to the first element even if `backfill_new_quota_panels` created `[general]` on an empty file.
-    if !has_schema_directive(doc) {
+    // Skip serializing `doc` when no structural edit ran: `doc` still matches `raw`.
+    let has_directive = if changed {
+        has_schema_directive(doc)
+    } else {
+        has_schema_directive_str(raw)
+    };
+    if !has_directive {
         changed |= prepend_schema_directive(doc);
     }
 
@@ -600,7 +640,7 @@ fn migrate_document(doc: &mut DocumentMut) -> bool {
 }
 
 /// Back-fills quota panels added after `[general].version` and stamps [`CONFIG_VERSION`], skipping empty panel lists and inline tables.
-fn backfill_new_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
+fn backfill_new_quota_panels(doc: &mut DocumentMut) -> bool {
     let from_version = match doc.get("general") {
         Some(item) => {
             let Some(general) = item.as_table() else {
@@ -621,7 +661,7 @@ fn backfill_new_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
 
     // Leave the version unstamped when the panel list lives in an inline table so the quota upgrade stays eligible later; still backfill `[general].auto_update`.
     if panels_out_of_reach(doc) {
-        return backfill_auto_update(doc, schema);
+        return backfill_auto_update(doc);
     }
 
     let mut changed = false;
@@ -652,17 +692,18 @@ fn backfill_new_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
         }
     }
 
-    changed |= stamp_config_version(doc, schema);
-    changed |= backfill_auto_update(doc, schema);
+    changed |= stamp_config_version(doc);
+    changed |= backfill_auto_update(doc);
     changed
 }
 
 /// Inserts `auto_update = true` into a standard `[general]` table when missing, leaving inline tables untouched.
-fn backfill_auto_update(doc: &mut DocumentMut, schema: &Value) -> bool {
+fn backfill_auto_update(doc: &mut DocumentMut) -> bool {
     let Some(general) = doc.get_mut("general").and_then(Item::as_table_mut) else {
         return false;
     };
     if !general.contains_key("auto_update") {
+        let schema = cached_json_schema();
         general.insert("auto_update", value(true));
         apply_comment(
             general,
@@ -705,7 +746,8 @@ fn panels_out_of_reach(doc: &DocumentMut) -> bool {
 }
 
 /// Stamps `[general].version` to [`CONFIG_VERSION`], creating `[general]` if absent.
-fn stamp_config_version(doc: &mut DocumentMut, schema: &Value) -> bool {
+fn stamp_config_version(doc: &mut DocumentMut) -> bool {
+    let schema = cached_json_schema();
     let mut changed = false;
     if doc.get("general").is_none() {
         let mut table = Table::new();
@@ -733,13 +775,17 @@ fn stamp_config_version(doc: &mut DocumentMut, schema: &Value) -> bool {
     changed || !version_is_current
 }
 
-/// Returns whether the first non-blank line of `doc` is a `#:schema` directive.
-fn has_schema_directive(doc: &DocumentMut) -> bool {
+/// Returns whether the first non-blank line of `text` is a `#:schema` directive.
+fn has_schema_directive_str(text: &str) -> bool {
     // Check only the first non-blank line so `#:schema` inside a multiline string or later comment does not suppress prepending.
-    doc.to_string()
-        .lines()
+    text.lines()
         .find(|line| !line.trim().is_empty())
         .is_some_and(|line| line.trim_start().starts_with("#:schema"))
+}
+
+/// Returns whether the first non-blank line of `doc` is a `#:schema` directive.
+fn has_schema_directive(doc: &DocumentMut) -> bool {
+    has_schema_directive_str(&doc.to_string())
 }
 
 /// Prepends the `#:schema` directive to the first element of `doc`, returning whether it was added.
@@ -777,7 +823,7 @@ fn decor_prefix(decor: &toml_edit::Decor) -> String {
 }
 
 /// Migrates `refresh_interval_secs` to `refresh_interval` in `table`, dropping malformed legacy values so serde defaults apply instead of failing the file.
-fn rename_refresh_key(table: &mut Table, schema: &Value, comment_path: &[&str]) -> bool {
+fn rename_refresh_key(table: &mut Table, comment_path: &[&str]) -> bool {
     if !table.contains_key("refresh_interval_secs") {
         return false;
     }
@@ -793,13 +839,19 @@ fn rename_refresh_key(table: &mut Table, schema: &Value, comment_path: &[&str]) 
         table.insert("refresh_interval", value(secs as i64));
         // Preserve hand-added comments; fall back to the schema description.
         let existing = decor_prefix(old_key.leaf_decor());
-        apply_comment(table, "refresh_interval", &existing, schema, comment_path);
+        apply_comment(
+            table,
+            "refresh_interval",
+            &existing,
+            cached_json_schema(),
+            comment_path,
+        );
     }
     true
 }
 
 /// Moves `[usage].quota_panels` into `[usage.quota].panels`, leaving inline `quota` tables untouched.
-fn migrate_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
+fn migrate_quota_panels(doc: &mut DocumentMut) -> bool {
     let Some(usage) = doc.get("usage").and_then(Item::as_table) else {
         return false;
     };
@@ -835,6 +887,7 @@ fn migrate_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
         .unwrap_or_default();
     // Carry the legacy key's comment onto the new `panels` key.
     let comment = decor_prefix(old_key.leaf_decor());
+    let schema = cached_json_schema();
 
     if usage.get("quota").and_then(Item::as_table).is_some() {
         let quota = usage
@@ -1081,7 +1134,7 @@ fn section_mut<'a>(parent: &'a mut Item, name: &str) -> &'a mut Item {
 
 /// Returns the schema description for the setting at `path`, if any.
 pub fn setting_description(path: &[&str]) -> Option<String> {
-    schema_description(&json_schema(), path)
+    schema_description(cached_json_schema(), path)
 }
 
 /// Loads `config.toml` under `dir` (falling back to [`default_document`]), applies `mutate`, and writes it back atomically.
@@ -1095,17 +1148,25 @@ fn edit_in(dir: &Path, mutate: impl FnOnce(&mut DocumentMut)) -> Result<()> {
     write_string_atomic(&path, &doc.to_string())
 }
 
+/// Returns the process-cached self-contained JSON schema for [`Config`] with all subschemas inlined.
+fn cached_json_schema() -> &'static Value {
+    static SCHEMA: OnceLock<Value> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let settings =
+            schemars::generate::SchemaSettings::draft2020_12().with(|s| s.inline_subschemas = true);
+        let schema = settings.into_generator().into_root_schema_for::<Config>();
+        serde_json::to_value(&schema).expect("config schema serializes to JSON")
+    })
+}
+
 /// Returns the self-contained JSON schema for [`Config`] with all subschemas inlined.
 pub fn json_schema() -> Value {
-    let settings =
-        schemars::generate::SchemaSettings::draft2020_12().with(|s| s.inline_subschemas = true);
-    let schema = settings.into_generator().into_root_schema_for::<Config>();
-    serde_json::to_value(&schema).expect("config schema serializes to JSON")
+    cached_json_schema().clone()
 }
 
 /// Returns the pretty-printed JSON schema for [`Config`] with a trailing newline.
 pub fn schema_json() -> String {
-    let mut s = serde_json::to_string_pretty(&json_schema()).expect("schema serializes");
+    let mut s = serde_json::to_string_pretty(cached_json_schema()).expect("schema serializes");
     s.push('\n');
     s
 }
@@ -1116,8 +1177,7 @@ fn default_document() -> DocumentMut {
         .expect("default config serializes to TOML")
         .parse()
         .expect("serialized default config is valid TOML");
-    let schema = json_schema();
-    annotate_table(doc.as_table_mut(), &schema, true);
+    annotate_table(doc.as_table_mut(), cached_json_schema(), true);
     doc
 }
 

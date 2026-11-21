@@ -469,6 +469,26 @@ fn acquire_update_lock_at(current_exe: &Path) -> Result<lock::UpdateLock> {
         .context("Another vct update is already running; try again after it exits")
 }
 
+/// Returns whether a background auto-update check is currently eligible and due today without creating `~/.vct` or contacting the network.
+pub fn auto_update_is_due() -> bool {
+    if !auto_update_allowed(
+        true,
+        crate::utils::network_disabled(),
+        !cfg!(debug_assertions),
+    ) {
+        return false;
+    }
+    let Ok(paths) = crate::utils::resolve_paths() else {
+        return false;
+    };
+    auto_update_is_due_in(&paths.cache_dir, Utc::now())
+}
+
+fn auto_update_is_due_in(cache_dir: &Path, now: DateTime<Utc>) -> bool {
+    let record = version_cache::read_self_version_in(cache_dir);
+    version_cache::check_is_due(&record, now)
+}
+
 /// Checks for and silently installs a newer release when policy allows.
 ///
 /// Returns [`AutoUpdateOutcome::Skipped`] when `enabled` is false, `VCT_OFFLINE` is set, the binary is a debug build, another update holds the lock, or a check already ran on the current UTC date. Failures are logged and returned as [`AutoUpdateOutcome::Failed`].
@@ -778,7 +798,9 @@ mod tests {
     fn current_day_cache_skips_fetch_and_install() {
         let dir = tempfile::tempdir().unwrap();
         let now = "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert!(auto_update_is_due_in(dir.path(), now));
         version_cache::record_check_attempt_in(dir.path(), now).unwrap();
+        assert!(!auto_update_is_due_in(dir.path(), now));
 
         let outcome = auto_update_with(
             dir.path(),
