@@ -12,6 +12,7 @@ use crate::models::TimeRange;
 use crate::pricing::TierThresholds;
 use crate::session::hermes::read_hermes_usage_contributions;
 use crate::session::opencode::read_opencode_usage_contributions;
+use crate::utils::directory::GEMINI_SESSION_MAX_DEPTH;
 use crate::utils::{
     ANTIGRAVITY_SESSION_MAX_DEPTH, COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH,
     GROK_SESSION_MAX_DEPTH, HelperPaths, is_antigravity_session_file, is_claude_session_file,
@@ -64,7 +65,7 @@ const FILE_PROVIDERS: [FileProviderSpec; 7] = [
         enabled: |p| p.gemini,
         dirs: |p| vec![p.gemini_session_dir.clone()],
         filter: is_gemini_session_file,
-        max_depth: None,
+        max_depth: Some(GEMINI_SESSION_MAX_DEPTH),
     },
     FileProviderSpec {
         provider: ExtensionType::Grok,
