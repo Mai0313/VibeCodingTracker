@@ -2,9 +2,12 @@
 //
 // The fetch/cache path runs against a local `httpmock` server pointed at a temp cache dir, so no real LiteLLM request is made and `~/.vct` is never touched. The rest are pure lookup and cost-math tests.
 
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use httpmock::prelude::*;
 use serde_json::json;
 use std::collections::HashMap;
+use std::io::Write;
 use tempfile::TempDir;
 use vct_core::pricing::{
     ModelPricing, ModelPricingMap, ThresholdTier, TierRange, calculate_cost, clear_pricing_cache,
@@ -83,6 +86,48 @@ fn fetch_pricing_from_mock_parses_and_caches() {
         cache_file.exists(),
         "pricing cache should be written to the temp cache dir"
     );
+    let cache_text = std::fs::read_to_string(&cache_file).expect("read written cache");
+    assert!(
+        !cache_text.contains('\n'),
+        "pricing cache should be written as compact JSON"
+    );
+}
+
+#[test]
+fn fetch_pricing_refetches_when_cache_is_legacy_or_has_negative_rate() {
+    clear_pricing_cache();
+    let bad_caches = [
+        json!({
+            "stale": {
+                "input_cost_per_token": 1e-6,
+                "tiers": [{ "threshold_tokens": 200_000, "input_cost_per_token": 2e-6 }]
+            }
+        }),
+        json!({
+            "good": { "input_cost_per_token": 1e-6 },
+            "bad": { "output_cost_per_token": -1e-6 }
+        }),
+        json!([]),
+    ];
+
+    for bad_cache in bad_caches {
+        let server = MockServer::start();
+        let endpoint = server.mock(|when, then| {
+            when.method(GET).path("/pricing");
+            then.status(200).json_body(json!({
+                "fresh-model": { "input_cost_per_token": 4e-6 }
+            }));
+        });
+        let cache_dir = TempDir::new().unwrap();
+        let cache_file = get_pricing_cache_path_in(cache_dir.path(), &pricing_cache_date());
+        std::fs::write(&cache_file, serde_json::to_string(&bad_cache).unwrap()).unwrap();
+
+        let map = fetch_model_pricing_with(&server.url("/pricing"), cache_dir.path())
+            .expect("invalid or legacy cache must fall back to remote fetch");
+
+        endpoint.assert();
+        assert_eq!(map.get("fresh-model").pricing.input_cost_per_token, 4e-6);
+    }
 }
 
 #[test]
@@ -202,6 +247,77 @@ fn fetch_pricing_backs_off_after_failure() {
 
     assert!(retry.to_string().contains("failure backoff"));
     assert_eq!(endpoint.calls(), 1);
+}
+
+#[test]
+fn fetch_pricing_requests_and_decompresses_gzip_payload() {
+    clear_pricing_cache();
+    let payload = serde_json::to_vec(&json!({
+        "claude-sonnet-4-6": {
+            "input_cost_per_token": 3e-6,
+            "output_cost_per_token": 1.5e-5,
+            "input_cost_per_token_above_200k_tokens": 6e-6
+        }
+    }))
+    .unwrap();
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let server = MockServer::start();
+    let endpoint = server.mock(|when, then| {
+        when.method(GET)
+            .path("/pricing")
+            .header("accept-encoding", "gzip");
+        then.status(200)
+            .header("content-type", "application/json")
+            .header("content-encoding", "gzip")
+            .body(compressed.clone());
+    });
+    let cache_dir = TempDir::new().unwrap();
+
+    let map = fetch_model_pricing_with(&server.url("/pricing"), cache_dir.path())
+        .expect("gzipped pricing response must decompress and parse");
+
+    endpoint.assert();
+    let sonnet = map.get("claude-sonnet-4-6");
+    assert_eq!(sonnet.pricing.input_cost_per_token, 3e-6);
+    assert_eq!(sonnet.pricing.tiers.len(), 1);
+    assert_eq!(sonnet.pricing.tiers[0].threshold_tokens, 200_000);
+}
+
+#[test]
+fn fetch_pricing_falls_back_to_uncompressed_and_rejects_corrupt_gzip() {
+    clear_pricing_cache();
+    let server = MockServer::start();
+    let plain_endpoint = server.mock(|when, then| {
+        when.method(GET)
+            .path("/plain")
+            .header("accept-encoding", "gzip");
+        then.status(200).json_body(json!({
+            "gpt-5": { "input_cost_per_token": 2e-6 }
+        }));
+    });
+    let corrupt_endpoint = server.mock(|when, then| {
+        when.method(GET).path("/corrupt");
+        then.status(200)
+            .header("content-encoding", "gzip")
+            .body("not valid gzip bytes");
+    });
+
+    let plain_dir = TempDir::new().unwrap();
+    let map = fetch_model_pricing_with(&server.url("/plain"), plain_dir.path())
+        .expect("uncompressed response must still parse when server ignores Accept-Encoding");
+    plain_endpoint.assert();
+    assert_eq!(map.get("gpt-5").pricing.input_cost_per_token, 2e-6);
+
+    let corrupt_dir = TempDir::new().unwrap();
+    let err = fetch_model_pricing_with(&server.url("/corrupt"), corrupt_dir.path())
+        .expect_err("corrupt gzip response must fail without caching");
+    corrupt_endpoint.assert();
+    assert!(err.to_string().contains("decompress gzip"));
+    let cache_file = get_pricing_cache_path_in(corrupt_dir.path(), &pricing_cache_date());
+    assert!(!cache_file.exists());
 }
 
 #[test]

@@ -8,11 +8,13 @@ mod cost;
 mod matching;
 mod tiers;
 
+use crate::constants::FastHashMap;
 use crate::utils::{find_pricing_cache_for_date_in, get_cache_dir};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const LITELLM_PRICING_URL: &str =
@@ -27,6 +29,8 @@ struct PricingFetchKey {
 
 static FAILED_FETCHES: LazyLock<Mutex<HashMap<PricingFetchKey, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static PRICING_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 
 pub use cache::{ModelPricing, ThresholdTier, TierRange};
 pub use calculation::calculate_cost;
@@ -63,9 +67,9 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
             && let Ok(pricing) = cache::load_from_cache_in(&cache_dir)
         {
             log::debug!("Loaded model pricing from today's cache (offline)");
-            return Ok(ModelPricingMap::new(pricing));
+            return Ok(ModelPricingMap::from_fast_map(pricing));
         }
-        return Ok(ModelPricingMap::new(std::collections::HashMap::new()));
+        return Ok(ModelPricingMap::from_fast_map(FastHashMap::default()));
     }
 
     fetch_model_pricing_with(LITELLM_PRICING_URL, &cache_dir)
@@ -90,7 +94,7 @@ pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPric
             Ok(pricing) => {
                 log::debug!("Loaded model pricing from today's cache");
                 clear_fetch_failure(&fetch_key);
-                return Ok(ModelPricingMap::new(pricing));
+                return Ok(ModelPricingMap::from_fast_map(pricing));
             }
             Err(e) => {
                 log::warn!("Failed to load from cache: {}, fetching from remote", e);
@@ -109,7 +113,7 @@ pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPric
     match result {
         Ok(pricing) => {
             clear_fetch_failure(&fetch_key);
-            Ok(ModelPricingMap::new(pricing))
+            Ok(ModelPricingMap::from_fast_map(pricing))
         }
         Err(error) => {
             record_fetch_failure(fetch_key);
@@ -118,19 +122,41 @@ pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPric
     }
 }
 
+fn pricing_http_client() -> Result<&'static reqwest::blocking::Client> {
+    if let Some(client) = PRICING_HTTP_CLIENT.get() {
+        return Ok(client);
+    }
+    // Bound the blocking fetch so an unreachable network cannot stall startup.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("Failed to create HTTP client")?;
+    Ok(PRICING_HTTP_CLIENT.get_or_init(|| client))
+}
+
+fn is_gzip_encoded(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|encoding| {
+            let encoding = encoding.trim();
+            encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("x-gzip")
+        })
+}
+
 fn fetch_model_pricing_remote(
     url: &str,
     cache_dir: &Path,
-) -> Result<HashMap<String, ModelPricing>> {
+) -> Result<FastHashMap<Arc<str>, ModelPricing>> {
     log::info!("Fetching model pricing from remote...");
-    // Bound the blocking fetch so an unreachable network cannot stall startup.
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("Failed to create HTTP client")?;
+    let client = pricing_http_client()?;
 
+    // Request gzip manually and decode via `flate2` so we cut transfer size without enabling `reqwest`'s decompression crate tree.
     let response = client
         .get(url)
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
         .send()
         .context("Failed to fetch model pricing from LiteLLM")?;
 
@@ -140,9 +166,18 @@ fn fetch_model_pricing_remote(
         response.status()
     );
 
-    let raw: serde_json::Value = response
-        .json()
-        .context("Failed to parse model pricing JSON")?;
+    let raw: serde_json::Value = if is_gzip_encoded(response.headers()) {
+        let mut decoder = flate2::read::MultiGzDecoder::new(response);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .context("Failed to decompress gzip model pricing response")?;
+        serde_json::from_slice(&decompressed).context("Failed to parse model pricing JSON")?
+    } else {
+        response
+            .json()
+            .context("Failed to parse model pricing JSON")?
+    };
 
     anyhow::ensure!(
         raw.is_object(),
@@ -151,17 +186,7 @@ fn fetch_model_pricing_remote(
 
     // Filter before parsing so in-memory pricing and the on-disk cache derive from the exact same subset of keys.
     let filtered_raw = cache::build_filtered_cost_json(&raw);
-
-    let parsed = cache::parse_litellm_pricing_map(filtered_raw.clone());
-    anyhow::ensure!(
-        cache::pricing_rates_are_valid(&parsed),
-        "Invalid model pricing JSON: negative or non-finite price"
-    );
-    let pricing = cache::normalize_pricing(parsed);
-    anyhow::ensure!(
-        !pricing.is_empty(),
-        "Invalid model pricing JSON: no priced models"
-    );
+    let pricing = cache::parse_and_validate_litellm_map(&filtered_raw)?;
 
     // Persist the raw cost-key projection rather than `ModelPricing` so unparsed LiteLLM cost keys remain available to future versions.
     if let Err(e) = cache::save_to_cache_in(cache_dir, &filtered_raw) {
@@ -257,5 +282,28 @@ mod tests {
         assert!(normalized.contains_key("valid-model"));
         assert!(!normalized.contains_key("zero-cost-model"));
         assert!(!normalized.contains_key("another-zero-model"));
+    }
+
+    #[test]
+    fn pricing_http_client_is_reused() {
+        let first = pricing_http_client().expect("build pricing client");
+        let second = pricing_http_client().expect("reuse pricing client");
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn is_gzip_encoded_matches_header_variants() {
+        use reqwest::header::{CONTENT_ENCODING, HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        assert!(!is_gzip_encoded(&headers));
+
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+        assert!(!is_gzip_encoded(&headers));
+
+        for value in ["gzip", "GZIP", "x-gzip", "identity, gzip"] {
+            headers.insert(CONTENT_ENCODING, HeaderValue::from_static(value));
+            assert!(is_gzip_encoded(&headers), "expected gzip match for {value}");
+        }
     }
 }
