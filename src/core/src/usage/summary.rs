@@ -14,11 +14,11 @@ enum ProviderPricing<'a> {
     Litellm,
     /// Grok's context-gauge estimate: LiteLLM with an input-rate fallback when cache-read pricing is absent.
     GrokGauge,
-    /// OpenCode: exact LiteLLM match, else its stored cost.
+    /// OpenCode: exact or official normalized LiteLLM match, else its stored cost.
     OpenCode(&'a crate::constants::FastHashMap<String, f64>),
     /// Cursor local estimate: exact LiteLLM pricing, else zero.
     CursorEstimate,
-    /// Hermes: exact LiteLLM match, else its stored cost.
+    /// Hermes: exact or official normalized LiteLLM match, else its stored cost.
     Hermes(&'a crate::constants::FastHashMap<String, f64>),
 }
 

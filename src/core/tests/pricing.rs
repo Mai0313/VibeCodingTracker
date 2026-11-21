@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use tempfile::TempDir;
 use vct_core::pricing::{
-    ModelPricing, ModelPricingMap, ThresholdTier, TierRange, calculate_cost, clear_pricing_cache,
-    fetch_model_pricing_with, normalize_model_name,
+    CostSource, ModelPricing, ModelPricingMap, ThresholdTier, TierRange, calculate_cost,
+    clear_pricing_cache, fetch_model_pricing_with, normalize_model_name, resolve_model_cost,
 };
 use vct_core::utils::{TierSlice, get_pricing_cache_path_in};
 
@@ -975,4 +975,188 @@ fn test_pricing_edge_cases() {
     let long_name = "a".repeat(1000);
     let result = pricing_map.get(&long_name);
     assert_eq!(result.pricing.input_cost_per_token, 0.0);
+}
+
+#[test]
+fn stored_cost_sources_resolve_vendor_prefixed_models_via_official_normalized_match() {
+    clear_pricing_cache();
+
+    let mut raw_map = HashMap::new();
+    raw_map.insert(
+        "gpt-6-astra".to_string(),
+        ModelPricing {
+            input_cost_per_token: 1e-5,
+            output_cost_per_token: 5e-5,
+            tiers: vec![ThresholdTier {
+                threshold_tokens: 272_000,
+                input_cost_per_token: 2e-5,
+                output_cost_per_token: 7.5e-5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    raw_map.insert("azure/gpt-6-astra".to_string(), pricing_at(9e-5));
+    raw_map.insert("kyma/gemini-4-argon".to_string(), pricing_at(9e-6));
+    raw_map.insert(
+        "gemini/gemini-4-argon".to_string(),
+        ModelPricing {
+            input_cost_per_token: 1.5e-6,
+            output_cost_per_token: 9e-6,
+            ..Default::default()
+        },
+    );
+    raw_map.insert(
+        "claude-haiku-4-5".to_string(),
+        ModelPricing {
+            input_cost_per_token: 1e-6,
+            output_cost_per_token: 5e-6,
+            ..Default::default()
+        },
+    );
+    raw_map.insert("azure/gpt-5.4".to_string(), pricing_at(2.5e-6));
+    raw_map.insert("gpt-5.4".to_string(), pricing_at(3e-6));
+    let pricing_map = ModelPricingMap::new(raw_map);
+
+    let astra_counts = tc(24_657, 16, 0, 0, 0, 0);
+    let expected_astra = 24_657.0 * 1e-5 + 16.0 * 5e-5;
+    for source in [
+        CostSource::OpenCodeStored(0.0),
+        CostSource::HermesStored(0.0),
+    ] {
+        let (cost, matched) =
+            resolve_model_cost("openai/gpt-6-astra", &astra_counts, &pricing_map, source);
+        assert!((cost - expected_astra).abs() < 1e-9);
+        assert_eq!(matched.as_deref(), Some("gpt-6-astra"));
+
+        let (gemini_cost, gemini_matched) = resolve_model_cost(
+            "google/gemini-4-argon",
+            &tc(1_000_000, 100_000, 0, 0, 0, 0),
+            &pricing_map,
+            source,
+        );
+        assert!((gemini_cost - 2.4).abs() < 1e-9);
+        assert_eq!(gemini_matched.as_deref(), Some("gemini/gemini-4-argon"));
+
+        let (claude_cost, claude_matched) = resolve_model_cost(
+            "anthropic/claude-haiku-4-5",
+            &tc(1_000_000, 200_000, 0, 0, 0, 0),
+            &pricing_map,
+            source,
+        );
+        assert!((claude_cost - 2.0).abs() < 1e-9);
+        assert_eq!(claude_matched.as_deref(), Some("claude-haiku-4-5"));
+
+        // Same-provider normalized key wins over unprefixed canonical key.
+        let (azure_cost, azure_matched) = resolve_model_cost(
+            "azure/gpt-5.4-20260101",
+            &tc(1_000_000, 0, 0, 0, 0, 0),
+            &pricing_map,
+            source,
+        );
+        assert!((azure_cost - 2.5).abs() < 1e-9);
+        assert_eq!(azure_matched.as_deref(), Some("azure/gpt-5.4"));
+    }
+
+    // Per-request tier slices apply when official normalized matching resolves a tiered model.
+    let mut tiered_astra = tc(300_000, 10_000, 0, 0, 0, 0);
+    tiered_astra.above_tiers = vec![TierSlice {
+        input_tokens: 300_000,
+        output_tokens: 10_000,
+        ..Default::default()
+    }];
+    let (tiered_cost, tiered_matched) = resolve_model_cost(
+        "openai/gpt-6-astra",
+        &tiered_astra,
+        &pricing_map,
+        CostSource::OpenCodeStored(0.0),
+    );
+    assert!((tiered_cost - (300_000.0 * 2e-5 + 10_000.0 * 7.5e-5)).abs() < 1e-9);
+    assert_eq!(tiered_matched.as_deref(), Some("gpt-6-astra"));
+}
+
+#[test]
+fn stored_cost_sources_keep_free_models_unpriced_and_reject_reseller_only_matches() {
+    clear_pricing_cache();
+
+    let mut raw_map = HashMap::new();
+    raw_map.insert("nemotron-3-ultra".to_string(), pricing_at(1e-5));
+    raw_map.insert("nvidia/nemotron-3-ultra".to_string(), pricing_at(1e-5));
+    raw_map.insert(
+        "kyma/gemini-3.1-pro".to_string(),
+        ModelPricing {
+            input_cost_per_token: 2.7e-6,
+            output_cost_per_token: 1.62e-5,
+            ..Default::default()
+        },
+    );
+    let pricing_map = ModelPricingMap::new(raw_map);
+
+    // Pre-populate full-lookup cache to ensure loose/reseller hits cannot leak into stored-cost lookups.
+    assert_eq!(
+        pricing_map
+            .get("opencode/nemotron-3-ultra-free")
+            .matched_model
+            .as_deref(),
+        Some("nemotron-3-ultra")
+    );
+    assert_eq!(
+        pricing_map
+            .get("opencode/gemini-3.1-pro")
+            .matched_model
+            .as_deref(),
+        Some("kyma/gemini-3.1-pro")
+    );
+
+    let free_counts = tc(60_000, 1_326, 0, 0, 0, 0);
+    let pro_counts = tc(5_000_000, 500_000, 0, 0, 0, 0);
+    for source in [
+        CostSource::OpenCodeStored(0.0),
+        CostSource::HermesStored(0.0),
+    ] {
+        for free_model in ["opencode/nemotron-3-ultra-free", "opencode/big-pickle"] {
+            let (cost, matched) =
+                resolve_model_cost(free_model, &free_counts, &pricing_map, source);
+            assert_eq!(cost, 0.0, "{free_model} must stay free");
+            assert!(matched.is_none());
+        }
+    }
+
+    for source in [
+        CostSource::OpenCodeStored(12.0523),
+        CostSource::HermesStored(12.0523),
+    ] {
+        let (cost, matched) =
+            resolve_model_cost("opencode/gemini-3.1-pro", &pro_counts, &pricing_map, source);
+        assert!((cost - 12.0523).abs() < 1e-9);
+        assert!(matched.is_none());
+    }
+}
+
+#[test]
+fn cursor_estimate_remains_exact_only_for_vendor_prefixed_names() {
+    clear_pricing_cache();
+
+    let mut raw_map = HashMap::new();
+    raw_map.insert("gpt-6-astra".to_string(), pricing_at(1e-5));
+    let pricing_map = ModelPricingMap::new(raw_map);
+
+    let counts = tc(100_000, 0, 0, 0, 0, 0);
+    let (prefixed_cost, prefixed_matched) = resolve_model_cost(
+        "openai/gpt-6-astra",
+        &counts,
+        &pricing_map,
+        CostSource::CursorEstimate,
+    );
+    assert_eq!(prefixed_cost, 0.0);
+    assert!(prefixed_matched.is_none());
+
+    let (exact_cost, exact_matched) = resolve_model_cost(
+        "gpt-6-astra",
+        &counts,
+        &pricing_map,
+        CostSource::CursorEstimate,
+    );
+    assert!((exact_cost - 1.0).abs() < 1e-9);
+    assert!(exact_matched.is_none());
 }

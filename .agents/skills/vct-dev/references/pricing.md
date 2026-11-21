@@ -12,6 +12,7 @@
 - Generic placeholders (`default`, `auto`, …) and model segments shorter than 4 **bytes** skip substring and fuzzy stages (unpriced beats a coincidental neighbor).
 - Date suffixes require exactly 8 ASCII digits; version suffixes allow numeric/dot forms (`v2`, `v1.0`) only, never words like `vision`.
 - Normalized collisions and substring tie-breaks prefer: same provider → unprefixed canonical key → model vendor's own official provider prefix (unsuffixed base ahead of versioned variants across all three) → suffix length → lexical order.
+- `CostSource::OpenCodeStored` and `CostSource::HermesStored` use exact-or-official-normalized lookup (`ModelPricingMap::lookup_exact_or_official_ref`: exact key first, then normalized candidates with `provider_rank < 3` — same provider, unprefixed canonical key, or `is_official_provider`), skipping substring/fuzzy stages and rank-3 third-party resellers before falling back to stored cost; this lookup does not touch `lowercase_keys` or `match_cache`. `CostSource::CursorEstimate` stays exact-only.
 - Each `ModelPricingMap` owns its own lazily allocated capacity-512 LRU for non-exact lookups, and builds its normalized and lowercase indices lazily via `OnceLock` so exact lookups and `tier_thresholds()` skip secondary indexing. `clear_pricing_cache()` advances a generation counter so existing maps lazily invalidate without cross-map contamination.
 
 ## Per-request context tiers and non-token billing
@@ -21,5 +22,5 @@
 - Range-based models contribute each row's inclusive `min_tokens - 1` (excluding row 0) rather than the previous row's exclusive `max_tokens`, so a request falling in a gap is never promoted to a higher tier.
 - Missing prices at level `n` fall back to level `n - 1`; levels past the last row bill at the last row; `MAX_TIER_LEVELS` bounds both the snapshot and extractor.
 - Providers without per-request granularity (Copilot, Cursor/Grok gauges, Hermes pre-aggregated table, OpenCode legacy `session` fallback) and offline scans classify nothing (intentional lower bound).
-- Live reachability note: LiteLLM's range-priced models (`dashscope/*`, `volcengine/*`) have no live path from any provider vct scans today because models.dev lacks those provider IDs for OpenCode's exact-only `CostSource::OpenCodeStored`; `ranges[1..]` is therefore exercised by tests alone.
+- Live reachability note: LiteLLM's official range-priced models (`dashscope/*`, `volcengine/*`) can be reached from `CostSource::OpenCodeStored` via exact-or-official-normalized lookup when OpenCode logs matching model IDs (whereas `ranges[1..]` still depends on per-request tier classification).
 - Claude `server_tool_use.web_search_requests` is billed per query via `ModelPricing::web_search_cost_per_query` (`search_context_cost_per_query`); `web_fetch_requests` is NOT separately billed (its content already counts as input tokens).

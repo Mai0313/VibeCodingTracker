@@ -629,8 +629,8 @@ vct config migrate
 
 - **Context tier 按单个 request 计**：LiteLLM 的「above Nk tokens」费率（如 GPT-5.x 超过 272k、Gemini 超过 200k）与 Qwen / doubao 的用量级距同样只应用在自身 prompt context 超过分界的那些 request 上，不会应用到整次扫描的 token 总和。每个 request 会落在自身 context 实际到达的那一级费率上，因此一个分成四级的 model 对真的到达最高级的 request 就按最高级计价。没有 per-request 粒度的 provider（以及离线扫描）一律按最低一级的费率计价，因此这类 model 的费用是下界。
 - **不止 token**：Claude 的 web-search 工具调用（`server_tool_use.web_search_requests`）会在 token 费用之外按每次查询计费；其他所有 model 的每次查询费用均为 $0。
-- **OpenCode**：只有在 LiteLLM 上**精确**匹配时，才会根据 token 为一个全新的 model 名称定价；若没有精确匹配，vct 会信任该 assistant message 自身存储的费用，而不是从一个只是大致相似的名称去猜测。
-- **Hermes**：与 OpenCode 相同，LiteLLM 上**精确**匹配时按 token 定价，否则使用 Hermes 自身存储的费用。
+- **OpenCode**：在 LiteLLM 上**精确**匹配或命中**官方归一化**键（同 provider 前缀、无前缀标准键或模型厂商官方前缀，跳过子串/模糊阶段与第三方转售商）时，才会根据 token 定价；否则 vct 会信任该 assistant message 自身存储的费用，而不是从一个只是大致相似的名称或转售商加价去猜测。
+- **Hermes**：与 OpenCode 相同，LiteLLM 上**精确**或**官方归一化**匹配时按 token 定价，否则使用 Hermes 自身存储的费用。
 - **DeepSeek Harness**：`dsh` 本身不记录任何费用，因此全部经由与其他 file-based provider 相同的查找链依 LiteLLM 计价，没有 OpenCode 或 Hermes 那样的 stored cost 兜底。它会路由到部署方配置的任意 provider，因此部署自定义的 model 名称很常见；LiteLLM 完全比对不到时费用为 $0。
 - **Antigravity**：与其他 file-based provider 一样依 LiteLLM 计价，model 取自每个 request 的 generation 记录。Compaction request 没有记录 model，其 token 按当时正在使用的 model 计价。
 - **Grok**：只会把 `contextTokensUsed` 作为 cache-read token 计价（若该 model 未公布 cache-read 费率则改用 input 费率）；这是单一时点的本地 context 估算，不是累计的 billed usage。

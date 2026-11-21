@@ -175,13 +175,34 @@ impl ModelPricingMap {
         }
     }
 
+    /// Resolves `model_name` via an exact key match or an official normalized match (`provider_rank < RESELLER_PROVIDER_RANK`), skipping substring, fuzzy, and third-party reseller entries.
+    ///
+    /// Exact matches hit `raw` directly without building secondary indices; normalized lookups consult `normalized_index` without populating `lowercase_keys` or `match_cache`.
+    pub(crate) fn lookup_exact_or_official_ref(
+        &self,
+        model_name: &str,
+    ) -> (Option<&ModelPricing>, Option<Arc<str>>) {
+        if let Some(pricing) = self.raw.get(model_name) {
+            return (Some(pricing), None);
+        }
+        if self.raw.is_empty() {
+            return (None, None);
+        }
+
+        let normalized_name = normalize_model_name_slice(model_name);
+        match self.normalized_match(model_name, normalized_name, true) {
+            Some(key) => (self.raw.get(key.as_ref()), Some(key)),
+            None => (None, None),
+        }
+    }
+
     fn resolve_non_exact(&self, model_name: &str) -> Option<Arc<str>> {
         if self.raw.is_empty() {
             return None;
         }
 
         let normalized_name = normalize_model_name_slice(model_name);
-        if let Some(original_key) = self.normalized_match(model_name, normalized_name) {
+        if let Some(original_key) = self.normalized_match(model_name, normalized_name, false) {
             return Some(original_key);
         }
 
@@ -241,12 +262,23 @@ impl ModelPricingMap {
         cache.entries_mut().put(Box::from(model_name), matched);
     }
 
-    fn normalized_match(&self, model_name: &str, normalized_name: &str) -> Option<Arc<str>> {
+    fn normalized_match(
+        &self,
+        model_name: &str,
+        normalized_name: &str,
+        official_only: bool,
+    ) -> Option<Arc<str>> {
+        if normalized_name.is_empty() {
+            return None;
+        }
         let candidates = self.normalized_index().get(normalized_name)?;
         let query_provider = provider_prefix(model_name);
 
         candidates
             .iter()
+            .filter(|candidate| {
+                !official_only || provider_rank(query_provider, candidate) < RESELLER_PROVIDER_RANK
+            })
             .min_by(|a, b| {
                 normalized_candidate_rank(a, normalized_name, query_provider).cmp(
                     &normalized_candidate_rank(b, normalized_name, query_provider),
@@ -501,6 +533,9 @@ fn provider_prefix(model_name: &str) -> Option<&str> {
         .and_then(|(prefix, _)| (!prefix.is_empty()).then_some(prefix))
 }
 
+/// Rank assigned to third-party host and reseller prefixes in [`provider_rank`].
+const RESELLER_PROVIDER_RANK: u8 = 3;
+
 fn normalized_candidate_rank<'a>(
     candidate: &'a str,
     normalized_name: &str,
@@ -508,7 +543,7 @@ fn normalized_candidate_rank<'a>(
 ) -> (u8, u8, usize, &'a str) {
     let cand_segment = model_without_provider(candidate);
     let p_rank = provider_rank(query_provider, candidate);
-    let tier_group = if p_rank == 3 {
+    let tier_group = if p_rank == RESELLER_PROVIDER_RANK {
         2
     } else if cand_segment == normalized_name {
         0
@@ -604,7 +639,7 @@ fn provider_rank(query_provider: Option<&str>, candidate: &str) -> u8 {
     } else if is_official_provider(cand_provider, model_without_provider(candidate)) {
         2
     } else {
-        3
+        RESELLER_PROVIDER_RANK
     }
 }
 
@@ -815,6 +850,79 @@ mod tests {
         assert!(map.get_exact("gpt-4-turbo").is_none());
         assert!(map.get_exact("deepseek-v4-pro").is_none());
         assert!(map.get_exact("GPT-4").is_none());
+    }
+
+    #[test]
+    fn lookup_exact_or_official_matches_exact_and_official_normalized_only() {
+        clear_pricing_cache();
+        let mut raw = HashMap::new();
+        raw.insert("gpt-6-astra".to_string(), create_test_pricing());
+        raw.insert("azure/gpt-6-astra".to_string(), create_test_pricing());
+        raw.insert("claude-haiku-4-5".to_string(), create_test_pricing());
+        raw.insert("gemini/gemini-4-argon".to_string(), create_test_pricing());
+        raw.insert("kyma/gemini-4-argon".to_string(), create_test_pricing());
+        raw.insert("kyma/gemini-3.1-pro".to_string(), create_test_pricing());
+        raw.insert("nemotron-3-ultra".to_string(), create_test_pricing());
+        let map = ModelPricingMap::new(raw);
+
+        // Exact hit skips secondary indices and reports no alternate matched key.
+        let (pricing, matched) = map.lookup_exact_or_official_ref("gpt-6-astra");
+        assert!(pricing.is_some());
+        assert!(matched.is_none());
+        assert!(map.normalized_index.get().is_none());
+        assert!(map.lowercase_keys.get().is_none());
+        assert!(map.match_cache.lock().unwrap().entries.is_none());
+
+        // Vendor-prefixed queries match unprefixed canonical, official vendor, or same-provider keys.
+        let (_, matched) = map.lookup_exact_or_official_ref("openai/gpt-6-astra");
+        assert_eq!(matched.as_deref(), Some("gpt-6-astra"));
+        let (_, matched) = map.lookup_exact_or_official_ref("google/gemini-4-argon");
+        assert_eq!(matched.as_deref(), Some("gemini/gemini-4-argon"));
+        let (_, matched) = map.lookup_exact_or_official_ref("anthropic/claude-haiku-4-5");
+        assert_eq!(matched.as_deref(), Some("claude-haiku-4-5"));
+        let (_, matched) = map.lookup_exact_or_official_ref("kyma/gemini-3.1-pro-20260101");
+        assert_eq!(matched.as_deref(), Some("kyma/gemini-3.1-pro"));
+
+        // Reseller-only normalized keys, loose substring/fuzzy names, and empty segments miss.
+        assert!(
+            map.lookup_exact_or_official_ref("opencode/gemini-3.1-pro")
+                .0
+                .is_none()
+        );
+        assert!(
+            map.lookup_exact_or_official_ref("opencode/nemotron-3-ultra-free")
+                .0
+                .is_none()
+        );
+        assert!(map.lookup_exact_or_official_ref("openai/").0.is_none());
+        assert!(map.lookup_exact_or_official_ref("").0.is_none());
+
+        // Official-only lookups must not build `lowercase_keys` or write to `match_cache`.
+        assert!(map.normalized_index.get().is_some());
+        assert!(map.lowercase_keys.get().is_none());
+        assert!(map.match_cache.lock().unwrap().entries.is_none());
+
+        // Full `get()` caching a reseller or substring match must not leak into official-only lookup.
+        assert_eq!(
+            map.get("opencode/gemini-3.1-pro").matched_model.as_deref(),
+            Some("kyma/gemini-3.1-pro")
+        );
+        assert_eq!(
+            map.get("opencode/nemotron-3-ultra-free")
+                .matched_model
+                .as_deref(),
+            Some("nemotron-3-ultra")
+        );
+        assert!(
+            map.lookup_exact_or_official_ref("opencode/gemini-3.1-pro")
+                .0
+                .is_none()
+        );
+        assert!(
+            map.lookup_exact_or_official_ref("opencode/nemotron-3-ultra-free")
+                .0
+                .is_none()
+        );
     }
 
     #[test]
