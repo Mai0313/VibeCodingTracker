@@ -474,7 +474,7 @@ vct version --json   # 机读 JSON
 
 ### Quota 标签页
 
-`vct quota` 会打开交互式界面并停在 Quota 标签页（也可在界面中按 `Tab` 或点击顶部标签栏的 `Quota` 切过去）。它会**零配置显示 Claude Code、Codex、GitHub Copilot、Cursor、Grok 与 Antigravity 的实时额度用量**：vct 会读取各 provider 自己的凭证，在后台线程调用其用量 API（Antigravity 则是询问 `agy` CLI），并在你工作时保持卡片持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。进度条会延伸到卡片宽度，终端放得下几张就显示几张（其余的以 `+N hidden, enlarge the terminal` 标出数量）。它不扫描任何 session，所以立即打开，也足够轻量，适合放在空闲的 pane 里常驻。可在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏所有额度卡片。
+`vct quota` 会打开交互式界面并停在 Quota 标签页（也可在界面中按 `Tab` 或点击顶部标签栏的 `Quota` 切过去）。它会**零配置显示 Claude Code、Codex、GitHub Copilot、Cursor、Grok 与 Antigravity 的实时额度用量**：vct 会读取各 provider 自己的凭证（或本地 Antigravity Language Server），在后台线程通过 HTTP 调用其用量 API，并在你工作时保持卡片持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。进度条会延伸到卡片宽度，终端放得下几张就显示几张（其余的以 `+N hidden, enlarge the terminal` 标出数量）。它不扫描任何 session，所以立即打开，也足够轻量，适合放在空闲的 pane 里常驻。可在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏所有额度卡片。
 
 ```bash
 vct quota
@@ -499,9 +499,9 @@ vct quota
 - **Copilot** — 方案类型，以及你的 premium 请求额度，以两个进度条呈现：已用百分比，以及已用 / 总量的请求数（例如 `45/1500`），来自 GitHub 的 Copilot API（`GET /copilot_internal/user`），从 `~/.copilot/config.json` 读取。该请求会模拟 Copilot CLI。token 为长期有效，因此不需要刷新；遇到 `401` / `403` 时会显示 `run: copilot login` 提示。
 - **Cursor** — 方案类型、total / auto / API **已用**百分比，以及按需消费，来自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。
 - **Grok** — 方案类型，以及当前每周或每月周期内的方案内含额度用量，来自 Grok CLI 自己的计费端点（`GET /v1/billing?format=credits`），从 `~/.grok/auth.json` 读取。预付余额只有在非零时才会显示；按量付费的消费则在你有过消费、或设置了上限之后才会显示。该请求会模拟 Grok CLI；遇到 `401` / `403` 时会显示 `run: grok login` 提示。
-- **Antigravity** — 每个共享模型池的额度（agy 的是 Gemini 以及 Claude / GPT，各有 5 小时与每周额度），来自 `agy` CLI 自己的 `/usage` 命令（`agy -p /usage --output-format json`）。卡片直接使用 agy 给出的模型池名称，每个额度则按 agy 的时间窗原样标示（`5h` 排在最前，然后是 `weekly`）；卡片放不下所有模型池时，其余的以 `+N` 标出。`/usage` 不提供方案名称，所以第一行只显示数据的新旧。vct 会运行 `PATH` 上的 `agy`，找不到时改找 agy 的安装位置（`~/.local/bin/agy`、`%LOCALAPPDATA%\agy\bin\agy.exe`）。agy 会自行维持登录状态，因此 vct 只检查 agy 的登录项是否存在（Windows 凭据管理器的 `gemini:antigravity`、macOS Keychain 的 `gemini` / `antigravity`，或 `~/.gemini/antigravity-cli/antigravity-oauth-token`）及其最后修改时间，从不读取或写入 token。每次轮询都会启动一次 agy（需要几秒、约 260 MB），所以这张卡片最多每 5 分钟更新一次。agy 无法登录时，卡片会显示 `run: agy acp --login` 提示，而且在该登录项变动之前，仪表盘不会再运行 agy。
+- **Antigravity** — 每个共享模型池的额度（例如 Gemini 以及 Claude / GPT，各有 5 小时与每周额度），通过纯 HTTP 以与其他额度卡片相同的轮询周期获取。卡片直接使用服务端返回的模型池名称，每个额度则按其时间窗标示（`5h` 排在最前，然后是 `weekly`）；卡片放不下所有模型池时，其余的以 `+N` 标出。额度摘要不提供方案名称，所以第一行只显示数据的新旧。vct 会优先向运行中的本地 Antigravity Language Server 查询（通过 `ANTIGRAVITY_LS_ADDRESS`、`$ANTIGRAVITY_APP_DATA_DIR/daemon` 或 `~/.gemini/*/daemon/{ls_,hub_}*.json` 发现文件，以及 Linux 上属于当前用户的 `*-hub-server` / `agy --hub` 进程，调用 `RetrieveUserQuotaSummary`）。若本地服务未运行，则改以只读方式使用本地保存的 OAuth 凭证（Windows 凭据管理器的 `gemini:antigravity`、macOS Keychain 的 `gemini` / `antigravity`，或 `~/.gemini/antigravity-cli/antigravity-oauth-token`）直接调用 Cloud Code HTTP（`v1internal:retrieveUserQuotaSummary`），不刷新 token。当凭证缺失、过期或被拒绝（`401` / `403`）时，卡片会显示 `run: agy models` 提示。
 
-**自动刷新 token。** 对 Claude、Codex 和 Grok，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式）。写入 Grok 的凭证文件时，会保留文件中其他所有的登录信息。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。Antigravity 的 token 属于 agy，每当 vct 向它询问 `/usage` 时由 agy 自行刷新。
+**自动刷新 token。** 对 Claude、Codex 和 Grok，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式）。写入 Grok 的凭证文件时，会保留文件中其他所有的登录信息。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）、Cursor（由其自身客户端保持最新）与 Antigravity（本地 Language Server 或只读 OAuth 回退）均为只读——vct 从不写入它们的凭证文件。
 
 只有在某个 provider 的凭证存在时才会显示对应的卡片，并排在统一网格上：一行放得下几张就放几张，放不下的自动折到下一行。
 
@@ -511,7 +511,7 @@ vct quota
 
 ### 原始响应（`vct quota <provider>`）
 
-带上供应商时，`vct quota` 会打印该供应商的原始响应，不解析、不聚合。它对 `usage` 面板使用的同一个 quota 端点（Claude / Codex / Copilot / Cursor / Grok）发起请求，直接打印原始 body，方便你查看 API 的实际结构或检查凭证是否正常。对 Claude、Codex 和 Grok，它会在 OAuth token 接近过期或被拒绝时自动刷新一次，并将轮换后的 token 写回该 CLI 的凭证文件，行为与仪表盘一致；Copilot 和 Cursor 为只读，无法刷新时请用对应供应商自己的 CLI 重新登录（`claude` / `codex` / `copilot` / `cursor-agent` / `grok`）。`vct quota antigravity` 则是运行一次 `agy -p /usage --output-format json`（按仪表盘相同的方式找到它）并打印它的输出；agy 会在运行时自行刷新 token。
+带上供应商时，`vct quota` 会打印该供应商的原始响应，不解析、不聚合。它对 `usage` 面板使用的同一个 quota 端点（Claude / Codex / Copilot / Cursor / Grok / Antigravity）发起请求，直接打印原始 body，方便你查看 API 的实际结构或检查凭证是否正常。对 Claude、Codex 和 Grok，它会在 OAuth token 接近过期或被拒绝时自动刷新一次，并将轮换后的 token 写回该 CLI 的凭证文件，行为与仪表盘一致；Copilot、Cursor 与 Antigravity 为只读，token 被拒时请用对应供应商自己的 CLI 重新认证（`claude` / `codex` / `copilot` / `cursor-agent` / `grok` / `agy models`）。
 
 `--json`、`--text` 与 `--table` 打印的是单个供应商的响应，所以不带供应商的 `vct quota --json` 会报错。
 
@@ -532,7 +532,7 @@ vct quota copilot --table
 ```
 
 > [!NOTE]
-> 响应 body 会原样打印到 stdout。遇到 HTTP 错误时仍会打印 body 并以非零状态退出；401/403 还会在 stderr 额外打印 `run: <cli> login` 提示。agy 运行失败时也一样，若是 agy 无法登录，还会附上 `run: agy acp --login` 提示。
+> 响应 body 会原样打印到 stdout。遇到 HTTP 错误时仍会打印 body 并以非零状态退出；401/403 还会在 stderr 额外打印 `run: <cli> login`（Antigravity 为 `run: agy models`）提示。
 
 ---
 
