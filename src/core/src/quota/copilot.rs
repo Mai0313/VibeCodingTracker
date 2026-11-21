@@ -7,11 +7,13 @@
 use crate::models::{CopilotQuotaSnapshot, CopilotUserResponse, QuotaSource, QuotaWindow};
 use crate::quota::http::{detect_cli_version, iso_to_unix_secs};
 use crate::quota::provider::QuotaOutcome;
+use crate::quota::refresh::file_mtime;
 use crate::utils::get_copilot_config_path;
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 /// Path of the Copilot internal usage endpoint; the API host is derived per account.
 const COPILOT_USAGE_PATH: &str = "/copilot_internal/user";
@@ -86,6 +88,7 @@ fn strip_jsonc_comments(input: &str) -> String {
 }
 
 /// A resolved Copilot credential: the entitlement API URL + the OAuth token.
+#[derive(Clone)]
 struct CopilotCreds {
     api_url: String,
     token: String,
@@ -303,25 +306,39 @@ pub(crate) fn fetch_copilot_raw_from(client: &Client, config_path: &Path) -> Res
     Ok((status, text))
 }
 
-/// Per-worker Copilot quota state; holds no cached token or refresh backoff.
+/// Per-worker Copilot quota state caching parsed credentials per config file mtime.
 #[derive(Default)]
-pub struct CopilotState;
+pub struct CopilotState {
+    creds: Option<(CopilotCreds, Option<SystemTime>)>,
+}
 
 impl CopilotState {
-    /// Reads the Copilot credential file and fetches a fresh quota snapshot.
+    /// Reads the Copilot credential file (or reuses mtime-cached credentials) and fetches a fresh quota snapshot.
     pub fn resolve(&mut self, client: &Client) -> QuotaOutcome<CopilotQuotaSnapshot> {
         let now = chrono::Local::now().timestamp();
         let path = match get_copilot_config_path() {
             Ok(p) => p,
             Err(_) => return QuotaOutcome::Transient,
         };
-        let body = match std::fs::read_to_string(&path) {
-            Ok(b) => b,
-            Err(_) => return QuotaOutcome::Transient,
-        };
-        let creds = match read_copilot_creds(&body) {
-            Some(c) => c,
-            None => return QuotaOutcome::NeedsLogin,
+        let cur_mtime = file_mtime(&path);
+        let creds = match &self.creds {
+            Some((cached, m)) if cur_mtime.is_some() && *m == cur_mtime => cached.clone(),
+            _ => {
+                let body = match std::fs::read_to_string(&path) {
+                    Ok(b) => b,
+                    Err(_) => return QuotaOutcome::Transient,
+                };
+                match read_copilot_creds(&body) {
+                    Some(c) => {
+                        self.creds = Some((c.clone(), cur_mtime));
+                        c
+                    }
+                    None => {
+                        self.creds = None;
+                        return QuotaOutcome::NeedsLogin;
+                    }
+                }
+            }
         };
         match fetch_copilot_user(client, &creds.api_url, &creds.token, now) {
             FetchResult::Ok(snap) => QuotaOutcome::Data(snap),

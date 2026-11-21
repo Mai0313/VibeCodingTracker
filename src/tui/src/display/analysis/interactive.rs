@@ -2,12 +2,17 @@
 
 use crate::display::analysis::averages::{AnalysisRow, build_analysis_rows_with_providers};
 use crate::display::common::provider_tui_color;
-use crate::display::common::table::{
-    ColumnSpec, DetailItem, DetailSection, fit_columns, styled_row,
-};
+use crate::display::common::table::{ColumnSpec, DetailItem, DetailSection, fit_columns};
 use crate::display::common::theme::theme;
-use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
-use ratatui::{layout::Constraint, style::Style, widgets::Row as RatatuiRow};
+use crate::display::common::tui::{
+    LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker, remote_snapshot_stamps,
+};
+use ratatui::{
+    layout::{Alignment, Constraint},
+    style::Style,
+    text::Text,
+    widgets::{Cell as RatatuiCell, Row as RatatuiRow},
+};
 use vct_core::analysis::AnalysisData;
 use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
@@ -125,25 +130,6 @@ impl AnalysisUiState {
             .retain(|row| row.total_lines() != 0 || row.total_calls() != 0);
         self.sort.apply(&mut self.rows);
         self.totals = AnalysisRow::default();
-        let fingerprints: Vec<_> = self
-            .rows
-            .iter()
-            .map(|row| {
-                (
-                    row.model.clone(),
-                    (
-                        row.edit_lines,
-                        row.read_lines,
-                        row.write_lines,
-                        row.bash_count,
-                        row.edit_count,
-                        row.read_count,
-                        row.todo_write_count,
-                        row.write_count,
-                    ),
-                )
-            })
-            .collect();
         for row in &self.rows {
             self.totals.edit_lines += row.edit_lines;
             self.totals.read_lines += row.read_lines;
@@ -154,14 +140,26 @@ impl AnalysisUiState {
             self.totals.todo_write_count += row.todo_write_count;
             self.totals.write_count += row.write_count;
         }
-        let models: Vec<_> = fingerprints
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        self.scroll.sync(previous.as_deref(), &models);
-        self.update_tracker.cleanup(models);
-        for (model, fingerprint) in fingerprints {
-            self.update_tracker.track_update(model, &fingerprint);
+        self.scroll.sync_by(
+            previous.as_deref(),
+            self.rows.iter().map(|row| row.model.as_str()),
+        );
+        self.update_tracker
+            .cleanup_str(self.rows.iter().map(|row| row.model.as_str()));
+        let now = std::time::Instant::now();
+        for row in &self.rows {
+            let fingerprint = (
+                row.edit_lines,
+                row.read_lines,
+                row.write_lines,
+                row.bash_count,
+                row.edit_count,
+                row.read_count,
+                row.todo_write_count,
+                row.write_count,
+            );
+            self.update_tracker
+                .track_update_at(row.model.clone(), &fingerprint, now);
         }
     }
 
@@ -171,18 +169,22 @@ impl AnalysisUiState {
             let previous = self.selected_model();
             self.sort = sort;
             self.sort.apply(&mut self.rows);
-            let models: Vec<_> = self.rows.iter().map(|row| row.model.clone()).collect();
-            self.scroll.sync(previous.as_deref(), &models);
+            self.scroll.sync_by(
+                previous.as_deref(),
+                self.rows.iter().map(|row| row.model.as_str()),
+            );
         }
     }
 
     /// Steps the sort column by `step` places along the header, preserving selection.
     pub(crate) fn step_sort(&mut self, step: isize) {
-        let previous = self.selected_model();
-        self.sort = self.sort.step(step);
-        self.sort.apply(&mut self.rows);
-        let models: Vec<_> = self.rows.iter().map(|row| row.model.clone()).collect();
-        self.scroll.sync(previous.as_deref(), &models);
+        let next = self.sort.step(step);
+        self.set_sort(next);
+    }
+
+    /// Evicts expired row-change highlights as of `now`, returning `true` when any highlight cleared.
+    pub(crate) fn prune_expired(&mut self, now: std::time::Instant) -> bool {
+        self.update_tracker.prune_expired(now)
     }
 
     /// Moves the table selection by `delta`.
@@ -239,46 +241,113 @@ impl AnalysisUiState {
     }
 }
 
-/// Runs one analysis scan of `paths` for `time_range` on `pool` using `ledger`.
-///
-/// # Errors
-///
-/// Returns an error if the scan fails or every candidate source failed to parse; partial failures are logged and kept.
-pub(crate) fn scan_analysis(
-    paths: &vct_core::utils::HelperPaths,
+/// Result of one [`AnalysisScanner::scan`] run.
+pub(crate) enum AnalysisScanOutcome {
+    /// New or changed analysis data to apply to the UI.
+    Updated(Box<AnalysisData>),
+    /// Zero sources changed and every input affecting the analysis summary matched the prior emission.
+    Unchanged,
+}
+
+#[derive(PartialEq)]
+struct AnalysisSnapshotKey {
     time_range: vct_core::models::TimeRange,
     providers: ProvidersConfig,
-    ledger: &mut SessionLedger,
-    pool: &rayon::ThreadPool,
-) -> anyhow::Result<AnalysisData> {
-    let aggregation = pool.install(|| {
-        vct_core::analysis::aggregate_sessions_by_model_from_paths_with_cache(
-            paths, time_range, providers, ledger,
-        )
-    })?;
-    // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every tick.
-    if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
-        log::warn!("failed to save the session ledger: {error:#}");
+    local_date: chrono::NaiveDate,
+    remote_stamps: Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>,
+    total_parsed_sources: usize,
+    ledger_entries: usize,
+    retained: usize,
+    failure_count: usize,
+}
+
+/// Stateful analysis scanner that short-circuits unchanged background refreshes.
+#[derive(Default)]
+pub(crate) struct AnalysisScanner {
+    last_emitted: Option<AnalysisSnapshotKey>,
+}
+
+impl AnalysisScanner {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
-    if aggregation.diagnostics.all_failed() {
-        let first = aggregation
-            .diagnostics
-            .failures
-            .first()
-            .map(|failure| failure.error.as_str())
-            .unwrap_or("unknown source failure");
-        anyhow::bail!(
-            "failed to parse all {} analysis sources: {first}",
-            aggregation.diagnostics.candidates
-        );
+
+    /// Runs one analysis scan of `paths` for `time_range` on `pool` using `ledger`, returning [`AnalysisScanOutcome::Unchanged`] when nothing affecting the summary changed since the previous emission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or every candidate source failed to parse; partial failures are logged and kept.
+    pub(crate) fn scan(
+        &mut self,
+        paths: &vct_core::utils::HelperPaths,
+        time_range: vct_core::models::TimeRange,
+        providers: ProvidersConfig,
+        ledger: &mut SessionLedger,
+        pool: &rayon::ThreadPool,
+    ) -> anyhow::Result<AnalysisScanOutcome> {
+        let local_date = chrono::Local::now().date_naive();
+        let remote_before = remote_snapshot_stamps(&paths.cache_dir);
+        let aggregation = match pool.install(|| {
+            vct_core::analysis::aggregate_sessions_by_model_from_paths_with_cache(
+                paths, time_range, providers, ledger,
+            )
+        }) {
+            Ok(aggregation) => aggregation,
+            Err(error) => {
+                self.last_emitted = None;
+                return Err(error);
+            }
+        };
+        let pre_save_stats = ledger.stats();
+        // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every tick.
+        if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
+            log::warn!("failed to save the session ledger: {error:#}");
+        }
+        if aggregation.diagnostics.all_failed() {
+            self.last_emitted = None;
+            let first = aggregation
+                .diagnostics
+                .failures
+                .first()
+                .map(|failure| failure.error.as_str())
+                .unwrap_or("unknown source failure");
+            anyhow::bail!(
+                "failed to parse all {} analysis sources: {first}",
+                aggregation.diagnostics.candidates
+            );
+        }
+        if aggregation.diagnostics.partially_failed() {
+            log::warn!(
+                "analysis refresh kept partial data after {} source failures",
+                aggregation.diagnostics.failures.len()
+            );
+        }
+
+        let post_save_stats = ledger.stats();
+        let remote_after = remote_snapshot_stamps(&paths.cache_dir);
+        let snapshot_stable =
+            remote_before == remote_after && pre_save_stats.entries == post_save_stats.entries;
+        let key = AnalysisSnapshotKey {
+            time_range,
+            providers,
+            local_date,
+            remote_stamps: remote_before,
+            total_parsed_sources: pre_save_stats.total_parsed_sources,
+            ledger_entries: pre_save_stats.entries,
+            retained: pre_save_stats.retained,
+            failure_count: aggregation.diagnostics.failures.len(),
+        };
+        if pre_save_stats.parsed_sources == 0
+            && snapshot_stable
+            && self.last_emitted.as_ref() == Some(&key)
+        {
+            return Ok(AnalysisScanOutcome::Unchanged);
+        }
+
+        // Never cache a key when remote snapshots or concurrent ledger saves shifted mid-scan.
+        self.last_emitted = snapshot_stable.then_some(key);
+        Ok(AnalysisScanOutcome::Updated(Box::new(aggregation.data)))
     }
-    if aggregation.diagnostics.partially_failed() {
-        log::warn!(
-            "analysis refresh kept partial data after {} source failures",
-            aggregation.diagnostics.failures.len()
-        );
-    }
-    Ok(aggregation.data)
 }
 
 const ANALYSIS_NUMERIC_COLS: [ColumnSpec; 8] = [
@@ -385,6 +454,21 @@ pub(crate) fn layout_analysis_columns(inner: u16) -> AnalysisTableColumns {
     }
 }
 
+/// Formats one numeric analysis column (`0..8`) for `row` without allocating dropped columns.
+pub(crate) fn format_analysis_column(row: &AnalysisRow, col: usize) -> String {
+    match col {
+        0 => format_compact(row.edit_lines as i64),
+        1 => format_compact(row.read_lines as i64),
+        2 => format_compact(row.write_lines as i64),
+        3 => format_compact(row.bash_count as i64),
+        4 => format_compact(row.edit_count as i64),
+        5 => format_compact(row.read_count as i64),
+        6 => format_compact(row.todo_write_count as i64),
+        7 => format_compact(row.write_count as i64),
+        _ => String::new(),
+    }
+}
+
 /// Builds one formatted analysis table row, prepending `prefix` (such as `"▸ "` or `"▾ "`) to the model name.
 pub(crate) fn build_analysis_table_row(
     row: &AnalysisRow,
@@ -398,20 +482,21 @@ pub(crate) fn build_analysis_table_row(
     } else {
         Style::default()
     };
-    let all = [
-        format_compact(row.edit_lines as i64),
-        format_compact(row.read_lines as i64),
-        format_compact(row.write_lines as i64),
-        format_compact(row.bash_count as i64),
-        format_compact(row.edit_count as i64),
-        format_compact(row.read_count as i64),
-        format_compact(row.todo_write_count as i64),
-        format_compact(row.write_count as i64),
-    ];
-    let mut cells = Vec::with_capacity(cols.header.len());
-    cells.push(format!("{prefix}{}", row.model));
-    cells.extend(cols.kept.iter().map(|&i| all[i].clone()));
-    styled_row(cells, style, 1)
+    let mut cells: Vec<RatatuiCell<'static>> = Vec::with_capacity(cols.header.len());
+    let model = if prefix.is_empty() {
+        row.model.clone()
+    } else {
+        format!("{prefix}{}", row.model)
+    };
+    cells.push(RatatuiCell::from(
+        Text::from(model).alignment(Alignment::Left),
+    ));
+    for &i in &cols.kept {
+        cells.push(RatatuiCell::from(
+            Text::from(format_analysis_column(row, i)).alignment(Alignment::Right),
+        ));
+    }
+    RatatuiRow::new(cells).style(style)
 }
 
 /// Builds the structured sections for one analysis row's `Details` panel.
@@ -611,5 +696,60 @@ mod tests {
         assert!(screen.contains("1,700 (50.0%)"), "got:\n{screen}");
         assert!(screen.contains("File Operations"), "got:\n{screen}");
         assert!(screen.contains("~12/op"), "got:\n{screen}");
+    }
+
+    #[test]
+    fn analysis_scanner_short_circuits_unchanged_refreshes_and_invalidates_on_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vct_core::utils::resolve_paths_from_home(dir.path());
+        let project = paths.claude_session_dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = project.join("session.jsonl");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/sessions/claude_code.jsonl");
+        std::fs::copy(fixture, &session).unwrap();
+
+        let pool = vct_core::scan::build_scan_pool(1).unwrap();
+        let mut ledger = SessionLedger::new();
+        let mut scanner = AnalysisScanner::new();
+        let providers = ProvidersConfig::default();
+
+        let first = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(first, AnalysisScanOutcome::Updated(_)));
+
+        let second = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(
+            matches!(second, AnalysisScanOutcome::Unchanged),
+            "identical refresh with zero changed sources must short-circuit"
+        );
+
+        let mut toggled = providers;
+        toggled.claude = false;
+        let providers_changed = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                toggled,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(providers_changed, AnalysisScanOutcome::Updated(_)));
     }
 }

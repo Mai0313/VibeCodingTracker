@@ -11,10 +11,10 @@ mod text;
 pub use averages::*;
 pub use interactive::UsageFrameBenchmark;
 pub(crate) use interactive::{
-    QuotaRuntime, QuotaSnapshots, QuotaView, UsageRefreshPayload, UsageScanner, UsageSort,
+    QuotaRuntime, QuotaView, UsageRefreshPayload, UsageScanOutcome, UsageScanner, UsageSort,
     UsageTableColumns, UsageUiState, build_usage_detail_sections, build_usage_table_row,
-    layout_usage_columns, provider_digest, provider_share_bar, render_provider_pane,
-    render_provider_panel,
+    format_usage_column, layout_usage_columns, provider_digest, provider_share_bar,
+    render_provider_pane, render_provider_panel, share_spans,
 };
 #[cfg(test)]
 pub(crate) use quota_tab::draw_quota_tab;

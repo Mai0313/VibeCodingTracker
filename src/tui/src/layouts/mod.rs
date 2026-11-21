@@ -5,7 +5,7 @@
 use crate::display::analysis::{AnalysisRow, AnalysisUiState};
 use crate::display::app::Tab;
 use crate::display::common::provider_tui_color;
-use crate::display::common::table::title_line;
+use crate::display::common::table::{repeated_bar, title_line};
 use crate::display::common::theme::theme;
 use crate::display::common::tui::{MouseInput, render_loading};
 use crate::display::settings::{SettingsOutcome, SettingsUiState};
@@ -425,11 +425,8 @@ pub(crate) fn bar_spans(
     }
     filled = filled.min(width);
     [
-        Span::styled(filled_ch.to_string().repeat(filled), filled_style),
-        Span::styled(
-            empty_ch.to_string().repeat(width - filled),
-            theme().border(),
-        ),
+        Span::styled(repeated_bar(filled_ch, filled), filled_style),
+        Span::styled(repeated_bar(empty_ch, width - filled), theme().border()),
     ]
 }
 

@@ -3,12 +3,14 @@
 //! [`UsageScanner`] caches one LiteLLM pricing map per UTC day across scans. [`UsageUiState`] retains the rendered model rows and totals between frames so resizes repaint without re-scanning, and highlights rows whose token counts changed.
 
 use crate::display::common::table::{
-    ColumnSpec, DetailItem, DetailSection, TableChrome, aligned_cells, create_controls_with_status,
+    ColumnSpec, DetailItem, DetailSection, TableChrome, create_controls_with_status,
     create_provider_row, create_ratatui_table, fit_columns, frame_layout, render_detail_panel,
-    render_scrollable_table, render_too_small,
+    render_scrollable_table, render_too_small, repeated_bar,
 };
 use crate::display::common::theme::theme;
-use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
+use crate::display::common::tui::{
+    LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker, remote_snapshot_stamps,
+};
 use crate::display::common::{ProviderTotal, provider_tui_color};
 use crate::display::usage::averages::{
     ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
@@ -17,15 +19,15 @@ use crate::display::usage::averages::{
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, TestBackend},
-    layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::{Color as RatatuiColor, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell as RatatuiCell, Clear, Paragraph, Row as RatatuiRow,
     },
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
@@ -37,7 +39,7 @@ use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::quota::{
     ANTIGRAVITY_LOGIN_HINT, AntigravityState, CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT,
     COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState, CodexState, CopilotState, CursorState,
-    GROK_LOGIN_HINT, GrokState, antigravity_quota_present, load_antigravity_cache,
+    GROK_LOGIN_HINT, GrokState, QuotaShutdown, antigravity_quota_present, load_antigravity_cache,
     load_claude_cache, load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache,
     save_antigravity_cache, save_claude_cache, save_codex_cache, save_copilot_cache,
     save_cursor_cache, save_grok_cache, spawn_quota_worker,
@@ -166,12 +168,12 @@ pub(crate) struct UsageRefreshPayload {
 }
 
 struct QuotaShutdownGuard {
-    shutdown: Arc<AtomicBool>,
+    shutdown: Arc<QuotaShutdown>,
 }
 
 impl Drop for QuotaShutdownGuard {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown.signal();
     }
 }
 
@@ -184,10 +186,36 @@ pub(crate) struct QuotaRuntime {
     pub(crate) cursor: Arc<Mutex<CursorQuotaSnapshot>>,
     pub(crate) grok: Arc<Mutex<GrokQuotaSnapshot>>,
     pub(crate) antigravity: Arc<Mutex<AntigravityQuotaSnapshot>>,
+    revision: Arc<AtomicU64>,
+    cached: Option<(u64, QuotaSnapshots)>,
     _guard: QuotaShutdownGuard,
 }
 
 impl QuotaRuntime {
+    /// Returns the monotonic snapshot revision bumped whenever any provider worker updates its snapshot.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Returns a [`QuotaView`] backed by a cached clone refreshed only when [`Self::revision`] changes.
+    pub(crate) fn view_cached(&mut self) -> QuotaView<'_> {
+        let rev = self.revision();
+        if self.cached.as_ref().is_none_or(|(r, _)| *r != rev) {
+            self.cached = Some((rev, QuotaSnapshots::read(self)));
+        }
+        let (_, snapshots) = self.cached.as_ref().expect("populated above");
+        QuotaView {
+            claude: &snapshots.claude,
+            codex: &snapshots.codex,
+            copilot: &snapshots.copilot,
+            cursor: &snapshots.cursor,
+            grok: &snapshots.grok,
+            antigravity: &snapshots.antigravity,
+            present: self.present,
+            band_enabled: self.band_enabled,
+        }
+    }
+
     pub(crate) fn start(
         quota_panels: &[String],
         providers: ProvidersConfig,
@@ -207,7 +235,8 @@ impl QuotaRuntime {
         present.grok &= providers.grok && panel_on("grok");
         present.antigravity &= providers.antigravity && panel_on("antigravity");
 
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(QuotaShutdown::new());
+        let revision = Arc::new(AtomicU64::new(1));
         let claude = Arc::new(Mutex::new(
             present
                 .claude
@@ -251,113 +280,151 @@ impl QuotaRuntime {
                 .unwrap_or_default(),
         ));
 
-        if present.claude
-            || present.codex
-            || present.copilot
-            || present.cursor
-            || present.grok
-            || present.antigravity
-        {
-            match vct_core::quota::http::build_client() {
-                Ok(client) => {
-                    if present.claude {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&claude));
-                        let mut state = ClaudeState::default();
-                        spawn_quota_worker(
-                            "claude",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_claude_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.codex {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&codex));
-                        let mut state = CodexState::default();
-                        spawn_quota_worker(
-                            "codex",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_codex_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.copilot {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&copilot));
-                        let mut state = CopilotState;
-                        spawn_quota_worker(
-                            "copilot",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_copilot_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.cursor {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&cursor));
-                        let mut state = CursorState;
-                        spawn_quota_worker(
-                            "cursor",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_cursor_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.grok {
-                        let (client, shutdown, shared) =
-                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&grok));
-                        let mut state = GrokState::default();
-                        spawn_quota_worker(
-                            "grok",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_grok_cache(snapshot);
-                            },
-                        );
-                    }
-                    if present.antigravity {
-                        let (client, shutdown, shared) = (
-                            client.clone(),
-                            Arc::clone(&shutdown),
-                            Arc::clone(&antigravity),
-                        );
-                        let mut state = AntigravityState::default();
-                        spawn_quota_worker(
-                            "antigravity",
-                            shared,
-                            shutdown,
-                            quota_refresh_secs,
-                            move || state.resolve(&client),
-                            |snapshot| {
-                                let _ = save_antigravity_cache(snapshot);
-                            },
-                        );
-                    }
+        if present.count() > 0 {
+            // Move HTTP client construction (Tokio + OS root CA loading) and worker spawning off the UI thread so cached cards draw immediately.
+            let starter_shutdown = Arc::clone(&shutdown);
+            let starter_revision = Arc::clone(&revision);
+            let starter_claude = Arc::clone(&claude);
+            let starter_codex = Arc::clone(&codex);
+            let starter_copilot = Arc::clone(&copilot);
+            let starter_cursor = Arc::clone(&cursor);
+            let starter_grok = Arc::clone(&grok);
+            let starter_antigravity = Arc::clone(&antigravity);
+            std::thread::spawn(move || {
+                if starter_shutdown.is_shutdown() {
+                    return;
                 }
-                Err(error) => {
-                    log::warn!("quota workers disabled: failed to build HTTP client: {error}")
+                let client = match vct_core::quota::http::build_client() {
+                    Ok(client) => client,
+                    Err(error) => {
+                        log::warn!("quota workers disabled: failed to build HTTP client: {error}");
+                        return;
+                    }
+                };
+                if starter_shutdown.is_shutdown() {
+                    return;
                 }
-            }
+                if present.claude {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_claude,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = ClaudeState::default();
+                    spawn_quota_worker(
+                        "claude",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_claude_cache(snapshot);
+                        },
+                    );
+                }
+                if present.codex {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_codex,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = CodexState::default();
+                    spawn_quota_worker(
+                        "codex",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_codex_cache(snapshot);
+                        },
+                    );
+                }
+                if present.copilot {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_copilot,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = CopilotState::default();
+                    spawn_quota_worker(
+                        "copilot",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_copilot_cache(snapshot);
+                        },
+                    );
+                }
+                if present.cursor {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_cursor,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = CursorState::default();
+                    spawn_quota_worker(
+                        "cursor",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_cursor_cache(snapshot);
+                        },
+                    );
+                }
+                if present.grok {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_grok,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = GrokState::default();
+                    spawn_quota_worker(
+                        "grok",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_grok_cache(snapshot);
+                        },
+                    );
+                }
+                if present.antigravity {
+                    let (client, shutdown, shared, rev) = (
+                        client.clone(),
+                        Arc::clone(&starter_shutdown),
+                        starter_antigravity,
+                        Arc::clone(&starter_revision),
+                    );
+                    let mut state = AntigravityState::default();
+                    spawn_quota_worker(
+                        "antigravity",
+                        shared,
+                        shutdown,
+                        quota_refresh_secs,
+                        move || state.resolve(&client),
+                        move |snapshot| {
+                            rev.fetch_add(1, Ordering::Release);
+                            let _ = save_antigravity_cache(snapshot);
+                        },
+                    );
+                }
+            });
         }
 
         Self {
@@ -369,6 +436,8 @@ impl QuotaRuntime {
             cursor,
             grok,
             antigravity,
+            revision,
+            cached: None,
             _guard: QuotaShutdownGuard { shutdown },
         }
     }
@@ -441,9 +510,9 @@ impl UsageSort {
     }
 }
 
-/// A copy of every quota worker's latest snapshot, taken once per frame.
+/// A copy of every quota worker's latest snapshot, refreshed only when [`QuotaRuntime::revision`] advances.
 #[derive(Default)]
-pub(crate) struct QuotaSnapshots {
+struct QuotaSnapshots {
     claude: ClaudeQuotaSnapshot,
     codex: CodexQuotaSnapshot,
     copilot: CopilotQuotaSnapshot,
@@ -454,7 +523,7 @@ pub(crate) struct QuotaSnapshots {
 
 impl QuotaSnapshots {
     /// Copies the current snapshots out of `runtime`.
-    pub(crate) fn read(runtime: &QuotaRuntime) -> Self {
+    fn read(runtime: &QuotaRuntime) -> Self {
         fn copy<T: Clone + Default>(shared: &Mutex<T>) -> T {
             shared.lock().map(|value| value.clone()).unwrap_or_default()
         }
@@ -465,20 +534,6 @@ impl QuotaSnapshots {
             cursor: copy(&runtime.cursor),
             grok: copy(&runtime.grok),
             antigravity: copy(&runtime.antigravity),
-        }
-    }
-
-    /// Returns a [`QuotaView`] borrowing these snapshots and `runtime`'s presence flags.
-    pub(crate) fn view(&self, runtime: &QuotaRuntime) -> QuotaView<'_> {
-        QuotaView {
-            claude: &self.claude,
-            codex: &self.codex,
-            copilot: &self.copilot,
-            cursor: &self.cursor,
-            grok: &self.grok,
-            antigravity: &self.antigravity,
-            present: runtime.present,
-            band_enabled: runtime.band_enabled,
         }
     }
 }
@@ -493,10 +548,13 @@ pub(crate) struct UsageUiState {
     scroll: ScrollState,
     merge_enabled: bool,
     sort: UsageSort,
+    rows_sort: Option<UsageSort>,
+    merged_rows_sort: Option<UsageSort>,
 }
 
 impl UsageUiState {
     pub(crate) fn new(merge_enabled: bool) -> Self {
+        let sort = UsageSort::default();
         Self {
             rows: Vec::new(),
             merged_rows: Vec::new(),
@@ -505,7 +563,9 @@ impl UsageUiState {
             update_tracker: UpdateTracker::new(MAX_TRACKED_ROWS, 1000),
             scroll: ScrollState::new(),
             merge_enabled,
-            sort: UsageSort::default(),
+            sort,
+            rows_sort: Some(sort),
+            merged_rows_sort: Some(sort),
         }
     }
 
@@ -521,37 +581,64 @@ impl UsageUiState {
             .map(|row| row.model.clone())
     }
 
+    /// Re-syncs the selection index against the active rows without touching highlight state.
+    fn sync_selection(&mut self, previous: Option<&str>) {
+        let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
+        self.scroll
+            .sync_by(previous, rows.iter().map(|row| row.model.as_str()));
+    }
+
+    /// Sorts only the active row slice if its sort order lags `self.sort`.
+    fn ensure_active_sorted(&mut self) {
+        if self.merge_enabled {
+            if self.merged_rows_sort != Some(self.sort) {
+                self.sort.apply(&mut self.merged_rows);
+                self.merged_rows_sort = Some(self.sort);
+            }
+        } else if self.rows_sort != Some(self.sort) {
+            self.sort.apply(&mut self.rows);
+            self.rows_sort = Some(self.sort);
+        }
+    }
+
     /// Re-syncs selection and highlight tracking to the active rows; flashes differences only when `changed` is `true`.
     fn resync(&mut self, previous: Option<String>, changed: bool) {
-        let fingerprints: Vec<_> = self
-            .view()
-            .iter()
-            .map(|row| (row.model.clone(), row_fingerprint(row)))
-            .collect();
-        let models: Vec<_> = fingerprints
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        self.scroll.sync(previous.as_deref(), &models);
-        self.update_tracker.cleanup(models);
-        for (model, fingerprint) in fingerprints {
+        let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
+        self.scroll.sync_by(
+            previous.as_deref(),
+            rows.iter().map(|row| row.model.as_str()),
+        );
+        self.update_tracker
+            .cleanup_str(rows.iter().map(|row| row.model.as_str()));
+        let now = std::time::Instant::now();
+        for row in rows {
+            let fingerprint = row_fingerprint(row);
             if changed {
-                self.update_tracker.track_update(model, &fingerprint);
+                self.update_tracker
+                    .track_update_at(row.model.clone(), &fingerprint, now);
             } else {
-                self.update_tracker.prime(model, &fingerprint);
+                self.update_tracker.prime(row.model.clone(), &fingerprint);
             }
         }
     }
 
-    /// Replaces the cached scan data with `payload`, re-sorts, and flashes changed rows.
+    /// Replaces the cached scan data with `payload`, sorts the active list, and flashes changed rows.
     pub(crate) fn apply(&mut self, payload: UsageRefreshPayload) {
         let previous = self.selected_model();
         self.rows = payload.rows;
         self.merged_rows = payload.merged_rows;
         self.totals = payload.totals;
         self.provider_totals = payload.provider_totals;
-        self.sort.apply(&mut self.rows);
-        self.sort.apply(&mut self.merged_rows);
+        // Sort only the active list immediately and clear the inactive list's cached sort so toggling sorts it lazily.
+        if self.merge_enabled {
+            self.sort.apply(&mut self.merged_rows);
+            self.merged_rows_sort = Some(self.sort);
+            self.rows_sort = None;
+        } else {
+            self.sort.apply(&mut self.rows);
+            self.rows_sort = Some(self.sort);
+            self.merged_rows_sort = None;
+        }
         self.resync(previous, true);
     }
 
@@ -560,6 +647,7 @@ impl UsageUiState {
         if enabled != self.merge_enabled {
             let previous = self.selected_model();
             self.merge_enabled = enabled;
+            self.ensure_active_sorted();
             self.resync(previous, false);
         }
     }
@@ -569,19 +657,20 @@ impl UsageUiState {
         if sort != self.sort {
             let previous = self.selected_model();
             self.sort = sort;
-            self.sort.apply(&mut self.rows);
-            self.sort.apply(&mut self.merged_rows);
-            self.resync(previous, false);
+            self.ensure_active_sorted();
+            self.sync_selection(previous.as_deref());
         }
     }
 
     /// Moves the sort one column left or right (`←` / `→`).
     pub(crate) fn step_sort(&mut self, step: isize) {
-        let previous = self.selected_model();
-        self.sort = self.sort.step(step);
-        self.sort.apply(&mut self.rows);
-        self.sort.apply(&mut self.merged_rows);
-        self.resync(previous, false);
+        let next = self.sort.step(step);
+        self.set_sort(next);
+    }
+
+    /// Evicts expired row-change highlights as of `now`, returning `true` when any highlight cleared.
+    pub(crate) fn prune_expired(&mut self, now: std::time::Instant) -> bool {
+        self.update_tracker.prune_expired(now)
     }
 
     /// Moves the selection.
@@ -663,11 +752,33 @@ impl UsageUiState {
     }
 }
 
+/// Result of one [`UsageScanner::scan`] run.
+pub(crate) enum UsageScanOutcome {
+    /// New or changed priced usage data to apply to the UI.
+    Updated(Box<UsageRefreshPayload>),
+    /// Zero sources changed and every input affecting the priced summary matched the prior emission.
+    Unchanged,
+}
+
+#[derive(PartialEq)]
+struct UsageSnapshotKey {
+    time_range: vct_core::models::TimeRange,
+    providers: ProvidersConfig,
+    pricing_date: Option<chrono::NaiveDate>,
+    local_date: chrono::NaiveDate,
+    remote_stamps: Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>,
+    total_parsed_sources: usize,
+    ledger_entries: usize,
+    retained: usize,
+    failure_count: usize,
+}
+
 /// Stateful usage scanner that caches one pricing map per UTC day across refreshes.
 pub(crate) struct UsageScanner {
     pricing: ModelPricingMap,
     scan_options: vct_core::usage::UsageScanOptions,
     loaded_pricing_utc_date: Option<chrono::NaiveDate>,
+    last_emitted: Option<UsageSnapshotKey>,
 }
 
 impl UsageScanner {
@@ -676,10 +787,11 @@ impl UsageScanner {
             pricing: ModelPricingMap::new(HashMap::new()),
             scan_options: vct_core::usage::UsageScanOptions::default(),
             loaded_pricing_utc_date: None,
+            last_emitted: None,
         }
     }
 
-    /// Scans `paths` for `time_range` and prices the result.
+    /// Scans `paths` for `time_range` and prices the result, returning [`UsageScanOutcome::Unchanged`] when nothing affecting the displayed summary changed since the previous emission.
     ///
     /// # Errors
     ///
@@ -691,7 +803,7 @@ impl UsageScanner {
         providers: ProvidersConfig,
         ledger: &mut SessionLedger,
         pool: &rayon::ThreadPool,
-    ) -> anyhow::Result<UsageRefreshPayload> {
+    ) -> anyhow::Result<UsageScanOutcome> {
         let today = chrono::Utc::now().date_naive();
         if self.loaded_pricing_utc_date != Some(today) {
             match fetch_model_pricing() {
@@ -707,7 +819,9 @@ impl UsageScanner {
             }
         }
 
-        let collection = pool.install(|| {
+        let local_date = chrono::Local::now().date_naive();
+        let remote_before = remote_snapshot_stamps(&paths.cache_dir);
+        let collection = match pool.install(|| {
             vct_core::usage::aggregate_usage_from_paths_with_cache_opts(
                 paths,
                 time_range,
@@ -715,12 +829,20 @@ impl UsageScanner {
                 ledger,
                 &self.scan_options,
             )
-        })?;
+        }) {
+            Ok(collection) => collection,
+            Err(error) => {
+                self.last_emitted = None;
+                return Err(error);
+            }
+        };
+        let pre_save_stats = ledger.stats();
         // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every refresh.
         if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
             log::warn!("failed to save the session ledger: {error:#}");
         }
         if collection.diagnostics.all_failed() {
+            self.last_emitted = None;
             let first = collection
                 .diagnostics
                 .failures
@@ -739,6 +861,28 @@ impl UsageScanner {
             );
         }
 
+        let post_save_stats = ledger.stats();
+        let remote_after = remote_snapshot_stamps(&paths.cache_dir);
+        let snapshot_stable =
+            remote_before == remote_after && pre_save_stats.entries == post_save_stats.entries;
+        let key = UsageSnapshotKey {
+            time_range,
+            providers,
+            pricing_date: self.loaded_pricing_utc_date,
+            local_date,
+            remote_stamps: remote_before,
+            total_parsed_sources: pre_save_stats.total_parsed_sources,
+            ledger_entries: pre_save_stats.entries,
+            retained: pre_save_stats.retained,
+            failure_count: collection.diagnostics.failures.len(),
+        };
+        if pre_save_stats.parsed_sources == 0
+            && snapshot_stable
+            && self.last_emitted.as_ref() == Some(&key)
+        {
+            return Ok(UsageScanOutcome::Unchanged);
+        }
+
         let mut summary = build_usage_summary(
             &collection.data.models,
             &collection.data.per_provider,
@@ -748,12 +892,14 @@ impl UsageScanner {
         );
         summary.rows.retain(|row| row.total != 0 || row.cost != 0.0);
         let merged_rows = merge_rows_by_base_model(&summary.rows);
-        Ok(UsageRefreshPayload {
+        // Never cache a key when remote snapshots or concurrent ledger saves shifted mid-scan.
+        self.last_emitted = snapshot_stable.then_some(key);
+        Ok(UsageScanOutcome::Updated(Box::new(UsageRefreshPayload {
             rows: summary.rows,
             merged_rows,
             totals: summary.totals,
             provider_totals: summary.provider_totals,
-        })
+        })))
     }
 }
 
@@ -893,6 +1039,39 @@ pub(crate) fn layout_usage_columns(inner: u16) -> UsageTableColumns {
     }
 }
 
+/// Formats one numeric usage column (`0..6`) for `row` without allocating dropped columns.
+pub(crate) fn format_usage_column(row: &UsageRow, col: usize) -> String {
+    match col {
+        0 => format_compact(row.input_tokens),
+        1 => format_compact(row.output_with_reasoning()),
+        2 => format_compact(row.cache_read),
+        3 => format_compact(row.cache_creation),
+        4 => format_compact(row.total),
+        5 => format_cost(row.cost),
+        _ => String::new(),
+    }
+}
+
+/// Builds the two-span share bar + percentage for `value / total` fitted to `width` columns, using static bar slices.
+pub(crate) fn share_spans(value: i64, total: i64, width: u16) -> Option<[Span<'static>; 2]> {
+    if total <= 0 || width < 6 {
+        return None;
+    }
+    let theme = theme();
+    let share = (value as f64 / total as f64).clamp(0.0, 1.0);
+    // Reserve 6 columns for "100.0%".
+    let bar_w = usize::from(width - 6);
+    let filled = ((share * bar_w as f64).round() as usize).min(bar_w);
+    let pad = bar_w - filled;
+    Some([
+        Span::styled(repeated_bar('━', filled), theme.accent()),
+        Span::styled(
+            format!("{}{:>5.1}%", repeated_bar(' ', pad), share * 100.0),
+            theme.dim(),
+        ),
+    ])
+}
+
 /// Builds one formatted model row for the usage table, prepending `prefix` to the model name.
 pub(crate) fn build_usage_table_row(
     row: &UsageRow,
@@ -907,26 +1086,26 @@ pub(crate) fn build_usage_table_row(
     } else {
         Style::default()
     };
-    let all = [
-        format_compact(row.input_tokens),
-        format_compact(row.output_with_reasoning()),
-        format_compact(row.cache_read),
-        format_compact(row.cache_creation),
-        format_compact(row.total),
-        format_cost(row.cost),
-    ];
-    let mut cells = Vec::with_capacity(cols.header.len());
-    cells.push(format!("{prefix}{}", row.model));
-    cells.extend(cols.kept.iter().map(|&i| all[i].clone()));
-    let mut cells = aligned_cells(cells, 1);
+    let mut cells: Vec<RatatuiCell<'static>> = Vec::with_capacity(cols.header.len());
+    let model = if prefix.is_empty() {
+        row.model.clone()
+    } else {
+        format!("{prefix}{}", row.model)
+    };
+    cells.push(RatatuiCell::from(
+        Text::from(model).alignment(Alignment::Left),
+    ));
+    for &i in &cols.kept {
+        cells.push(RatatuiCell::from(
+            Text::from(format_usage_column(row, i)).alignment(Alignment::Right),
+        ));
+    }
     if cols.share_w > 0 {
-        let share = share_cell(row.total, total_tokens, cols.share_w);
-        let bar: String = share.chars().take_while(|c| *c == '━').collect();
-        let rest = share[bar.len()..].to_string();
-        cells.push(RatatuiCell::from(Line::from(vec![
-            Span::styled(bar, theme.accent()),
-            Span::styled(rest, theme.dim()),
-        ])));
+        if let Some(spans) = share_spans(row.total, total_tokens, cols.share_w) {
+            cells.push(RatatuiCell::from(Line::from(Vec::from(spans))));
+        } else {
+            cells.push(RatatuiCell::from(""));
+        }
     }
     RatatuiRow::new(cells).style(style)
 }
@@ -1333,8 +1512,11 @@ fn bar_spans(pct: f64, cells: usize) -> [Span<'static>; 2] {
     let theme = theme();
     let filled = ((pct / (100.0 / cells as f64)).ceil() as i64).clamp(0, cells as i64) as usize;
     [
-        Span::styled("━".repeat(filled), Style::default().fg(theme.gauge(pct))),
-        Span::styled("━".repeat(cells - filled), theme.border()),
+        Span::styled(
+            repeated_bar('━', filled),
+            Style::default().fg(theme.gauge(pct)),
+        ),
+        Span::styled(repeated_bar('━', cells - filled), theme.border()),
     ]
 }
 
@@ -1352,7 +1534,7 @@ pub(crate) fn provider_share_bar(
     let total: i64 = segments.iter().map(|(_, t)| *t).sum();
 
     if width == 0 || total <= 0 {
-        return Line::from(Span::styled("░".repeat(width), theme().border()));
+        return Line::from(Span::styled(repeated_bar('░', width), theme().border()));
     }
 
     // Largest-remainder apportionment ensures segment widths sum to exactly `width`.
@@ -1381,7 +1563,7 @@ pub(crate) fn provider_share_bar(
         .enumerate()
         .filter_map(|(i, (color, _))| {
             let w = widths[i];
-            (w > 0).then(|| Span::styled("█".repeat(w), Style::default().fg(*color)))
+            (w > 0).then(|| Span::styled(repeated_bar('█', w), Style::default().fg(*color)))
         })
         .collect();
     Line::from(spans)
@@ -1449,6 +1631,7 @@ fn grid_cells(spec: &GridSpec, band: Rect, n: usize) -> Vec<Rect> {
 }
 
 /// Formats `value / total` as a bar and percentage fitted to `width` columns (empty if `total <= 0` or `width < 6`).
+#[cfg(test)]
 fn share_cell(value: i64, total: i64, width: u16) -> String {
     if total <= 0 || width < 6 {
         return String::new();
@@ -1456,10 +1639,11 @@ fn share_cell(value: i64, total: i64, width: u16) -> String {
     let share = (value as f64 / total as f64).clamp(0.0, 1.0);
     // Reserve 6 columns for "100.0%".
     let bar_w = usize::from(width - 6);
-    let filled = (share * bar_w as f64).round() as usize;
+    let filled = ((share * bar_w as f64).round() as usize).min(bar_w);
     format!(
-        "{:<bar_w$}{:>5.1}%",
-        "━".repeat(filled.min(bar_w)),
+        "{}{}{:>5.1}%",
+        repeated_bar('━', filled),
+        repeated_bar(' ', bar_w - filled),
         share * 100.0
     )
 }
@@ -1649,8 +1833,9 @@ pub(crate) fn fit_cards(
 ) -> (Vec<(Rect, QuotaCard)>, usize) {
     // Measure height at `base.min_w` first, then compute the final cell widths before building the rendered cards so line fitting matches the drawn cell.
     let present = quota.present.count();
+    let initial_cards = collect_cards(quota, now, base.min_w, wide);
     // Grow card height to the tallest card only if all present providers still fit.
-    let tallest = collect_cards(quota, now, base.min_w, wide)
+    let tallest = initial_cards
         .iter()
         .map(|card| card.lines.len())
         .max()
@@ -1669,7 +1854,11 @@ pub(crate) fn fit_cards(
     let fits = present.min(cols.saturating_mul(rows_that_fit));
     let cells = grid_cells(spec, area, fits);
     let card_w = cells.first().map_or(spec.min_w, |cell| cell.width);
-    let cards = collect_cards(quota, now, card_w, wide);
+    let cards = if card_w == base.min_w {
+        initial_cards
+    } else {
+        collect_cards(quota, now, card_w, wide)
+    };
     (cells.into_iter().zip(cards).collect(), present - fits)
 }
 
@@ -1830,6 +2019,7 @@ fn render_provider_box(
 }
 
 /// Pre-wrapped quota card lines ordered most-important-first; excess lines are counted by [`render_quota_card_with_border`].
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct QuotaCard {
     title: &'static str,
     color: RatatuiColor,
@@ -1844,14 +2034,14 @@ fn card_inner_w(width: u16) -> u16 {
 
 #[cfg(test)]
 pub(crate) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
-    render_quota_card_with_border(f, area, card, BorderType::Plain);
+    render_quota_card_with_border(f, area, card.clone(), BorderType::Plain);
 }
 
 /// Renders `card` into `area` with `border_type`, placing `+N` (hidden lines) and `LIMIT` flags on the top border.
 pub(crate) fn render_quota_card_with_border(
     f: &mut Frame,
     area: Rect,
-    card: &QuotaCard,
+    mut card: QuotaCard,
     border_type: BorderType,
 ) {
     let capacity = usize::from(area.height.saturating_sub(2));
@@ -1888,8 +2078,8 @@ pub(crate) fn render_quota_card_with_border(
         block = block.title(Line::from(flags).right_aligned());
     }
 
-    let shown = card.lines[..capacity.min(card.lines.len())].to_vec();
-    f.render_widget(Paragraph::new(shown).block(block), area);
+    card.lines.truncate(capacity);
+    f.render_widget(Paragraph::new(card.lines).block(block), area);
 }
 
 /// Truncates `text` to `width` characters, appending `…` when shortened.
@@ -2545,11 +2735,11 @@ mod tests {
 
     #[test]
     fn quota_shutdown_guard_never_waits_and_sets_flag() {
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(QuotaShutdown::new());
         drop(QuotaShutdownGuard {
             shutdown: Arc::clone(&shutdown),
         });
-        assert!(shutdown.load(Ordering::Relaxed));
+        assert!(shutdown.is_shutdown());
     }
 
     #[test]
@@ -3748,5 +3938,105 @@ mod tests {
         assert!(details.contains("claude-sonnet-4-6"), "got:\n{details}");
         assert!(details.contains("Merged from"), "got:\n{details}");
         assert!(details.contains("Cache hit rate"), "got:\n{details}");
+    }
+
+    #[test]
+    fn usage_scanner_short_circuits_unchanged_refreshes_and_invalidates_on_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vct_core::utils::resolve_paths_from_home(dir.path());
+        let project = paths.claude_session_dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = project.join("session.jsonl");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/sessions/claude_code.jsonl");
+        std::fs::copy(fixture, &session).unwrap();
+
+        let pool = vct_core::scan::build_scan_pool(1).unwrap();
+        let mut ledger = SessionLedger::new();
+        let mut scanner = UsageScanner::new();
+        // Pre-stamp today's pricing date so the test stays hermetic without touching network or ~/.vct.
+        scanner.loaded_pricing_utc_date = Some(chrono::Utc::now().date_naive());
+        let providers = ProvidersConfig::default();
+
+        let first = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(first, UsageScanOutcome::Updated(_)));
+
+        let second = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::All,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(
+            matches!(second, UsageScanOutcome::Unchanged),
+            "identical refresh with zero changed sources must short-circuit"
+        );
+
+        let range_changed = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::Daily,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(range_changed, UsageScanOutcome::Updated(_)));
+
+        // Adding a remote snapshot file invalidates the short-circuit even with zero local parses.
+        let remote_sessions = paths
+            .cache_dir
+            .join(vct_core::ledger::REMOTES_DIR_NAME)
+            .join("host-a")
+            .join(vct_core::ledger::LEDGER_DIR_NAME);
+        std::fs::create_dir_all(&remote_sessions).unwrap();
+        std::fs::write(remote_sessions.join("claude.json"), "{}").unwrap();
+        let remote_changed = scanner
+            .scan(
+                &paths,
+                vct_core::models::TimeRange::Daily,
+                providers,
+                &mut ledger,
+                &pool,
+            )
+            .unwrap();
+        assert!(matches!(remote_changed, UsageScanOutcome::Updated(_)));
+    }
+
+    #[test]
+    fn set_sort_then_toggle_merge_sorts_inactive_list() {
+        let row = |model: &str, cost: f64| UsageRow {
+            model: model.to_string(),
+            input_tokens: 10,
+            output_tokens: 10,
+            total: 20,
+            cost,
+            ..Default::default()
+        };
+        let rows = vec![row("z-model", 10.0), row("a-model", 1.0)];
+        let merged_rows = vec![row("z-model", 10.0), row("a-model", 1.0)];
+        let mut ui = UsageUiState::new(false);
+        ui.apply(UsageRefreshPayload {
+            rows,
+            merged_rows,
+            totals: UsageTotals::default(),
+            provider_totals: UsageProviderTotals::default(),
+        });
+        // Switch sort to Model while unmerged, then toggle merge on; merged_rows must sort by Model.
+        ui.set_sort(UsageSort::Model);
+        ui.set_merge(true);
+        let names: Vec<&str> = ui.view().iter().map(|r| r.model.as_str()).collect();
+        assert_eq!(names, vec!["a-model", "z-model"]);
     }
 }

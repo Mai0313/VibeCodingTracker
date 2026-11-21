@@ -15,7 +15,40 @@ use ratatui::{
         Scrollbar, ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
     },
 };
+use std::borrow::Cow;
 use sysinfo::System;
+
+const HEAVY_BARS: &str = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+const LIGHT_BARS: &str = "────────────────────────────────────────────────────────────────";
+const FULL_BLOCKS: &str = "████████████████████████████████████████████████████████████████";
+const SHADE_BLOCKS: &str = "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░";
+const SPACES: &str = "                                                                ";
+
+/// Returns `ch` repeated `count` times without heap allocation for standard bar glyphs up to 64 columns wide.
+pub(crate) fn repeated_bar(ch: char, count: usize) -> Cow<'static, str> {
+    if count == 0 {
+        return Cow::Borrowed("");
+    }
+    let table = match ch {
+        '━' => Some(HEAVY_BARS),
+        '─' => Some(LIGHT_BARS),
+        '█' => Some(FULL_BLOCKS),
+        '░' => Some(SHADE_BLOCKS),
+        ' ' => Some(SPACES),
+        _ => None,
+    };
+    if let Some(table) = table {
+        let bytes = count.saturating_mul(ch.len_utf8());
+        if bytes <= table.len() {
+            return Cow::Borrowed(&table[..bytes]);
+        }
+    }
+    let mut owned = String::with_capacity(count.saturating_mul(ch.len_utf8()));
+    for _ in 0..count {
+        owned.push(ch);
+    }
+    Cow::Owned(owned)
+}
 
 /// Normalizes sysinfo's summed per-core CPU percentage into `[0.0, 100.0]` using `cores` (`sys.cpus().len()`).
 fn normalized_cpu(raw: f32, cores: f32) -> f32 {

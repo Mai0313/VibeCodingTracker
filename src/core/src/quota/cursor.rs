@@ -2,17 +2,19 @@
 //!
 //! Reads the WorkOS session JWT from the Cursor CLI's `auth.json`, synthesizes the `WorkosCursorSessionToken` cookie, and calls `GET /api/usage-summary` with a `cursor-agent/<version>` `User-Agent`.
 //!
-//! `auth.json` is re-read on each tick and never modified; token refresh is left to the Cursor CLI/IDE. An expired JWT `exp` or HTTP 401/403 surfaces [`CURSOR_LOGIN_HINT`].
+//! `auth.json` is cached in memory per mtime and never modified; token refresh is left to the Cursor CLI/IDE. An expired JWT `exp` or HTTP 401/403 surfaces [`CURSOR_LOGIN_HINT`].
 
 use crate::models::{CursorQuotaSnapshot, CursorUsageSummary, QuotaSource, QuotaWindow};
 use crate::quota::http::{detect_cli_version, iso_to_unix_secs};
 use crate::quota::provider::QuotaOutcome;
+use crate::quota::refresh::file_mtime;
 use crate::utils::get_cursor_auth_path;
 use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::blocking::Client;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 /// The Cursor usage-summary endpoint.
 const CURSOR_USAGE_URL: &str = "https://cursor.com/api/usage-summary";
@@ -36,6 +38,7 @@ pub(crate) fn cursor_ua() -> &'static str {
 }
 
 /// Synthesized `WorkosCursorSessionToken` cookie header and JWT `exp` timestamp (Unix seconds).
+#[derive(Clone)]
 pub(crate) struct CursorSession {
     pub(crate) cookie: String,
     pub(crate) exp: i64,
@@ -220,26 +223,40 @@ pub(crate) fn fetch_cursor_raw_from(
     Ok((status, text))
 }
 
-/// Per-worker Cursor quota state; holds no cached session between ticks.
+/// Per-worker Cursor quota state caching the parsed session per `auth.json` mtime.
 #[derive(Default)]
-pub struct CursorState;
+pub struct CursorState {
+    session: Option<(CursorSession, Option<SystemTime>)>,
+}
 
 impl CursorState {
-    /// Reads `auth.json`, validates the JWT expiry, and fetches a fresh quota snapshot.
+    /// Reads `auth.json` (or reuses the mtime-cached session), validates the JWT expiry, and fetches a fresh quota snapshot.
     pub fn resolve(&mut self, client: &Client) -> QuotaOutcome<CursorQuotaSnapshot> {
         let now = chrono::Local::now().timestamp();
         let path = match get_cursor_auth_path() {
             Ok(p) => p,
             Err(_) => return QuotaOutcome::Transient,
         };
-        let body = match std::fs::read_to_string(&path) {
-            Ok(b) => b,
-            Err(_) => return QuotaOutcome::Transient,
-        };
-        // A readable file with no usable session (e.g. cleared on logout) is an auth failure, not a transient read error.
-        let session = match read_cursor_session(&body) {
-            Some(s) => s,
-            None => return QuotaOutcome::NeedsLogin,
+        let cur_mtime = file_mtime(&path);
+        let session = match &self.session {
+            Some((cached, m)) if cur_mtime.is_some() && *m == cur_mtime => cached.clone(),
+            _ => {
+                let body = match std::fs::read_to_string(&path) {
+                    Ok(b) => b,
+                    Err(_) => return QuotaOutcome::Transient,
+                };
+                // A readable file with no usable session (e.g. cleared on logout) is an auth failure, not a transient read error.
+                match read_cursor_session(&body) {
+                    Some(s) => {
+                        self.session = Some((s.clone(), cur_mtime));
+                        s
+                    }
+                    None => {
+                        self.session = None;
+                        return QuotaOutcome::NeedsLogin;
+                    }
+                }
+            }
         };
         // The token is expired and we cannot refresh it ourselves; nudge login.
         if session.exp > 0 && session.exp <= now {

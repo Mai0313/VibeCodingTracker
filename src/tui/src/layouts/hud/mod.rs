@@ -82,16 +82,16 @@ impl HudView {
     fn sync_inspector_target(&mut self, ctx: &LayoutContext<'_>) {
         match ctx.tab {
             Tab::Usage => {
-                let cur = ctx.usage.selected_row().map(|r| r.model.clone());
-                if cur != self.last_usage_model {
-                    self.last_usage_model = cur;
+                let cur = ctx.usage.selected_row().map(|r| r.model.as_str());
+                if cur != self.last_usage_model.as_deref() {
+                    self.last_usage_model = cur.map(str::to_string);
                     self.inspector_scroll = 0;
                 }
             }
             Tab::Analysis => {
-                let cur = ctx.analysis.selected_row().map(|r| r.model.clone());
-                if cur != self.last_analysis_model {
-                    self.last_analysis_model = cur;
+                let cur = ctx.analysis.selected_row().map(|r| r.model.as_str());
+                if cur != self.last_analysis_model.as_deref() {
+                    self.last_analysis_model = cur.map(str::to_string);
                     self.inspector_scroll = 0;
                 }
             }
@@ -124,14 +124,12 @@ impl HudView {
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
 
         let show_kpi = work.height >= KPI_MIN_WORK_H;
-        let main_area = if show_kpi {
+        let (kpi_band, main_area) = if show_kpi {
             let [kpi_band, lower] =
                 Layout::vertical([Constraint::Length(4), Constraint::Min(8)]).areas(work);
-            let kpi_providers = build_provider_total_rows(ctx.usage.provider_totals());
-            self.provider_kpi_area = Some(render_usage_kpi_strip(f, kpi_band, ctx, &kpi_providers));
-            lower
+            (Some(kpi_band), lower)
         } else {
-            work
+            (None, work)
         };
 
         self.split_active = main_area.width >= USAGE_SPLIT_MIN_W;
@@ -219,6 +217,9 @@ impl HudView {
         );
 
         let provider_rows = build_provider_total_rows(ctx.usage.provider_totals());
+        if let Some(kpi_band) = kpi_band {
+            self.provider_kpi_area = Some(render_usage_kpi_strip(f, kpi_band, ctx, &provider_rows));
+        }
         if let Some(digest) = self.digest_area {
             f.render_widget(
                 Paragraph::new(provider_digest(&provider_rows, digest.width)).centered(),

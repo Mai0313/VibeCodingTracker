@@ -1,20 +1,21 @@
 //! `editorial` layout: single outer rounded frame divided by `─` and `│` hairlines, with a `▎` selection cursor and a borderless table.
 
 use crate::display::analysis::{
-    AnalysisRow, AnalysisTableColumns, build_analysis_detail_sections, layout_analysis_columns,
+    AnalysisRow, AnalysisTableColumns, build_analysis_detail_sections, format_analysis_column,
+    layout_analysis_columns,
 };
 use crate::display::app::Tab;
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
-    aligned_cells, create_controls_with_status, create_provider_row, create_ratatui_table,
-    format_detail_lines, render_detail_panel, render_too_small,
+    create_controls_with_status, create_provider_row, create_ratatui_table, format_detail_lines,
+    render_detail_panel, render_too_small,
 };
 use crate::display::common::theme::theme;
 use crate::display::common::tui::{MouseInput, NavDelta, ScrollState, UpdateTracker};
 use crate::display::usage::{
     ProviderStats, UsageRow, UsageTableColumns, build_provider_total_rows,
-    build_usage_detail_sections, layout_usage_columns, provider_digest, provider_share_bar,
-    render_provider_panel,
+    build_usage_detail_sections, format_usage_column, layout_usage_columns, provider_digest,
+    provider_share_bar, render_provider_panel, share_spans,
 };
 use crate::layouts::{
     EventResult, LayoutContext, LayoutMeta, LayoutView, RANGES, TopBarHits, TuiLayout, contains,
@@ -23,9 +24,9 @@ use crate::layouts::{
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::Style,
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell as RatatuiCell, Paragraph, Row as RatatuiRow, Scrollbar,
         ScrollbarOrientation, ScrollbarState,
@@ -83,16 +84,16 @@ impl EditorialView {
     fn sync_inspector_target(&mut self, ctx: &LayoutContext<'_>) {
         match ctx.tab {
             Tab::Usage => {
-                let cur = ctx.usage.selected_row().map(|r| r.model.clone());
-                if cur != self.last_usage_model {
-                    self.last_usage_model = cur;
+                let cur = ctx.usage.selected_row().map(|r| r.model.as_str());
+                if cur != self.last_usage_model.as_deref() {
+                    self.last_usage_model = cur.map(str::to_string);
                     self.inspector_scroll = 0;
                 }
             }
             Tab::Analysis => {
-                let cur = ctx.analysis.selected_row().map(|r| r.model.clone());
-                if cur != self.last_analysis_model {
-                    self.last_analysis_model = cur;
+                let cur = ctx.analysis.selected_row().map(|r| r.model.as_str());
+                if cur != self.last_analysis_model.as_deref() {
+                    self.last_analysis_model = cur.map(str::to_string);
                     self.inspector_scroll = 0;
                 }
             }
@@ -632,35 +633,19 @@ fn build_editorial_usage_row(
     } else {
         Style::default()
     };
-    let all = [
-        format_compact(row.input_tokens),
-        format_compact(row.output_with_reasoning()),
-        format_compact(row.cache_read),
-        format_compact(row.cache_creation),
-        format_compact(row.total),
-        format_cost(row.cost),
-    ];
     let mut cells: Vec<RatatuiCell<'static>> = Vec::with_capacity(cols.header.len());
     cells.push(cursor_model_cell(&row.model, selected));
-    let numeric: Vec<String> = cols.kept.iter().map(|&i| all[i].clone()).collect();
-    cells.extend(aligned_cells(numeric, 0));
-    if cols.share_w > 0 && total_tokens > 0 && cols.share_w >= 6 {
-        let share = (row.total as f64 / total_tokens as f64).clamp(0.0, 1.0);
-        let bar_w = usize::from(cols.share_w - 6);
-        let filled = (share * bar_w as f64).round() as usize;
-        cells.push(RatatuiCell::from(Line::from(vec![
-            Span::styled("━".repeat(filled.min(bar_w)), theme.accent()),
-            Span::styled(
-                format!(
-                    "{}{:>5.1}%",
-                    " ".repeat(bar_w.saturating_sub(filled)),
-                    share * 100.0
-                ),
-                theme.dim(),
-            ),
-        ])));
-    } else if cols.share_w > 0 {
-        cells.push(RatatuiCell::from(""));
+    for &i in &cols.kept {
+        cells.push(RatatuiCell::from(
+            Text::from(format_usage_column(row, i)).alignment(Alignment::Right),
+        ));
+    }
+    if cols.share_w > 0 {
+        if let Some(spans) = share_spans(row.total, total_tokens, cols.share_w) {
+            cells.push(RatatuiCell::from(Line::from(Vec::from(spans))));
+        } else {
+            cells.push(RatatuiCell::from(""));
+        }
     }
     RatatuiRow::new(cells).style(style)
 }
@@ -677,20 +662,13 @@ fn build_editorial_analysis_row(
     } else {
         Style::default()
     };
-    let all = [
-        format_compact(row.edit_lines as i64),
-        format_compact(row.read_lines as i64),
-        format_compact(row.write_lines as i64),
-        format_compact(row.bash_count as i64),
-        format_compact(row.edit_count as i64),
-        format_compact(row.read_count as i64),
-        format_compact(row.todo_write_count as i64),
-        format_compact(row.write_count as i64),
-    ];
     let mut cells: Vec<RatatuiCell<'static>> = Vec::with_capacity(cols.header.len());
     cells.push(cursor_model_cell(&row.model, selected));
-    let numeric: Vec<String> = cols.kept.iter().map(|&i| all[i].clone()).collect();
-    cells.extend(aligned_cells(numeric, 0));
+    for &i in &cols.kept {
+        cells.push(RatatuiCell::from(
+            Text::from(format_analysis_column(row, i)).alignment(Alignment::Right),
+        ));
+    }
     RatatuiRow::new(cells).style(style)
 }
 

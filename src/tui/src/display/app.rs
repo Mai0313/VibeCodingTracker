@@ -2,7 +2,7 @@
 //!
 //! [`run_app`] owns the event loop. The Usage and Analysis tabs share one background [`RefreshWorker`] and one session ledger started on the first visit to either, and the Quota tab starts its workers on the first visit. Only the visible tab refreshes on its timer, while the active `LayoutView` owns frame geometry and mouse hit-testing.
 
-use crate::display::analysis::{AnalysisUiState, scan_analysis};
+use crate::display::analysis::{AnalysisScanOutcome, AnalysisScanner, AnalysisUiState};
 use crate::display::common::table::{
     init_process_metrics, process_metrics, refresh_process_metrics,
 };
@@ -13,7 +13,7 @@ use crate::display::common::tui::{
 };
 use crate::display::settings::{SettingsOutcome, SettingsUiState};
 use crate::display::usage::{
-    QuotaRuntime, QuotaSnapshots, UsageRefreshPayload, UsageScanner, UsageUiState,
+    QuotaRuntime, UsageRefreshPayload, UsageScanOutcome, UsageScanner, UsageUiState,
 };
 use crate::layouts::{EventResult, LayoutCommand, LayoutContext, LayoutView, RANGES};
 use crossterm::event::KeyCode;
@@ -84,8 +84,8 @@ pub struct AppOptions {
     pub merge: bool,
     /// The loaded settings.
     pub config: Config,
-    /// The pool session scans run in.
-    pub scan_pool: Arc<rayon::ThreadPool>,
+    /// Optional pre-built pool session scans run in; when `None`, the pool is built lazily when a data tab starts scanning.
+    pub scan_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 /// Parameters for a background scan, read by the worker at the start of each run.
@@ -97,8 +97,9 @@ struct ScanRequest {
 }
 
 enum ScanData {
-    Usage(UsageRefreshPayload),
-    Analysis(AnalysisData),
+    Usage(Box<UsageRefreshPayload>),
+    Analysis(Box<AnalysisData>),
+    Unchanged,
 }
 
 /// A finished scan and the request it answered.
@@ -177,31 +178,47 @@ fn spawn_scan_worker(
     refresh_secs: u64,
     request: Arc<Mutex<ScanRequest>>,
     paths: vct_core::utils::HelperPaths,
-    pool: Arc<rayon::ThreadPool>,
+    pool: Option<Arc<rayon::ThreadPool>>,
+    scan_threads: usize,
 ) -> RefreshWorker<ScanOutput> {
     RefreshWorker::new_with_init(refresh_secs, move || {
         let mut ledger = SessionLedger::open(&paths.cache_dir);
         let mut usage = UsageScanner::new();
+        let mut analysis = AnalysisScanner::new();
+        let mut pool = pool;
         move || {
+            let pool = match &pool {
+                Some(pool) => pool,
+                None => {
+                    let built = Arc::new(vct_core::scan::build_scan_pool(scan_threads)?);
+                    pool.insert(built)
+                }
+            };
             let request = *request
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let data = if request.tab == Tab::Analysis {
-                ScanData::Analysis(scan_analysis(
+                match analysis.scan(
                     &paths,
                     request.time_range,
                     request.providers,
                     &mut ledger,
-                    &pool,
-                )?)
+                    pool,
+                )? {
+                    AnalysisScanOutcome::Updated(data) => ScanData::Analysis(data),
+                    AnalysisScanOutcome::Unchanged => ScanData::Unchanged,
+                }
             } else {
-                ScanData::Usage(usage.scan(
+                match usage.scan(
                     &paths,
                     request.time_range,
                     request.providers,
                     &mut ledger,
-                    &pool,
-                )?)
+                    pool,
+                )? {
+                    UsageScanOutcome::Updated(payload) => ScanData::Usage(payload),
+                    UsageScanOutcome::Unchanged => ScanData::Unchanged,
+                }
             };
             Ok(ScanOutput { request, data })
         }
@@ -218,18 +235,44 @@ fn spawn_scan_worker(
 ///
 /// Returns an error if path resolution fails, terminal setup or restoration fails, reading input or drawing a frame fails, or the scan worker disconnects.
 pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
+    let AppOptions {
+        start,
+        time_range,
+        merge,
+        mut config,
+        scan_pool,
+    } = options;
+    let paths = vct_core::utils::resolve_paths()?;
+    let mut tab = start;
+    let mut current_time_range = time_range;
+    let request = Arc::new(Mutex::new(ScanRequest {
+        tab,
+        time_range: current_time_range,
+        providers: config.providers,
+    }));
+    // Start ledger open and initial scan before entering raw mode so startup overlaps terminal setup and OSC 10/11 probing.
+    let mut worker: Option<RefreshWorker<ScanOutput>> = if start.scans() {
+        let interval = if start == Tab::Usage {
+            config.usage.refresh_secs()
+        } else {
+            config.analysis.refresh_secs()
+        };
+        vct_core::remote::spawn_sync_loop(paths.cache_dir.clone(), config.remotes.clone());
+        let mut worker = spawn_scan_worker(
+            interval,
+            Arc::clone(&request),
+            paths.clone(),
+            scan_pool.clone(),
+            config.performance.resolved_scan_threads(),
+        );
+        worker.request();
+        Some(worker)
+    } else {
+        None
+    };
+
     let mut terminal = TerminalSession::new()?;
     let result = (|| -> anyhow::Result<()> {
-        let AppOptions {
-            start,
-            time_range,
-            merge,
-            config,
-            scan_pool,
-        } = options;
-        let paths = vct_core::utils::resolve_paths()?;
-        let mut tab = start;
-        let mut config = config;
         let (mut active_layout_id, mut layout_view) =
             crate::layouts::create(&config.general.layout);
         let update_notice = Arc::new(OnceLock::new());
@@ -243,6 +286,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             });
         }
         let mut quota: Option<QuotaRuntime> = None;
+        let mut last_quota_state: Option<(u64, i64)> = None;
         let mut usage = UsageUiState::new(merge);
         let mut analysis = AnalysisUiState::new();
         let mut settings = SettingsUiState::new(
@@ -256,12 +300,11 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             }),
         );
 
-        let request = Arc::new(Mutex::new(ScanRequest {
+        let mut last_published_request = ScanRequest {
             tab,
-            time_range,
+            time_range: current_time_range,
             providers: config.providers,
-        }));
-        let mut worker: Option<RefreshWorker<ScanOutput>> = None;
+        };
         // The request each data tab last showed.
         let mut shown: [Option<ScanRequest>; 2] = [None, None];
         let mut failure_until = None;
@@ -272,10 +315,14 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             .expect("Failed to get current process ID for memory monitoring");
         let mut sys = System::new();
         init_process_metrics(&mut sys, pid);
+        let mut metrics = process_metrics(&sys, pid);
         let metrics_interval =
             Duration::from_millis(vct_core::constants::refresh::METRICS_REFRESH_MS);
         let mut last_metrics = Instant::now();
         let mut last_draw: Option<Instant> = None;
+        let mut refresh_indicator_drawn = false;
+        let mut last_refresh_status: Option<&'static str> = None;
+        let mut update_notice_drawn = false;
         let mut spinner = 0usize;
         let mut help_open = false;
 
@@ -283,24 +330,30 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             let mut redraw = false;
             let wanted = ScanRequest {
                 tab,
-                time_range: request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .time_range,
+                time_range: current_time_range,
                 providers: config.providers,
             };
 
             if let Some(result) = worker.as_mut().and_then(RefreshWorker::try_result) {
                 match result {
                     Ok(output) => {
+                        let had_failure = failure_until.is_some() || retry_at.is_some();
                         match output.data {
                             ScanData::Usage(payload) => {
-                                usage.apply(payload);
+                                usage.apply(*payload);
                                 shown[0] = Some(output.request);
+                                redraw = true;
                             }
                             ScanData::Analysis(data) => {
-                                analysis.apply(data);
+                                analysis.apply(*data);
                                 shown[1] = Some(output.request);
+                                redraw = true;
+                            }
+                            ScanData::Unchanged => {
+                                if output.request.tab.scans() {
+                                    shown[output.request.tab.index()] = Some(output.request);
+                                }
+                                redraw = had_failure || refresh_indicator_drawn;
                             }
                         }
                         failure_until = None;
@@ -315,9 +368,10 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                         failure_until = Some(Instant::now() + Duration::from_secs(3));
                         retry_at =
                             Some(Instant::now() + Duration::from_secs(config.usage.refresh_secs()));
+                        vct_core::utils::release_freed_heap();
+                        redraw = true;
                     }
                 }
-                redraw = true;
             }
 
             if tab.scans() {
@@ -335,55 +389,98 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                         interval,
                         Arc::clone(&request),
                         paths.clone(),
-                        Arc::clone(&scan_pool),
+                        scan_pool.clone(),
+                        config.performance.resolved_scan_threads(),
                     )
                 });
                 worker.set_interval(interval);
-                *request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = wanted;
+                if wanted != last_published_request {
+                    *request
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = wanted;
+                    last_published_request = wanted;
+                }
                 let current = shown[tab.index()] == Some(wanted);
                 // Rescan stale tabs as soon as the worker is free; after a failure, wait out `retry_at` unless refreshed manually.
                 if should_rescan(current, worker.is_active(), retry_at, Instant::now()) {
                     worker.request();
                     redraw = true;
-                } else if current && worker.request_if_due() {
-                    redraw = true;
+                } else if current {
+                    worker.request_if_due();
                 }
             }
 
-            let loading = tab.scans() && shown[tab.index()].is_none();
-            let tick = if loading {
-                Duration::from_millis(100)
+            let quota_now = if tab == Tab::Quota {
+                let runtime = quota.get_or_insert_with(|| {
+                    last_quota_state = None;
+                    QuotaRuntime::start(
+                        &config.usage.quota.panels,
+                        config.providers,
+                        config.usage.quota_refresh_secs(),
+                    )
+                });
+                let now = chrono::Utc::now().timestamp();
+                let current_quota_state = (runtime.revision(), now / 60);
+                if last_quota_state != Some(current_quota_state) {
+                    redraw = true;
+                }
+                Some((now, current_quota_state))
             } else {
-                Duration::from_secs(1)
+                None
             };
-            if last_metrics.elapsed() >= metrics_interval {
-                last_metrics = Instant::now();
-                refresh_process_metrics(&mut sys, pid);
+
+            let now = Instant::now();
+            if usage.prune_expired(now) && tab == Tab::Usage {
+                redraw = true;
             }
-            let metrics = process_metrics(&sys, pid);
-            if redraw || last_draw.is_none_or(|at| at.elapsed() >= tick) {
+            if analysis.prune_expired(now) && tab == Tab::Analysis {
+                redraw = true;
+            }
+            let loading = tab.scans() && shown[tab.index()].is_none();
+            if now.saturating_duration_since(last_metrics) >= metrics_interval {
+                last_metrics = now;
+                refresh_process_metrics(&mut sys, pid);
+                let next_metrics = process_metrics(&sys, pid);
+                if (next_metrics.0 * 10.0).round() != (metrics.0 * 10.0).round()
+                    || (next_metrics.1 * 10.0).round() != (metrics.1 * 10.0).round()
+                {
+                    metrics = next_metrics;
+                    redraw = true;
+                }
+            }
+            let active = worker.as_ref().is_some_and(RefreshWorker::is_active);
+            let refresh = refresh_status(active, failure_until);
+            let update_text = update_notice.get().map(String::as_str);
+            if update_text.is_some() != update_notice_drawn
+                || (refresh != last_refresh_status
+                    && (refresh != Some("Refreshing...")
+                        || last_draw.is_none_or(|at| {
+                            now.saturating_duration_since(at) >= Duration::from_secs(1)
+                        })))
+            {
+                redraw = true;
+            }
+            if loading
+                && last_draw.is_none_or(|at| {
+                    now.saturating_duration_since(at) >= Duration::from_millis(100)
+                })
+            {
+                redraw = true;
+            }
+            if redraw || last_draw.is_none() {
                 spinner = spinner.wrapping_add(1);
-                let active = worker.as_ref().is_some_and(RefreshWorker::is_active);
-                let refresh = refresh_status(active, failure_until);
-                let update_text = update_notice.get().map(String::as_str);
+                refresh_indicator_drawn = refresh.is_some();
+                last_refresh_status = refresh;
+                update_notice_drawn = update_text.is_some();
                 let data_status = data_tab_status(refresh, update_text);
                 let update_status = update_text.map(|text| (text, theme().good));
-                let quota_snapshots = (tab == Tab::Quota).then(|| {
-                    let runtime = quota.get_or_insert_with(|| {
-                        QuotaRuntime::start(
-                            &config.usage.quota.panels,
-                            config.providers,
-                            config.usage.quota_refresh_secs(),
-                        )
-                    });
-                    QuotaSnapshots::read(runtime)
-                });
+                if let Some((_, state)) = quota_now {
+                    last_quota_state = Some(state);
+                }
                 let completed = terminal.terminal_mut().draw(|f| {
-                    let quota_view = quota_snapshots.as_ref().map(|snapshots| {
-                        let runtime = quota.as_ref().expect("started for Quota tab");
-                        (snapshots.view(runtime), chrono::Local::now().timestamp())
+                    let quota_view = quota_now.map(|(now, _)| {
+                        let runtime = quota.as_mut().expect("started for Quota tab");
+                        (runtime.view_cached(), now)
                     });
                     let mut ctx = LayoutContext {
                         tab,
@@ -407,7 +504,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 })?;
                 // ratatui cannot embed OSC 8 escapes in cells, so hyperlink the rendered repo label directly.
                 overlay_repo_hyperlink(completed.buffer)?;
-                last_draw = Some(Instant::now());
+                last_draw = Some(now);
             }
 
             let mut go_to = None;
@@ -451,6 +548,9 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                                     &mut active_layout_id,
                                     &mut layout_view,
                                 );
+                                if quota.is_none() {
+                                    last_quota_state = None;
+                                }
                             }
                             SettingsOutcome::Stay => {}
                         }
@@ -491,6 +591,9 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                                 &mut active_layout_id,
                                 &mut layout_view,
                             );
+                            if quota.is_none() {
+                                last_quota_state = None;
+                            }
                         }
                         last_draw = None;
                     }
@@ -619,27 +722,23 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             }
             if let Some(target_range) = command.set_range
                 && tab.scans()
+                && current_time_range != target_range
             {
-                let mut req = request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if req.time_range != target_range {
-                    req.time_range = target_range;
-                    failure_until = None;
-                    retry_at = None;
-                    last_draw = None;
-                }
+                current_time_range = target_range;
+                failure_until = None;
+                retry_at = None;
+                last_draw = None;
             }
             if let Some(step) = command.step_range
                 && tab.scans()
             {
-                let mut req = request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                req.time_range = step_range(req.time_range, step);
-                failure_until = None;
-                retry_at = None;
-                last_draw = None;
+                let next_range = step_range(current_time_range, step);
+                if next_range != current_time_range {
+                    current_time_range = next_range;
+                    failure_until = None;
+                    retry_at = None;
+                    last_draw = None;
+                }
             }
             if command.refresh
                 && tab.scans()

@@ -12,10 +12,58 @@ use crate::models::{
 };
 use serde::Serialize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Cooperative shutdown signal shared between a caller and its quota polling workers.
+#[derive(Default)]
+pub struct QuotaShutdown {
+    stopped: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl QuotaShutdown {
+    /// Creates an unsignaled shutdown handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks shutdown requested and wakes all sleeping workers immediately.
+    pub fn signal(&self) {
+        let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        *stopped = true;
+        self.wake.notify_all();
+    }
+
+    /// Returns whether shutdown has been requested.
+    pub fn is_shutdown(&self) -> bool {
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Waits up to `duration` for shutdown, returning `true` if shutdown was signaled.
+    pub fn wait_timeout(&self, duration: Duration) -> bool {
+        let deadline = Instant::now() + duration;
+        let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        while !*stopped {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            let (guard, result) = self
+                .wake
+                .wait_timeout(stopped, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            stopped = guard;
+            if result.timed_out() {
+                return *stopped;
+            }
+        }
+        true
+    }
+}
 
 /// A normalized quota snapshot managed by [`spawn_quota_worker`].
 pub trait QuotaSnapshot: Clone + Default + Send + Serialize + 'static {
@@ -122,13 +170,13 @@ pub enum QuotaOutcome<T> {
     Transient,
 }
 
-/// Spawns a background thread that polls `resolve`, updates `shared`, and invokes `save` every `refresh_secs` seconds until `shutdown` is set.
+/// Spawns a background thread that polls `resolve`, updates `shared`, and invokes `save` every `refresh_secs` seconds until `shutdown` is signaled.
 ///
 /// `refresh_secs` is clamped to at least 1 second. Panics inside `resolve` are caught and logged under `label` while the lock is not held, preserving the last snapshot and avoiding mutex poisoning.
 pub fn spawn_quota_worker<T, R, S>(
     label: &'static str,
     shared: Arc<Mutex<T>>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: Arc<QuotaShutdown>,
     refresh_secs: u64,
     mut resolve: R,
     save: S,
@@ -138,11 +186,10 @@ where
     R: FnMut() -> QuotaOutcome<T> + Send + 'static,
     S: Fn(&T) + Send + 'static,
 {
-    // Sleep in 200ms slices so shutdown stays responsive.
-    let ticks = refresh_secs.max(1).saturating_mul(5);
+    let interval = Duration::from_secs(refresh_secs.max(1));
     std::thread::spawn(move || {
         loop {
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.is_shutdown() {
                 break;
             }
             match catch_unwind(AssertUnwindSafe(&mut resolve)) {
@@ -166,11 +213,8 @@ where
                 Ok(QuotaOutcome::Transient) => {}
                 Err(_) => log::warn!("{label} quota worker panicked; keeping last snapshot"),
             }
-            for _ in 0..ticks {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(200));
+            if shutdown.wait_timeout(interval) {
+                break;
             }
         }
     })
@@ -180,6 +224,7 @@ where
 mod tests {
     use super::*;
     use crate::models::CodexQuotaSnapshot;
+    use std::sync::mpsc;
 
     #[test]
     fn needs_login_snapshot_is_present() {
@@ -188,5 +233,34 @@ mod tests {
             ..Default::default()
         };
         assert!(snap.is_present());
+    }
+
+    #[test]
+    fn shutdown_signal_wakes_sleeping_worker_immediately() {
+        let shared = Arc::new(Mutex::new(CodexQuotaSnapshot::default()));
+        let shutdown = Arc::new(QuotaShutdown::new());
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn_quota_worker(
+            "test",
+            shared,
+            Arc::clone(&shutdown),
+            60,
+            move || {
+                let _ = tx.send(());
+                QuotaOutcome::Transient
+            },
+            |_| {},
+        );
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("first poll should run immediately");
+        let start = Instant::now();
+        shutdown.signal();
+        handle.join().expect("worker should exit cleanly");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "worker should wake immediately on shutdown signal, took {:?}",
+            start.elapsed()
+        );
     }
 }

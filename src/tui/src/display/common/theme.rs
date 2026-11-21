@@ -151,13 +151,58 @@ fn luminance((r, g, b): Rgb) -> f32 {
     0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
 }
 
+/// Maximum bytes buffered from stdin while waiting for the OSC 10/11 + DA1 probe reply.
+#[cfg_attr(not(unix), allow(dead_code))]
+const MAX_PROBE_REPLY_BYTES: usize = 4096;
+
+/// Fallback timeout while waiting for a terminal that never answers the OSC 10/11 + DA1 probe.
+#[cfg(unix)]
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Returns whether `reply` contains a complete primary device-attributes (`CSI ? Ps ; ... c`) response anywhere in the buffer.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn has_complete_da1(reply: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < reply.len() {
+        if &reply[i..i + 3] == b"\x1b[?" {
+            let mut j = i + 3;
+            while j < reply.len() && (0x30..=0x3f).contains(&reply[j]) {
+                j += 1;
+            }
+            if j < reply.len() && reply[j] == b'c' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Reads chunks via `read_chunk` until a complete DA1 terminator arrives, the source ends, or [`MAX_PROBE_REPLY_BYTES`] is reached.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn collect_probe_reply(mut read_chunk: impl FnMut(&mut [u8]) -> Option<usize>) -> Vec<u8> {
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 256];
+    while !has_complete_da1(&reply) && reply.len() < MAX_PROBE_REPLY_BYTES {
+        let to_read = (MAX_PROBE_REPLY_BYTES - reply.len()).min(chunk.len());
+        let Some(read) = read_chunk(&mut chunk[..to_read]) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        reply.extend_from_slice(&chunk[..read.min(to_read)]);
+    }
+    reply
+}
+
 /// Queries the terminal's default foreground and background via OSC 10/11, returning `None` if stdin is not a TTY or the reply cannot be parsed.
 ///
-/// Appends a primary device-attributes request (`CSI c`) as a response terminator; the 1-second deadline only bounds terminals that never reply.
+/// Appends a primary device-attributes request (`CSI c`) as a response terminator; the timeout only bounds terminals that never reply.
 #[cfg(unix)]
 fn query_default_colors() -> Option<(Rgb, Rgb)> {
     use std::io::{IsTerminal, Write};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     if !std::io::stdin().is_terminal() {
         return None;
@@ -168,28 +213,42 @@ fn query_default_colors() -> Option<(Rgb, Rgb)> {
         .ok()?;
     stdout.flush().ok()?;
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let mut reply = Vec::new();
-    while !reply.ends_with(b"c") || !reply.windows(3).any(|bytes| bytes == b"\x1b[?") {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let mut fd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `fd` is one valid pollfd, and the count passed is 1.
-        if unsafe { libc::poll(&raw mut fd, 1, left.as_millis() as libc::c_int) } <= 0 {
-            break;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let reply = collect_probe_reply(|buf| {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let mut fd = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = left.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+            // SAFETY: `fd` is one valid pollfd, and the count passed is 1.
+            let ready = unsafe { libc::poll(&raw mut fd, 1, timeout_ms) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+            if ready == 0 {
+                return None;
+            }
+            // SAFETY: `buf` is writable for `buf.len()` bytes.
+            let read =
+                unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+            if read < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+            return (read > 0).then_some(read as usize);
         }
-        let mut chunk = [0u8; 256];
-        // SAFETY: `chunk` is writable for the `chunk.len()` bytes asked for.
-        let read =
-            unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if read <= 0 {
-            break;
-        }
-        reply.extend_from_slice(&chunk[..read as usize]);
-    }
+    });
     let reply = String::from_utf8_lossy(&reply);
     Some((
         parse_color_reply(&reply, 10)?,
@@ -274,5 +333,54 @@ mod tests {
         }
         // The greys still fall between the two.
         assert!(level(light.border) > level(light.dim));
+    }
+
+    #[test]
+    fn da1_detector_recognizes_complete_sequence_even_with_trailing_input() {
+        assert!(has_complete_da1(b"\x1b[?62;4c"));
+        assert!(has_complete_da1(b"\x1b[?c"));
+        assert!(has_complete_da1(
+            b"\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\\x1b[?62;4cq"
+        ));
+        assert!(has_complete_da1(b"\x1b[?62;4c\x1b[I\x1b[A"));
+        assert!(has_complete_da1(b"\x1b[?12x\x1b[?62;4c"));
+
+        assert!(!has_complete_da1(b""));
+        assert!(!has_complete_da1(b"\x1b[?62;4"));
+        assert!(!has_complete_da1(b"\x1b[?62xc"));
+        assert!(!has_complete_da1(b"\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\c"));
+    }
+
+    #[test]
+    fn probe_reply_stops_on_da1_and_enforces_4kib_cap() {
+        // Stops as soon as DA1 + trailing keystroke arrives without waiting for further reads.
+        let mut reads = 0usize;
+        let chunks: [&[u8]; 3] = [
+            b"\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\",
+            b"\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\\x1b[?62;4cq",
+            b"should-not-be-read",
+        ];
+        let reply = collect_probe_reply(|buf| {
+            let src = *chunks.get(reads)?;
+            reads += 1;
+            let n = src.len().min(buf.len());
+            buf[..n].copy_from_slice(&src[..n]);
+            Some(n)
+        });
+        assert_eq!(reads, 2);
+        assert!(has_complete_da1(&reply));
+        let text = String::from_utf8_lossy(&reply);
+        assert_eq!(parse_color_reply(&text, 10), Some((0xcd, 0xd6, 0xf4)));
+        assert_eq!(parse_color_reply(&text, 11), Some((0x1e, 0x1e, 0x2e)));
+
+        // Unbounded chatter without DA1 is capped at 4 KiB.
+        let mut flood_reads = 0usize;
+        let capped = collect_probe_reply(|buf| {
+            flood_reads += 1;
+            buf.fill(b'x');
+            Some(buf.len())
+        });
+        assert_eq!(capped.len(), MAX_PROBE_REPLY_BYTES);
+        assert_eq!(flood_reads, MAX_PROBE_REPLY_BYTES / 256);
     }
 }

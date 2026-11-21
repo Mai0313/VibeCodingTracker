@@ -75,16 +75,16 @@ impl ClassicView {
     fn sync_inspector_target(&mut self, ctx: &LayoutContext<'_>) {
         match ctx.tab {
             Tab::Usage => {
-                let cur = ctx.usage.selected_row().map(|r| r.model.clone());
-                if cur != self.last_usage_model {
-                    self.last_usage_model = cur;
+                let cur = ctx.usage.selected_row().map(|r| r.model.as_str());
+                if cur != self.last_usage_model.as_deref() {
+                    self.last_usage_model = cur.map(str::to_string);
                     self.inspector_scroll = 0;
                 }
             }
             Tab::Analysis => {
-                let cur = ctx.analysis.selected_row().map(|r| r.model.clone());
-                if cur != self.last_analysis_model {
-                    self.last_analysis_model = cur;
+                let cur = ctx.analysis.selected_row().map(|r| r.model.as_str());
+                if cur != self.last_analysis_model.as_deref() {
+                    self.last_analysis_model = cur.map(str::to_string);
                     self.inspector_scroll = 0;
                 }
             }
