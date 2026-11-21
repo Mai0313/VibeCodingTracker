@@ -235,18 +235,44 @@ fn spawn_scan_worker(
 ///
 /// Returns an error if path resolution fails, terminal setup or restoration fails, reading input or drawing a frame fails, or the scan worker disconnects.
 pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
+    let AppOptions {
+        start,
+        time_range,
+        merge,
+        mut config,
+        scan_pool,
+    } = options;
+    let paths = vct_core::utils::resolve_paths()?;
+    let mut tab = start;
+    let mut current_time_range = time_range;
+    let request = Arc::new(Mutex::new(ScanRequest {
+        tab,
+        time_range: current_time_range,
+        providers: config.providers,
+    }));
+    // Start ledger open and initial scan before entering raw mode so startup overlaps terminal setup and OSC 10/11 probing.
+    let mut worker: Option<RefreshWorker<ScanOutput>> = if start.scans() {
+        let interval = if start == Tab::Usage {
+            config.usage.refresh_secs()
+        } else {
+            config.analysis.refresh_secs()
+        };
+        vct_core::remote::spawn_sync_loop(paths.cache_dir.clone(), config.remotes.clone());
+        let mut worker = spawn_scan_worker(
+            interval,
+            Arc::clone(&request),
+            paths.clone(),
+            scan_pool.clone(),
+            config.performance.resolved_scan_threads(),
+        );
+        worker.request();
+        Some(worker)
+    } else {
+        None
+    };
+
     let mut terminal = TerminalSession::new()?;
     let result = (|| -> anyhow::Result<()> {
-        let AppOptions {
-            start,
-            time_range,
-            merge,
-            config,
-            scan_pool,
-        } = options;
-        let paths = vct_core::utils::resolve_paths()?;
-        let mut tab = start;
-        let mut config = config;
         let (mut active_layout_id, mut layout_view) =
             crate::layouts::create(&config.general.layout);
         let update_notice = Arc::new(OnceLock::new());
@@ -273,12 +299,11 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             }),
         );
 
-        let request = Arc::new(Mutex::new(ScanRequest {
+        let mut last_published_request = ScanRequest {
             tab,
-            time_range,
+            time_range: current_time_range,
             providers: config.providers,
-        }));
-        let mut worker: Option<RefreshWorker<ScanOutput>> = None;
+        };
         // The request each data tab last showed.
         let mut shown: [Option<ScanRequest>; 2] = [None, None];
         let mut failure_until = None;
@@ -301,10 +326,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             let mut redraw = false;
             let wanted = ScanRequest {
                 tab,
-                time_range: request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .time_range,
+                time_range: current_time_range,
                 providers: config.providers,
             };
 
@@ -368,9 +390,12 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                     )
                 });
                 worker.set_interval(interval);
-                *request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = wanted;
+                if wanted != last_published_request {
+                    *request
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = wanted;
+                    last_published_request = wanted;
+                }
                 let current = shown[tab.index()] == Some(wanted);
                 // Rescan stale tabs as soon as the worker is free; after a failure, wait out `retry_at` unless refreshed manually.
                 if should_rescan(current, worker.is_active(), retry_at, Instant::now()) {
@@ -649,27 +674,23 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             }
             if let Some(target_range) = command.set_range
                 && tab.scans()
+                && current_time_range != target_range
             {
-                let mut req = request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if req.time_range != target_range {
-                    req.time_range = target_range;
-                    failure_until = None;
-                    retry_at = None;
-                    last_draw = None;
-                }
+                current_time_range = target_range;
+                failure_until = None;
+                retry_at = None;
+                last_draw = None;
             }
             if let Some(step) = command.step_range
                 && tab.scans()
             {
-                let mut req = request
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                req.time_range = step_range(req.time_range, step);
-                failure_until = None;
-                retry_at = None;
-                last_draw = None;
+                let next_range = step_range(current_time_range, step);
+                if next_range != current_time_range {
+                    current_time_range = next_range;
+                    failure_until = None;
+                    retry_at = None;
+                    last_draw = None;
+                }
             }
             if command.refresh
                 && tab.scans()
