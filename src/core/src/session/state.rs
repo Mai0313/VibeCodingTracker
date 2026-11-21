@@ -512,6 +512,26 @@ impl SessionParseState {
         self.resolve_path(path).into_owned()
     }
 
+    /// Clears all accumulated metrics and details while keeping allocated buffers for reuse.
+    pub(crate) fn reset_for_reuse(&mut self) {
+        self.write_details.clear();
+        self.read_details.clear();
+        self.edit_details.clear();
+        self.run_details.clear();
+        self.tool_counts = CodeAnalysisToolCalls::default();
+        self.unique_files.clear();
+        self.total_write_lines = 0;
+        self.total_read_lines = 0;
+        self.total_edit_lines = 0;
+        self.total_write_characters = 0;
+        self.total_read_characters = 0;
+        self.total_edit_characters = 0;
+        self.folder_path.clear();
+        self.git_remote.clear();
+        self.task_id.clear();
+        self.last_ts = 0;
+    }
+
     /// Combines `other` into `self`, summing counts and totals, taking the maximum `last_ts`, and filling empty metadata fields from `other`.
     ///
     /// # Panics

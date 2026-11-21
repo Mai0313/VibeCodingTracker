@@ -15,7 +15,7 @@ use crate::session::copilot::parse_copilot_events_with_diagnostics;
 use crate::session::detector::{RecordClassifier, detect_extension_type};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::dsh::{has_zstd_magic, parse_dsh_session};
-use crate::session::gemini::parse_gemini_events_with_diagnostics;
+use crate::session::gemini::{parse_gemini_events_with_diagnostics, parse_gemini_jsonl_path};
 use crate::session::grok::{parse_grok_session, parse_grok_session_known};
 use crate::session::state::ParseMode;
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
@@ -313,6 +313,7 @@ fn stream_parse_known(
                 provider,
             )))
         }
+        ExtensionType::Gemini => parse_gemini_jsonl_path(path, mode, tiers),
         // Grok `signals.json` is pretty-printed JSON with sibling session files; open it once directly.
         ExtensionType::Grok => {
             Ok(parse_grok_session_known(path, mode)?.map(|parsed| finalize(parsed, provider)))

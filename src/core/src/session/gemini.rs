@@ -5,11 +5,18 @@ use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
-use crate::session::state::{ParseMode, SessionParseState};
+use crate::session::parser::stream_jsonl_borrowed;
+use crate::session::state::{ParseMode, SessionParseState, TextMetrics, count_json_string_metrics};
 use crate::utils::{parse_iso_timestamp, process_gemini_usage};
-use anyhow::Result;
-use serde::Deserialize;
-use serde_json::Value;
+use anyhow::{Context, Result};
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
+use serde_json::{Value, value::RawValue};
+use std::borrow::Cow;
+use std::fmt;
+use std::path::Path;
 
 /// Parses Gemini CLI JSONL `events` for `session` into a [`CodeAnalysis`].
 ///
@@ -39,35 +46,362 @@ pub(crate) fn parse_gemini_events_with_diagnostics<I>(
 where
     I: IntoIterator<Item = Value>,
 {
-    let mut classifier = tiers.map(TierClassifier::new);
-    let mut state = SessionParseState::with_mode(mode);
-    let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
-    let mut diagnostics = ParseDiagnostics::default();
-    diagnostics.record_recognized_source();
-
-    let messages = deduplicate_messages(events, mode, &mut diagnostics);
-    for message in messages {
-        diagnostics.merge(message.diagnostics);
-        if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
-            // `tokens.input` already includes cached tokens, so it is the full request prompt size.
-            let level = classifier
-                .as_mut()
-                .map_or(0, |classifier| classifier.level(model, tokens.input));
-            process_gemini_usage(&mut conversation_usage, model, tokens, level);
-        }
-        state.merge(message.state);
+    let mut fold = GeminiFold::new(mode, tiers);
+    fold.session = Some(session);
+    fold.diagnostics.record_recognized_source();
+    for event in events {
+        fold.observe_value_event(event);
     }
+    fold.finish()
+}
 
-    let analysis = finalize_record(state, conversation_usage, session.session_id);
-    Ok(ParsedAnalysis::new(analysis, diagnostics))
+/// Streams and parses a Gemini CLI JSONL file at `path` without materializing per-line `Value` trees or cloning `$set.messages` snapshots.
+pub(crate) fn parse_gemini_jsonl_path(
+    path: &Path,
+    mode: ParseMode,
+    tiers: Option<&TierThresholds>,
+) -> Result<Option<ParsedAnalysis>> {
+    stream_jsonl_borrowed(
+        path,
+        ExtensionType::Gemini,
+        GeminiFold::new(mode, tiers),
+        |fold, bytes| {
+            if !fold.seen_first_line {
+                fold.seen_first_line = true;
+                if !bytes.starts_with(b"{") {
+                    let err: serde_json::Error =
+                        serde::de::Error::custom("expected Gemini session object");
+                    if serde_json::from_slice::<IgnoredAny>(bytes).is_ok() {
+                        fold.session_error =
+                            Some(anyhow::Error::new(err).context("Failed to parse Gemini session"));
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+                match serde_json::from_slice::<GeminiSession>(bytes) {
+                    Ok(session) => {
+                        fold.session = Some(session);
+                        fold.diagnostics.record_recognized_source();
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        // Distinguish pretty-printed / non-JSON line 1 (`Ok(None)`) from valid JSON missing `GeminiSession` fields.
+                        if serde_json::from_slice::<IgnoredAny>(bytes).is_ok() {
+                            fold.session_error = Some(
+                                anyhow::Error::new(err).context("Failed to parse Gemini session"),
+                            );
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+
+            if fold.session_error.is_some() {
+                return Ok(());
+            }
+
+            if !bytes.starts_with(b"{") {
+                return Err(serde::de::Error::custom("expected Gemini event object"));
+            }
+            let event = serde_json::from_slice::<BorrowedGeminiEvent<'_>>(bytes)?;
+            fold.observe_borrowed_event(event);
+            Ok(())
+        },
+        GeminiFold::finish,
+    )
 }
 
 /// One compacted assistant-message revision retained for historical metrics.
 struct GeminiMessageAnalysis {
-    state: SessionParseState,
+    last_ts: i64,
+    state: Option<SessionParseState>,
     tokens: Option<GeminiTokens>,
     model: Option<String>,
     diagnostics: ParseDiagnostics,
+}
+
+struct GeminiFold<'a> {
+    mode: ParseMode,
+    tiers: Option<&'a TierThresholds>,
+    seen_first_line: bool,
+    session: Option<GeminiSession>,
+    session_error: Option<anyhow::Error>,
+    diagnostics: ParseDiagnostics,
+    messages: Vec<GeminiMessageAnalysis>,
+    positions: FastHashMap<String, usize>,
+}
+
+impl<'a> GeminiFold<'a> {
+    fn new(mode: ParseMode, tiers: Option<&'a TierThresholds>) -> Self {
+        Self {
+            mode,
+            tiers,
+            seen_first_line: false,
+            session: None,
+            session_error: None,
+            diagnostics: ParseDiagnostics::default(),
+            messages: Vec::new(),
+            positions: FastHashMap::default(),
+        }
+    }
+
+    fn take_reusable_state(&mut self, id: &str) -> Option<SessionParseState> {
+        let &index = self.positions.get(id)?;
+        let mut state = self.messages[index].state.take()?;
+        state.reset_for_reuse();
+        Some(state)
+    }
+
+    fn store_message(&mut self, id: Cow<'_, str>, mut analysis: GeminiMessageAnalysis) {
+        if let Some(&index) = self.positions.get(id.as_ref()) {
+            // Preserve prior billed tokens and model when a later revision omits `tokens`.
+            if analysis.tokens.is_none() {
+                let prior = &mut self.messages[index];
+                analysis.tokens = prior.tokens.take();
+                if analysis.model.is_none() {
+                    analysis.model = prior.model.take();
+                }
+            }
+            self.messages[index] = analysis;
+        } else {
+            self.positions.insert(id.into_owned(), self.messages.len());
+            self.messages.push(analysis);
+        }
+    }
+
+    fn observe_borrowed_event(&mut self, event: BorrowedGeminiEvent<'_>) {
+        if event.rewind_to.is_some() {
+            self.diagnostics.record_recognized_source();
+            return;
+        }
+
+        if let Some(id_raw) = event.id
+            && let Some(type_raw) = event.message_type
+            && let Ok(id) = serde_json::from_str::<Cow<'_, str>>(id_raw.get())
+            && let Ok(message_type) = serde_json::from_str::<Cow<'_, str>>(type_raw.get())
+        {
+            if matches!(message_type.as_ref(), "gemini" | "user" | "info" | "error") {
+                self.diagnostics.record_recognized_source();
+            } else {
+                self.diagnostics.record_unrecognized();
+            }
+            if message_type.as_ref() == "gemini" {
+                self.upsert_borrowed_message(
+                    Some(id),
+                    event.timestamp,
+                    event.tokens,
+                    event.model,
+                    event.tool_calls,
+                );
+            }
+            return;
+        }
+
+        let Some(set_raw) = event.set else {
+            self.diagnostics.record_unrecognized();
+            return;
+        };
+        self.diagnostics.record_recognized_source();
+        if !set_raw.get().starts_with('{') {
+            return;
+        }
+        let Ok(set) = serde_json::from_str::<BorrowedGeminiSet<'_>>(set_raw.get()) else {
+            return;
+        };
+        let Some(messages_raw) = set.messages else {
+            return;
+        };
+        let mut deserializer = serde_json::Deserializer::from_str(messages_raw.get());
+        if (SnapshotMessagesSeed { fold: self })
+            .deserialize(&mut deserializer)
+            .is_err()
+        {
+            self.diagnostics.record_relevant(false);
+        }
+    }
+
+    fn upsert_borrowed_message(
+        &mut self,
+        id: Option<Cow<'_, str>>,
+        timestamp_raw: Option<&RawValue>,
+        tokens_raw: Option<&RawValue>,
+        model_raw: Option<&RawValue>,
+        tool_calls_raw: Option<&RawValue>,
+    ) {
+        let Some(id) = id.filter(|id| !id.is_empty()) else {
+            self.diagnostics.record_relevant(false);
+            return;
+        };
+
+        let mut reusable_state = self.take_reusable_state(id.as_ref());
+        let analysis = match parse_borrowed_gemini_message(
+            timestamp_raw,
+            tokens_raw,
+            model_raw,
+            tool_calls_raw,
+            self.mode,
+            &mut reusable_state,
+        ) {
+            Some(analysis) => analysis,
+            None => {
+                let mut message_diagnostics = ParseDiagnostics::default();
+                message_diagnostics.record_relevant(false);
+                GeminiMessageAnalysis {
+                    last_ts: 0,
+                    state: reusable_state,
+                    tokens: None,
+                    model: None,
+                    diagnostics: message_diagnostics,
+                }
+            }
+        };
+
+        self.store_message(id, analysis);
+    }
+
+    fn observe_value_event(&mut self, mut event: Value) {
+        if event.get("$rewindTo").is_some() {
+            self.diagnostics.record_recognized_source();
+            return;
+        }
+
+        if event.get("id").and_then(Value::as_str).is_some()
+            && let Some(message_type) = event.get("type").and_then(Value::as_str)
+        {
+            if matches!(message_type, "gemini" | "user" | "info" | "error") {
+                self.diagnostics.record_recognized_source();
+            } else {
+                self.diagnostics.record_unrecognized();
+            }
+            self.upsert_value_message(event);
+            return;
+        }
+
+        let Some(mut set) = event.as_object_mut().and_then(|map| map.remove("$set")) else {
+            self.diagnostics.record_unrecognized();
+            return;
+        };
+        self.diagnostics.record_recognized_source();
+        let Some(messages_value) = set.as_object_mut().and_then(|map| map.remove("messages"))
+        else {
+            return;
+        };
+        let Value::Array(snapshot) = messages_value else {
+            self.diagnostics.record_relevant(false);
+            return;
+        };
+
+        for message in snapshot {
+            self.upsert_value_message(message);
+        }
+    }
+
+    fn upsert_value_message(&mut self, message: Value) {
+        if message.get("type").and_then(Value::as_str) != Some("gemini") {
+            return;
+        }
+        let Some(id) = message
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+        else {
+            self.diagnostics.record_relevant(false);
+            return;
+        };
+
+        let raw_tokens_present = message
+            .get("tokens")
+            .is_some_and(|tokens| !tokens.is_null());
+        let tokens_supported = message
+            .get("tokens")
+            .filter(|tokens| !tokens.is_null())
+            .is_some_and(gemini_tokens_supported);
+
+        let mut reusable_state = self.take_reusable_state(&id);
+        let analysis = match serde_json::from_value::<GeminiAnalysisMessage>(message) {
+            Ok(mut message) => {
+                let mut message_diagnostics = ParseDiagnostics::default();
+                if raw_tokens_present {
+                    let normalized = message
+                        .model
+                        .as_deref()
+                        .is_some_and(|model| !model.is_empty())
+                        && tokens_supported;
+                    message_diagnostics.record_relevant(normalized);
+                    if !normalized {
+                        message.tokens = None;
+                    }
+                }
+                let ts = parse_iso_timestamp(&message.timestamp);
+                if message.message_type == "gemini" {
+                    for tool_call in &message.tool_calls {
+                        fold_value_tool_call(
+                            tool_call,
+                            ts,
+                            self.mode,
+                            &mut reusable_state,
+                            &mut message_diagnostics,
+                        );
+                    }
+                }
+                GeminiMessageAnalysis {
+                    last_ts: ts,
+                    state: reusable_state,
+                    tokens: message.tokens,
+                    model: message.model,
+                    diagnostics: message_diagnostics,
+                }
+            }
+            Err(_) => {
+                let mut message_diagnostics = ParseDiagnostics::default();
+                message_diagnostics.record_relevant(false);
+                GeminiMessageAnalysis {
+                    last_ts: 0,
+                    state: reusable_state,
+                    tokens: None,
+                    model: None,
+                    diagnostics: message_diagnostics,
+                }
+            }
+        };
+
+        self.store_message(Cow::Owned(id), analysis);
+    }
+
+    fn finish(self) -> Result<ParsedAnalysis> {
+        if let Some(err) = self.session_error {
+            return Err(err);
+        }
+        let session = self
+            .session
+            .context("Gemini session missing top-level object")?;
+        let mut classifier = self.tiers.map(TierClassifier::new);
+        let mut state = SessionParseState::with_mode(self.mode);
+        let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
+        let mut diagnostics = self.diagnostics;
+
+        for message in self.messages {
+            diagnostics.merge(message.diagnostics);
+            if message.last_ts > state.last_ts {
+                state.last_ts = message.last_ts;
+            }
+            if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
+                // `tokens.input` already includes cached tokens, so it is the full request prompt size.
+                let level = classifier
+                    .as_mut()
+                    .map_or(0, |classifier| classifier.level(model, tokens.input));
+                process_gemini_usage(&mut conversation_usage, model, tokens, level);
+            }
+            if let Some(msg_state) = message.state {
+                state.merge(msg_state);
+            }
+        }
+
+        let analysis = finalize_record(state, conversation_usage, session.session_id);
+        Ok(ParsedAnalysis::new(analysis, diagnostics))
+    }
 }
 
 /// Minimal Gemini message payload, omitting `content` and `thoughts` to keep deduplication memory bounded.
@@ -83,136 +417,643 @@ struct GeminiAnalysisMessage {
     tool_calls: Vec<Value>,
 }
 
-/// Deduplicates append-only `events` by message id (merging `$set.messages` snapshots and retaining `$rewindTo` history), compacting each revision under `mode`.
-fn deduplicate_messages<I>(
-    events: I,
-    mode: ParseMode,
-    diagnostics: &mut ParseDiagnostics,
-) -> Vec<GeminiMessageAnalysis>
+fn deserialize_present_raw<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<&'de RawValue>, D::Error>
 where
-    I: IntoIterator<Item = Value>,
+    D: Deserializer<'de>,
 {
-    let mut messages = Vec::new();
-    let mut positions: FastHashMap<String, usize> = FastHashMap::default();
-
-    for event in events {
-        if event.get("$rewindTo").is_some() {
-            diagnostics.record_recognized_source();
-            continue;
-        }
-
-        if event.get("id").and_then(Value::as_str).is_some()
-            && let Some(message_type) = event.get("type").and_then(Value::as_str)
-        {
-            if matches!(message_type, "gemini" | "user" | "info" | "error") {
-                diagnostics.record_recognized_source();
-            } else {
-                diagnostics.record_unrecognized();
-            }
-            upsert_message(&mut messages, &mut positions, event, mode, diagnostics);
-            continue;
-        }
-
-        let Some(set) = event.get("$set") else {
-            diagnostics.record_unrecognized();
-            continue;
-        };
-        diagnostics.record_recognized_source();
-        let Some(messages_value) = set.get("messages") else {
-            continue;
-        };
-        let Some(snapshot) = messages_value.as_array() else {
-            diagnostics.record_relevant(false);
-            continue;
-        };
-
-        for message in snapshot {
-            upsert_message(
-                &mut messages,
-                &mut positions,
-                message.clone(),
-                mode,
-                diagnostics,
-            );
-        }
-    }
-
-    messages
+    <&'de RawValue>::deserialize(deserializer).map(Some)
 }
 
-/// Inserts a new message or replaces the latest revision for an existing id.
-fn upsert_message(
-    messages: &mut Vec<GeminiMessageAnalysis>,
-    positions: &mut FastHashMap<String, usize>,
-    message: Value,
-    mode: ParseMode,
-    diagnostics: &mut ParseDiagnostics,
-) {
-    if message.get("type").and_then(Value::as_str) != Some("gemini") {
-        return;
+#[derive(Deserialize)]
+struct BorrowedGeminiEvent<'a> {
+    #[serde(
+        default,
+        borrow,
+        rename = "$rewindTo",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    rewind_to: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "$set",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    set: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    id: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "type",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    message_type: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    timestamp: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    tokens: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    model: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "toolCalls",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    tool_calls: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGeminiSet<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    messages: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGeminiSnapshotMessage<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    id: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "type",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    message_type: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    timestamp: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    tokens: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    model: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "toolCalls",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    tool_calls: Option<&'a RawValue>,
+}
+
+struct SnapshotMessagesSeed<'a, 'b> {
+    fold: &'b mut GeminiFold<'a>,
+}
+
+impl<'de> Visitor<'de> for SnapshotMessagesSeed<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a Gemini $set.messages array")
     }
-    let Some(id) = message
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-    else {
-        diagnostics.record_relevant(false);
-        return;
-    };
-    let raw_tokens = message
-        .get("tokens")
-        .filter(|tokens| !tokens.is_null())
-        .cloned();
-    let mut analysis = match serde_json::from_value::<GeminiAnalysisMessage>(message) {
-        Ok(mut message) => {
-            let mut message_diagnostics = ParseDiagnostics::default();
-            if let Some(raw_tokens) = raw_tokens.as_ref() {
-                let normalized = message
-                    .model
-                    .as_deref()
-                    .is_some_and(|model| !model.is_empty())
-                    && gemini_tokens_supported(raw_tokens);
-                message_diagnostics.record_relevant(normalized);
-                if !normalized {
-                    message.tokens = None;
+
+    fn visit_seq<A: SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        while let Some(raw) = seq.next_element::<&'de RawValue>()? {
+            if !raw.get().starts_with('{') {
+                continue;
+            }
+            let Ok(msg) = serde_json::from_str::<BorrowedGeminiSnapshotMessage<'de>>(raw.get())
+            else {
+                continue;
+            };
+            let is_gemini = msg
+                .message_type
+                .and_then(|raw| serde_json::from_str::<Cow<'de, str>>(raw.get()).ok())
+                .is_some_and(|kind| kind == "gemini");
+            if !is_gemini {
+                continue;
+            }
+            let id = msg
+                .id
+                .and_then(|raw| serde_json::from_str::<Cow<'de, str>>(raw.get()).ok());
+            self.fold.upsert_borrowed_message(
+                id,
+                msg.timestamp,
+                msg.tokens,
+                msg.model,
+                msg.tool_calls,
+            );
+        }
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for SnapshotMessagesSeed<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+enum ParsedGeminiTokens {
+    Valid(GeminiTokens),
+    Unsupported,
+}
+
+impl<'de> Deserialize<'de> for ParsedGeminiTokens {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ParsedGeminiTokens;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a Gemini tokens object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut tokens = GeminiTokens {
+                    input: 0,
+                    output: 0,
+                    cached: 0,
+                    thoughts: 0,
+                    tool: 0,
+                    total: 0,
+                };
+                let mut recognized = false;
+
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "input" => {
+                            tokens.input = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "output" => {
+                            tokens.output = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "cached" => {
+                            tokens.cached = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "thoughts" => {
+                            tokens.thoughts = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "tool" => {
+                            tokens.tool = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        "total" => {
+                            tokens.total = map.next_value::<i64>()?;
+                            recognized = true;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                if recognized {
+                    Ok(ParsedGeminiTokens::Valid(tokens))
+                } else {
+                    Ok(ParsedGeminiTokens::Unsupported)
                 }
             }
-            record_message_diagnostics(&message, &mut message_diagnostics);
-            let mut state = SessionParseState::with_mode(mode);
-            process_gemini_message(&mut state, &message);
-            GeminiMessageAnalysis {
-                state,
-                tokens: message.tokens,
-                model: message.model,
-                diagnostics: message_diagnostics,
-            }
         }
-        Err(_) => {
-            let mut message_diagnostics = ParseDiagnostics::default();
-            message_diagnostics.record_relevant(false);
-            GeminiMessageAnalysis {
-                state: SessionParseState::with_mode(mode),
-                tokens: None,
-                model: None,
-                diagnostics: message_diagnostics,
-            }
+        deserializer.deserialize_map(V)
+    }
+}
+
+fn parse_borrowed_gemini_message(
+    timestamp_raw: Option<&RawValue>,
+    tokens_raw: Option<&RawValue>,
+    model_raw: Option<&RawValue>,
+    tool_calls_raw: Option<&RawValue>,
+    mode: ParseMode,
+    reusable_state: &mut Option<SessionParseState>,
+) -> Option<GeminiMessageAnalysis> {
+    let ts = match timestamp_raw {
+        Some(raw) => {
+            let timestamp = serde_json::from_str::<Cow<'_, str>>(raw.get()).ok()?;
+            parse_iso_timestamp(&timestamp)
         }
+        None => 0,
     };
 
-    if let Some(&index) = positions.get(&id) {
-        // Preserve prior billed tokens and model when a later revision omits `tokens`.
-        if analysis.tokens.is_none() {
-            let prior = &mut messages[index];
-            analysis.tokens = prior.tokens.take();
-            if analysis.model.is_none() {
-                analysis.model = prior.model.take();
+    let model = match model_raw {
+        Some(raw) => serde_json::from_str::<Option<Cow<'_, str>>>(raw.get()).ok()?,
+        None => None,
+    };
+
+    let mut message_diagnostics = ParseDiagnostics::default();
+    let tokens = match tokens_raw {
+        Some(raw) if raw.get() != "null" => {
+            let parsed = serde_json::from_str::<ParsedGeminiTokens>(raw.get()).ok()?;
+            match parsed {
+                ParsedGeminiTokens::Valid(tokens)
+                    if model.as_deref().is_some_and(|m| !m.is_empty()) =>
+                {
+                    message_diagnostics.record_relevant(true);
+                    Some(tokens)
+                }
+                _ => {
+                    message_diagnostics.record_relevant(false);
+                    None
+                }
             }
         }
-        messages[index] = analysis;
-    } else {
-        positions.insert(id, messages.len());
-        messages.push(analysis);
+        _ => None,
+    };
+
+    if let Some(raw) = tool_calls_raw {
+        let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+        ToolCallsSeed {
+            ts,
+            mode,
+            state: reusable_state,
+            diagnostics: &mut message_diagnostics,
+        }
+        .deserialize(&mut deserializer)
+        .ok()?;
+    }
+
+    Some(GeminiMessageAnalysis {
+        last_ts: ts,
+        state: reusable_state.take(),
+        tokens,
+        model: model.map(Cow::into_owned),
+        diagnostics: message_diagnostics,
+    })
+}
+
+struct ToolCallsSeed<'s, 'd> {
+    ts: i64,
+    mode: ParseMode,
+    state: &'s mut Option<SessionParseState>,
+    diagnostics: &'d mut ParseDiagnostics,
+}
+
+impl<'de> Visitor<'de> for ToolCallsSeed<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a Gemini toolCalls array")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        while let Some(raw) = seq.next_element::<&'de RawValue>()? {
+            if !raw.get().starts_with('{') {
+                continue;
+            }
+            if let Ok(tc) = serde_json::from_str::<BorrowedGeminiToolCall<'de>>(raw.get()) {
+                fold_borrowed_tool_call(&tc, self.ts, self.mode, self.state, self.diagnostics);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for ToolCallsSeed<'_, '_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+#[derive(Deserialize)]
+struct BorrowedGeminiToolCall<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    name: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    status: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    args: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    result: Option<&'a RawValue>,
+}
+
+fn raw_as_str<'a>(raw: Option<&'a RawValue>) -> Option<Cow<'a, str>> {
+    let raw = raw?;
+    if !raw.get().starts_with('"') {
+        return None;
+    }
+    serde_json::from_str::<Cow<'a, str>>(raw.get()).ok()
+}
+
+fn raw_is_empty_result(raw: Option<&RawValue>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let s = raw.get();
+    if s == "null" {
+        return true;
+    }
+    s.starts_with('[')
+        && s.ends_with(']')
+        && s[1..s.len() - 1].bytes().all(|b| b.is_ascii_whitespace())
+}
+
+fn borrowed_tool_status(tc: &BorrowedGeminiToolCall<'_>) -> GeminiToolStatus {
+    match raw_as_str(tc.status).as_deref() {
+        Some("success") => GeminiToolStatus::Success,
+        Some("error" | "failed") => GeminiToolStatus::Failed,
+        Some("pending" | "running") => GeminiToolStatus::Pending,
+        None if raw_is_empty_result(tc.result) => GeminiToolStatus::Pending,
+        _ => GeminiToolStatus::Unsupported,
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct BorrowedGeminiArgs<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    file_path: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    content: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    old_string: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    old_text: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    new_string: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    new_text: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    command: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    cmd: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    description: Option<&'a RawValue>,
+}
+
+fn first_raw_str<'a>(
+    primary: Option<&'a RawValue>,
+    fallback: Option<&'a RawValue>,
+) -> Option<Cow<'a, str>> {
+    raw_as_str(primary.or(fallback))
+}
+
+fn first_raw_metrics(
+    primary: Option<&RawValue>,
+    fallback: Option<&RawValue>,
+) -> Option<TextMetrics> {
+    count_json_string_metrics(primary.or(fallback)?.get())
+}
+
+#[derive(Deserialize)]
+struct BorrowedGeminiReadItem<'a> {
+    #[serde(default, borrow, rename = "functionResponse")]
+    function_response: Option<BorrowedGeminiFunctionResponse<'a>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGeminiFunctionResponse<'a> {
+    #[serde(default, borrow)]
+    response: Option<BorrowedGeminiResponsePayload<'a>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedGeminiResponsePayload<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    output: Option<&'a RawValue>,
+}
+
+fn borrowed_tool_result_output_raw<'a>(result: Option<&'a RawValue>) -> Option<&'a RawValue> {
+    struct FirstItem;
+    impl<'de> Visitor<'de> for FirstItem {
+        type Value = Option<&'de RawValue>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a Gemini result array")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let first = seq.next_element::<&'de RawValue>()?;
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(first)
+        }
+    }
+
+    let raw = result?;
+    if !raw.get().starts_with('[') {
+        return None;
+    }
+    let mut de = serde_json::Deserializer::from_str(raw.get());
+    let first = de.deserialize_seq(FirstItem).ok()??;
+    if !first.get().starts_with('{') {
+        return None;
+    }
+    let item = serde_json::from_str::<BorrowedGeminiReadItem<'a>>(first.get()).ok()?;
+    item.function_response?.response?.output
+}
+
+fn fold_borrowed_tool_call(
+    tc: &BorrowedGeminiToolCall<'_>,
+    ts: i64,
+    mode: ParseMode,
+    state_slot: &mut Option<SessionParseState>,
+    diagnostics: &mut ParseDiagnostics,
+) {
+    let Some(tool) = raw_as_str(tc.name)
+        .as_deref()
+        .and_then(TrackedTool::from_name)
+    else {
+        return;
+    };
+    let status = borrowed_tool_status(tc);
+    match status {
+        GeminiToolStatus::Unsupported => {
+            diagnostics.record_relevant(false);
+        }
+        GeminiToolStatus::Failed => {
+            diagnostics.record_relevant(true);
+            let state = state_slot.get_or_insert_with(|| SessionParseState::with_mode(mode));
+            tool.record_invocation(state);
+        }
+        GeminiToolStatus::Pending => {
+            diagnostics.record_relevant(false);
+            let state = state_slot.get_or_insert_with(|| SessionParseState::with_mode(mode));
+            tool.record_invocation(state);
+        }
+        GeminiToolStatus::Success => {
+            let state = state_slot.get_or_insert_with(|| SessionParseState::with_mode(mode));
+            if record_borrowed_success(tool, tc.args, tc.result, state, ts) {
+                diagnostics.record_relevant(true);
+            } else {
+                diagnostics.record_relevant(false);
+                tool.record_invocation(state);
+            }
+        }
+    }
+}
+
+fn record_borrowed_success(
+    tool: TrackedTool,
+    args_raw: Option<&RawValue>,
+    result_raw: Option<&RawValue>,
+    state: &mut SessionParseState,
+    ts: i64,
+) -> bool {
+    match tool {
+        TrackedTool::TodoWrite => {
+            state.tool_counts.todo_write += 1;
+            return true;
+        }
+        TrackedTool::ReadManyFiles => {
+            state.tool_counts.read += 1;
+            return true;
+        }
+        _ => {}
+    }
+
+    let Some(args_raw) = args_raw.filter(|raw| raw.get().starts_with('{')) else {
+        return false;
+    };
+    let Ok(args) = serde_json::from_str::<BorrowedGeminiArgs<'_>>(args_raw.get()) else {
+        return false;
+    };
+
+    let usage_only = matches!(state.mode, ParseMode::UsageOnly);
+    match tool {
+        TrackedTool::Read => {
+            let Some(file_path) = raw_as_str(args.file_path).filter(|p| !p.is_empty()) else {
+                return false;
+            };
+            let Some(output_raw) = borrowed_tool_result_output_raw(result_raw) else {
+                return false;
+            };
+            if usage_only {
+                let Some(metrics) = count_json_string_metrics(output_raw.get()) else {
+                    return false;
+                };
+                state.tool_counts.read += 1;
+                let count = state.tool_counts.read;
+                state.add_read_counts(&file_path, metrics.lines, metrics.chars);
+                state.tool_counts.read = count;
+            } else {
+                let Some(content) = raw_as_str(Some(output_raw)) else {
+                    return false;
+                };
+                state.tool_counts.read += 1;
+                attach_read_detail(state, &file_path, &content, ts);
+            }
+            true
+        }
+        TrackedTool::Write => {
+            let Some(file_path) = raw_as_str(args.file_path).filter(|p| !p.is_empty()) else {
+                return false;
+            };
+            if usage_only {
+                let Some(metrics) = args
+                    .content
+                    .and_then(|raw| count_json_string_metrics(raw.get()))
+                else {
+                    return false;
+                };
+                state.add_write_counts(&file_path, metrics.lines, metrics.chars);
+            } else {
+                let Some(content) = raw_as_str(args.content) else {
+                    return false;
+                };
+                state.add_write_detail(&file_path, &content, ts);
+            }
+            true
+        }
+        TrackedTool::Edit => {
+            let Some(file_path) = raw_as_str(args.file_path).filter(|p| !p.is_empty()) else {
+                return false;
+            };
+            if usage_only {
+                // Validate `old_string`/`old_text` is a JSON string even though `add_edit_counts_raw` counts only `new`.
+                let Some(old_raw) = args.old_string.or(args.old_text) else {
+                    return false;
+                };
+                if count_json_string_metrics(old_raw.get()).is_none() {
+                    return false;
+                }
+                let Some(new_metrics) = first_raw_metrics(args.new_string, args.new_text) else {
+                    return false;
+                };
+                state.add_edit_counts_raw(&file_path, new_metrics.lines, new_metrics.chars);
+            } else {
+                let Some(old_string) = first_raw_str(args.old_string, args.old_text) else {
+                    return false;
+                };
+                let Some(new_string) = first_raw_str(args.new_string, args.new_text) else {
+                    return false;
+                };
+                state.add_edit_detail_raw(&file_path, &old_string, &new_string, ts);
+            }
+            true
+        }
+        TrackedTool::Shell => {
+            let Some(command) =
+                first_raw_str(args.command, args.cmd).filter(|cmd| !cmd.trim().is_empty())
+            else {
+                return false;
+            };
+            let description = if usage_only {
+                Cow::Borrowed("")
+            } else {
+                raw_as_str(args.description).unwrap_or(Cow::Borrowed(""))
+            };
+            state.add_run_command(&command, &description, ts);
+            true
+        }
+        TrackedTool::TodoWrite | TrackedTool::ReadManyFiles => unreachable!(),
+    }
+}
+
+fn fold_value_tool_call(
+    tool_call: &Value,
+    ts: i64,
+    mode: ParseMode,
+    state_slot: &mut Option<SessionParseState>,
+    diagnostics: &mut ParseDiagnostics,
+) {
+    let Some(tool) = tool_call
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(TrackedTool::from_name)
+    else {
+        return;
+    };
+    let status = gemini_tool_status(tool_call);
+    match status {
+        GeminiToolStatus::Unsupported => {
+            diagnostics.record_relevant(false);
+        }
+        GeminiToolStatus::Failed => {
+            diagnostics.record_relevant(true);
+            let state = state_slot.get_or_insert_with(|| SessionParseState::with_mode(mode));
+            tool.record_invocation(state);
+        }
+        GeminiToolStatus::Pending => {
+            diagnostics.record_relevant(false);
+            let state = state_slot.get_or_insert_with(|| SessionParseState::with_mode(mode));
+            tool.record_invocation(state);
+        }
+        GeminiToolStatus::Success => {
+            let state = state_slot.get_or_insert_with(|| SessionParseState::with_mode(mode));
+            if let Some(args) = tool.read_args(tool_call) {
+                diagnostics.record_relevant(true);
+                args.record(state, ts);
+            } else {
+                diagnostics.record_relevant(false);
+                tool.record_invocation(state);
+            }
+        }
     }
 }
 
@@ -389,24 +1230,6 @@ fn arg_file_path(args: Option<&Value>) -> Option<&str> {
     arg_str(args, &["file_path"]).filter(|path| !path.is_empty())
 }
 
-fn record_message_diagnostics(message: &GeminiAnalysisMessage, diagnostics: &mut ParseDiagnostics) {
-    for tool_call in &message.tool_calls {
-        let Some(tool) = tool_call
-            .get("name")
-            .and_then(Value::as_str)
-            .and_then(TrackedTool::from_name)
-        else {
-            continue;
-        };
-        let normalized = match gemini_tool_status(tool_call) {
-            GeminiToolStatus::Success => tool.read_args(tool_call).is_some(),
-            GeminiToolStatus::Failed => true,
-            GeminiToolStatus::Pending | GeminiToolStatus::Unsupported => false,
-        };
-        diagnostics.record_relevant(normalized);
-    }
-}
-
 /// Builds a single-record [`CodeAnalysis`] with `session_id` (Gemini CLI logs omit workspace paths, leaving `folder_path` and `git_remote` empty).
 fn finalize_record(
     state: SessionParseState,
@@ -424,39 +1247,6 @@ fn finalize_record(
         insights_version: String::new(),
         machine_id: String::new(),
         records: vec![record],
-    }
-}
-
-/// Folds one assistant message's timestamp and tools into a compact state.
-fn process_gemini_message(state: &mut SessionParseState, message: &GeminiAnalysisMessage) {
-    let ts = parse_iso_timestamp(&message.timestamp);
-    if ts > state.last_ts {
-        state.last_ts = ts;
-    }
-
-    if message.message_type != "gemini" {
-        return;
-    }
-
-    for tool_call in &message.tool_calls {
-        let Some(tool) = tool_call
-            .get("name")
-            .and_then(|n| n.as_str())
-            .and_then(TrackedTool::from_name)
-        else {
-            continue;
-        };
-        let status = gemini_tool_status(tool_call);
-        if status == GeminiToolStatus::Unsupported {
-            continue;
-        }
-        if status == GeminiToolStatus::Success
-            && let Some(args) = tool.read_args(tool_call)
-        {
-            args.record(state, ts);
-        } else {
-            tool.record_invocation(state);
-        }
     }
 }
 
@@ -1001,5 +1791,100 @@ mod tests {
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
         assert_eq!(parsed.analysis.records[0].tool_call_counts.read, 1);
         assert_eq!(parsed.analysis.records[0].total_read_lines, 2);
+    }
+
+    #[test]
+    fn borrowed_jsonl_stream_matches_value_parser_across_snapshots_and_cjk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let meta = json!({
+            "sessionId": "s-gemini",
+            "projectHash": "proj",
+            "startTime": "2026-07-12T00:00:00Z",
+            "lastUpdated": "2026-07-12T00:01:00Z",
+            "kind": "main"
+        });
+        let events = vec![
+            json!({ "id": "u1", "timestamp": "2026-07-12T00:00:01Z", "type": "user", "content": "hi" }),
+            assistant(
+                "m1",
+                "gemini-test",
+                100,
+                json!([{
+                    "name": "read_file",
+                    "args": { "file_path": "/tmp/zh.txt" },
+                    "result": [{ "functionResponse": { "response": { "output": "繁體中文\n第二行🚀\n" } } }]
+                }]),
+            ),
+            // Snapshot supersedes m1 and introduces m2 with write + replace.
+            json!({
+                "$set": {
+                    "messages": [
+                        { "id": "u1", "timestamp": "2026-07-12T00:00:01Z", "type": "user", "content": "hi" },
+                        assistant(
+                            "m1",
+                            "gemini-test",
+                            150,
+                            json!([{
+                                "name": "read_file",
+                                "args": { "file_path": "/tmp/zh.txt" },
+                                "result": [{ "functionResponse": { "response": { "output": "繁體中文\n第二行🚀\n第三行\n" } } }]
+                            }]),
+                        ),
+                        assistant(
+                            "m2",
+                            "gemini-test",
+                            200,
+                            json!([
+                                { "name": "write_file", "args": { "file_path": "/tmp/out.txt", "content": "寫入\n多行😀\n\n" } },
+                                { "name": "replace", "args": { "file_path": "/tmp/out.txt", "old_text": "", "new_text": "修改\r\n後" } },
+                                { "name": "run_shell_command", "args": { "cmd": "ls -la", "description": "list" } },
+                                { "name": "write_todos", "args": {} },
+                                { "name": "read_many_files", "args": {} }
+                            ]),
+                        )
+                    ]
+                }
+            }),
+            json!({ "$rewindTo": "m1" }),
+        ];
+
+        let mut body = format!("{meta}\n");
+        for event in &events {
+            body.push_str(&format!("{event}\n"));
+        }
+        std::fs::write(&path, body).unwrap();
+
+        let session: GeminiSession = serde_json::from_value(meta).unwrap();
+        let owned_full =
+            parse_gemini_events_with_diagnostics(session, events, ParseMode::Full, None).unwrap();
+        let streamed_full = parse_gemini_jsonl_path(&path, ParseMode::Full, None)
+            .unwrap()
+            .unwrap();
+        let streamed_usage = parse_gemini_jsonl_path(&path, ParseMode::UsageOnly, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(streamed_full.diagnostics, owned_full.diagnostics);
+        assert_eq!(streamed_usage.diagnostics, owned_full.diagnostics);
+        let o = &owned_full.analysis.records[0];
+        let sf = &streamed_full.analysis.records[0];
+        let su = &streamed_usage.analysis.records[0];
+        assert_eq!(
+            serde_json::to_value(sf).unwrap(),
+            serde_json::to_value(o).unwrap()
+        );
+        assert_eq!(su.total_unique_files, o.total_unique_files);
+        assert_eq!(su.total_read_lines, o.total_read_lines);
+        assert_eq!(su.total_read_characters, o.total_read_characters);
+        assert_eq!(su.total_write_lines, o.total_write_lines);
+        assert_eq!(su.total_write_characters, o.total_write_characters);
+        assert_eq!(su.total_edit_lines, o.total_edit_lines);
+        assert_eq!(su.total_edit_characters, o.total_edit_characters);
+        assert_eq!(
+            serde_json::to_value(&su.tool_call_counts).unwrap(),
+            serde_json::to_value(&o.tool_call_counts).unwrap()
+        );
+        assert_eq!(su.conversation_usage, o.conversation_usage);
     }
 }
