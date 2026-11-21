@@ -4,7 +4,8 @@
 use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::*;
 use crate::utils::count_lines;
-use serde_json::Value;
+use serde::{Deserialize, Deserializer};
+use serde_json::{Value, value::RawValue};
 use std::borrow::Cow;
 use std::path::Path;
 
@@ -23,6 +24,151 @@ impl TextMetrics {
             lines: count_lines(trimmed),
             chars: bytecount::num_chars(trimmed.as_bytes()),
         }
+    }
+
+    /// Returns whether the trimmed content is empty.
+    #[inline]
+    pub(crate) fn is_empty(self) -> bool {
+        self.chars == 0
+    }
+}
+
+/// Incremental counter matching `trim_end_matches('\n')` + `count_lines` + `chars().count()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StreamingTextCounter {
+    total_chars: usize,
+    interior_newlines: usize,
+    trailing_newlines: usize,
+}
+
+impl StreamingTextCounter {
+    /// Records `count` consecutive non-newline Unicode scalar values.
+    #[inline]
+    pub(crate) fn push_non_newline_chars(&mut self, count: usize) {
+        if count > 0 {
+            if self.trailing_newlines > 0 {
+                self.total_chars += self.trailing_newlines;
+                self.interior_newlines += self.trailing_newlines;
+                self.trailing_newlines = 0;
+            }
+            self.total_chars += count;
+        }
+    }
+
+    /// Records a single `\n` character.
+    #[inline]
+    pub(crate) fn push_newline(&mut self) {
+        self.trailing_newlines += 1;
+    }
+
+    /// Finalizes the accumulated counts, discarding trailing `\n` characters.
+    #[inline]
+    pub(crate) fn finish(self) -> TextMetrics {
+        if self.total_chars == 0 {
+            TextMetrics::default()
+        } else {
+            TextMetrics {
+                lines: self.interior_newlines + 1,
+                chars: self.total_chars,
+            }
+        }
+    }
+}
+
+#[inline]
+fn parse_hex4(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let mut value = 0_u16;
+    for &b in &bytes[..4] {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as u16,
+            b'a'..=b'f' => (b - b'a' + 10) as u16,
+            b'A'..=b'F' => (b - b'A' + 10) as u16,
+            _ => return None,
+        };
+        value = (value << 4) | digit;
+    }
+    Some(value)
+}
+
+/// Computes trimmed `(lines, chars)` directly from a `serde_json`-validated raw JSON string token without allocating a `String`.
+///
+/// Returns `None` if `raw` is not a JSON string literal or contains an invalid escape or unpaired UTF-16 surrogate.
+pub(crate) fn count_json_string_metrics(raw: &str) -> Option<TextMetrics> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return None;
+    }
+    let inner = &raw[1..raw.len() - 1];
+    let inner_bytes = inner.as_bytes();
+    let mut counter = StreamingTextCounter::default();
+    let mut i = 0;
+
+    while i < inner_bytes.len() {
+        let seg_end = match inner[i..].find('\\') {
+            Some(offset) => i + offset,
+            None => inner_bytes.len(),
+        };
+        if seg_end > i {
+            counter.push_non_newline_chars(bytecount::num_chars(&inner_bytes[i..seg_end]));
+        }
+        if seg_end == inner_bytes.len() {
+            break;
+        }
+        let esc = *inner_bytes.get(seg_end + 1)?;
+        match esc {
+            b'n' => {
+                counter.push_newline();
+                i = seg_end + 2;
+            }
+            b'"' | b'\\' | b'/' | b'b' | b'f' | b'r' | b't' => {
+                counter.push_non_newline_chars(1);
+                i = seg_end + 2;
+            }
+            b'u' => {
+                let code = parse_hex4(inner_bytes.get(seg_end + 2..seg_end + 6)?)?;
+                if code == 0x000A {
+                    counter.push_newline();
+                    i = seg_end + 6;
+                } else if (0xD800..=0xDBFF).contains(&code) {
+                    if inner_bytes.get(seg_end + 6..seg_end + 8) != Some(b"\\u") {
+                        return None;
+                    }
+                    let low = parse_hex4(inner_bytes.get(seg_end + 8..seg_end + 12)?)?;
+                    if !(0xDC00..=0xDFFF).contains(&low) {
+                        return None;
+                    }
+                    counter.push_non_newline_chars(1);
+                    i = seg_end + 12;
+                } else if (0xDC00..=0xDFFF).contains(&code) {
+                    return None;
+                } else {
+                    counter.push_non_newline_chars(1);
+                    i = seg_end + 6;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    Some(counter.finish())
+}
+
+/// Deserializes a JSON string token directly into [`TextMetrics`] without allocating a file-body `String`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CountedJsonString(pub(crate) TextMetrics);
+
+impl<'de> Deserialize<'de> for CountedJsonString {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = <&'de RawValue>::deserialize(deserializer)?;
+        count_json_string_metrics(raw.get())
+            .map(Self)
+            .ok_or_else(|| serde::de::Error::custom("expected a valid JSON string"))
     }
 }
 
@@ -769,5 +915,69 @@ mod tests {
         assert_eq!(counted.tool_counts.read, full.tool_counts.read);
         assert_eq!(counted.tool_counts.write, full.tool_counts.write);
         assert_eq!(counted.tool_counts.edit, full.tool_counts.edit);
+    }
+
+    #[test]
+    fn counted_json_string_matches_unescaped_metrics_across_edge_cases() {
+        let valid_raws = [
+            r#""""#,
+            r#""\n""#,
+            r#""\n\n\n""#,
+            r#""\u000a\n\u000A""#,
+            r#""hello""#,
+            r#""hello\n""#,
+            r#""hello\n\n""#,
+            r#""\nhello\nworld\n""#,
+            r#""a\r\nb\r\n""#,
+            r#""a\r\n\n""#,
+            r#""a\n\nb""#,
+            r#""\"\\\/\b\f\r\t""#,
+            r#""\\n""#,
+            r#""你好世界\n繁體中文\n""#,
+            r#""🚀🎉\n\uD83D\uDE00\u4E2D\n""#,
+            r#""\u0000""#,
+            r#""a\u000ab""#,
+            r#""café\t日本語\n👨‍👩‍👧‍👦\r\nend\n\n""#,
+        ];
+
+        for raw in valid_raws {
+            let decoded: String = serde_json::from_str(raw).unwrap();
+            let expected = TextMetrics::from_str(&decoded);
+            assert_eq!(
+                count_json_string_metrics(raw),
+                Some(expected),
+                "raw mismatch for {raw}"
+            );
+            let parsed: CountedJsonString = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed.0, expected, "deserialize mismatch for {raw}");
+        }
+
+        // Invalid tokens and unpaired UTF-16 surrogates must fail identically to `String`.
+        for invalid in [
+            "42",
+            "true",
+            "{}",
+            "[]",
+            r#""\uD800""#,
+            r#""\uDC00""#,
+            r#""\uD800abc""#,
+            r#""\uD800\u0041""#,
+        ] {
+            assert_eq!(
+                count_json_string_metrics(invalid),
+                None,
+                "should reject {invalid}"
+            );
+            assert!(
+                serde_json::from_str::<CountedJsonString>(invalid).is_err(),
+                "deserialize should reject {invalid}"
+            );
+        }
+
+        // `Option<CountedJsonString>` still accepts JSON `null` as `None`.
+        assert_eq!(
+            serde_json::from_str::<Option<CountedJsonString>>("null").unwrap(),
+            None
+        );
     }
 }
