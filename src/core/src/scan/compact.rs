@@ -273,7 +273,7 @@ where
     for file in files {
         let key = session_key(provider, dirs, &file.path);
         if single_file {
-            if let Some(entry) = book.sessions.get(&key)
+            if let Some(entry) = book.sessions.get_mut(&key)
                 && entry_matches_target(entry, target, &file, tiers_fingerprint)
             {
                 let stamp = entry.scanned.half(verdict_feature);
@@ -283,7 +283,9 @@ where
                 if let Some(failure) = stamp.and_then(|stamp| stamp.failure.as_ref()) {
                     retained_failures.push((file.path.clone(), failure.clone()));
                 }
-                book.mark_present(&key);
+                if entry.missing_since.take().is_some() {
+                    book.dirty = true;
+                }
                 seen.insert(key);
                 continue;
             }
@@ -312,7 +314,7 @@ where
                     continue;
                 }
             };
-            match book.sessions.get(&key) {
+            match book.sessions.get_mut(&key) {
                 Some(entry) if entry_matches_stamp(entry, target, &current) => {
                     let stamp = entry.scanned.half(verdict_feature);
                     if stamp.is_none_or(|stamp| stamp.parsed) {
@@ -321,7 +323,9 @@ where
                     if let Some(failure) = stamp.and_then(|stamp| stamp.failure.as_ref()) {
                         retained_failures.push((file.path, failure.clone()));
                     }
-                    book.mark_present(&key);
+                    if entry.missing_since.take().is_some() {
+                        book.dirty = true;
+                    }
                     seen.insert(key);
                 }
                 _ => {
@@ -330,6 +334,12 @@ where
                 }
             }
         }
+    }
+
+    // LPT scheduling: dispatch largest files first so huge logs do not stall the parallel tail.
+    let reordered_misses = misses.len() > 1;
+    if reordered_misses {
+        misses.sort_unstable_by_key(|left| std::cmp::Reverse(left.0.len));
     }
 
     let loaded: Vec<_> = misses
@@ -357,6 +367,14 @@ where
                 hard_failures.push((source, error.to_string()));
                 failed_keys.insert(key);
             }
+        }
+    }
+    if reordered_misses {
+        if hard_failures.len() > 1 {
+            hard_failures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        }
+        if retained_failures.len() > 1 {
+            retained_failures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         }
     }
 

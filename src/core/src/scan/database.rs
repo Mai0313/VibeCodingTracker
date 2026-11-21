@@ -4,19 +4,18 @@
 
 use super::compact::{CompactSink, cutoff_string, fold_days};
 use super::{ScanDiagnostics, ScanFeature};
-use crate::constants::FastHashSet;
+use crate::constants::{FastHashMap, FastHashSet};
 use crate::ledger::{DayEntry, ProviderLedger, ScanStamp, SessionLedger, TinyMap, stamp, today};
 use crate::models::{ExtensionType, TimeRange};
 use crate::session::diagnostics::{DatabaseAnalysisRow, DatabaseUsageRead};
 use crate::session::sqlite::is_cacheable_sqlite_failure;
 use anyhow::Result;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// One half of every session a database read produced.
 pub(crate) struct DatabaseHalfRead {
     /// Session id → that session's `feature` half, by day.
-    pub(crate) sessions: BTreeMap<String, SessionRead>,
+    pub(crate) sessions: FastHashMap<String, SessionRead>,
     /// Whether the read produced usable data.
     pub(crate) parsed: bool,
     /// The read's diagnostic, beside its data or in place of it.
@@ -48,13 +47,20 @@ pub(crate) fn group_usage_rows(
     } else {
         None
     };
-    let mut sessions: BTreeMap<String, SessionRead> = BTreeMap::new();
+    let mut sessions: FastHashMap<String, SessionRead> = FastHashMap::default();
     for row in read.rows {
-        let session = sessions.entry(row.session_id).or_default();
+        let session = match sessions.get_mut(&row.session_id) {
+            Some(session) => session,
+            None => sessions.entry(row.session_id).or_default(),
+        };
         if row.cwd.is_some() {
             session.cwd = row.cwd;
         }
-        session.days.entry(row.date).or_default().add_usage_row(
+        let day = match session.days.get_mut(&row.date) {
+            Some(day) => day,
+            None => session.days.entry(row.date).or_default(),
+        };
+        day.add_usage_row(
             row.model,
             row.tokens,
             row.tier_level,
@@ -74,19 +80,22 @@ pub(crate) fn group_analysis_rows(
     parsed: bool,
     failure: Option<String>,
 ) -> DatabaseHalfRead {
-    let mut sessions: BTreeMap<String, SessionRead> = BTreeMap::new();
+    let mut sessions: FastHashMap<String, SessionRead> = FastHashMap::default();
     for row in rows {
-        let session = sessions.entry(row.session_id).or_default();
+        let session = match sessions.get_mut(&row.session_id) {
+            Some(session) => session,
+            None => sessions.entry(row.session_id).or_default(),
+        };
         if let Some(record) = row.analysis.records.first()
             && !record.folder_path.is_empty()
         {
             session.cwd = Some(record.folder_path.clone());
         }
-        session
-            .days
-            .entry(row.date)
-            .or_default()
-            .add_analysis_records(&row.analysis);
+        let day = match session.days.get_mut(&row.date) {
+            Some(day) => day,
+            None => session.days.entry(row.date).or_default(),
+        };
+        day.add_analysis_records(&row.analysis);
     }
     DatabaseHalfRead {
         sessions,

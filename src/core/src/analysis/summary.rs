@@ -88,7 +88,7 @@ pub struct AnalysisProviderStats {
 
 impl AnalysisProviderStats {
     /// Adds one model row's metrics into the running provider totals.
-    fn accumulate_row(&mut self, row: &AnalysisRow) {
+    fn accumulate_row(&mut self, row: &AggregatedAnalysisRow) {
         self.total_edit_lines += row.edit_lines;
         self.total_read_lines += row.read_lines;
         self.total_write_lines += row.write_lines;
@@ -212,8 +212,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
 
 /// Folds every aggregated row for one provider into its `stats` totals.
 fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[AggregatedAnalysisRow]) {
-    let analysis_rows = convert_to_analysis_rows(rows);
-    for row in &analysis_rows {
+    for row in rows {
         stats.accumulate_row(row);
     }
 }

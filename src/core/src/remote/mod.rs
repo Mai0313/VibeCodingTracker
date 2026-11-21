@@ -250,8 +250,9 @@ fn fetch_one(
 fn ssh_command(program: &OsStr, host: &str, remote_command: &str) -> Command {
     let mut ssh = Command::new(program);
     // BatchMode makes ssh fail instead of asking for a password or a host key,
-    // which would otherwise wait on a terminal the TUI owns.
-    ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+    // which would otherwise wait on a terminal the TUI owns; `-C` compresses
+    // the repetitive JSON export over WAN/VPN links.
+    ssh.args(["-C", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
         .arg(host)
         .arg(remote_command);
     #[cfg(windows)]
@@ -390,7 +391,7 @@ fn run(
                 timeout.as_secs()
             )));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(10));
     };
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
@@ -431,7 +432,8 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<St
         if let Some(mut pipe) = pipe {
             let _ = pipe.read_to_end(&mut bytes);
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
     })
 }
 
@@ -609,7 +611,7 @@ echo '{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider
         );
         assert_eq!(
             std::fs::read_to_string(args).unwrap(),
-            "-o\nBatchMode=yes\n-o\nConnectTimeout=10\nwei@devbox\n/opt/vct ledger export\n"
+            "-C\n-o\nBatchMode=yes\n-o\nConnectTimeout=10\nwei@devbox\n/opt/vct ledger export\n"
         );
     }
 
@@ -702,7 +704,7 @@ echo '{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider
         let ssh = fake_ssh(
             local_cache.path(),
             &format!(
-                ". '{}'\nshift 5\nexec sh -c \"$1\"",
+                ". '{}'\nshift 6\nexec sh -c \"$1\"",
                 env_file.to_string_lossy().replace('\'', "'\\''"),
             ),
         );
@@ -783,7 +785,7 @@ echo '{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider
         let ssh = fake_ssh(
             local_cache.path(),
             &format!(
-                ". '{}'\nshift 5\nexec sh -c \"$1\"",
+                ". '{}'\nshift 6\nexec sh -c \"$1\"",
                 env_file.to_string_lossy().replace('\'', "'\\''"),
             ),
         );

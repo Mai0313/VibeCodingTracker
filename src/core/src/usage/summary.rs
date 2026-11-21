@@ -308,6 +308,32 @@ pub fn build_usage_summary(
 
     summary.rows.reserve(usage_data.len());
 
+    let totals = &mut summary.provider_totals;
+    let ProviderActiveDays {
+        claude: claude_days,
+        codex: codex_days,
+        copilot: copilot_days,
+        gemini: gemini_days,
+        opencode: opencode_days,
+        cursor: cursor_days,
+        hermes: hermes_days,
+        grok: grok_days,
+        deepseek: deepseek_days,
+        antigravity: antigravity_days,
+        total: total_days,
+    } = *provider_days;
+    totals.claude.days_count = claude_days;
+    totals.codex.days_count = codex_days;
+    totals.copilot.days_count = copilot_days;
+    totals.gemini.days_count = gemini_days;
+    totals.grok.days_count = grok_days;
+    totals.deepseek.days_count = deepseek_days;
+    totals.antigravity.days_count = antigravity_days;
+    totals.opencode.days_count = opencode_days;
+    totals.cursor.days_count = cursor_days;
+    totals.hermes.days_count = hermes_days;
+    totals.overall.days_count = total_days;
+
     for (model, usage) in usage_data.iter() {
         let (cost, matched_model, providers) = match crate::usage::resolve_merged_model_breakdown(
             model,
@@ -321,9 +347,101 @@ pub fn build_usage_summary(
                 (cost, matched, Vec::new())
             }
         };
+        for p in &providers {
+            let slot = match p.provider {
+                Provider::ClaudeCode => &mut totals.claude,
+                Provider::Codex => &mut totals.codex,
+                Provider::Copilot => &mut totals.copilot,
+                Provider::Gemini => &mut totals.gemini,
+                Provider::Grok => &mut totals.grok,
+                Provider::DeepSeek => &mut totals.deepseek,
+                Provider::Antigravity => &mut totals.antigravity,
+                Provider::OpenCode => &mut totals.opencode,
+                Provider::Cursor => &mut totals.cursor,
+                Provider::Hermes => &mut totals.hermes,
+                Provider::Unknown => continue,
+            };
+            slot.total_tokens += p.total_tokens;
+            slot.total_cost += p.cost;
+        }
         let mut row = build_usage_row(model, usage, cost, matched_model);
         row.providers = providers;
         summary.rows.push(row);
+    }
+
+    // Price any per-provider models not present in `usage_data` so callers passing asymmetric maps still match `calculate_provider_totals_from_per_provider`.
+    let PerProviderUsage {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        opencode,
+        cursor,
+        hermes,
+        grok,
+        deepseek,
+        antigravity,
+    } = per_provider;
+    for (slot, map, pricing) in [
+        (&mut totals.claude, claude, ProviderPricing::Litellm),
+        (&mut totals.codex, codex, ProviderPricing::Litellm),
+        (&mut totals.copilot, copilot, ProviderPricing::Litellm),
+        (&mut totals.gemini, gemini, ProviderPricing::Litellm),
+        (&mut totals.grok, grok, ProviderPricing::GrokGauge),
+        (&mut totals.deepseek, deepseek, ProviderPricing::Litellm),
+        (
+            &mut totals.antigravity,
+            antigravity,
+            ProviderPricing::Litellm,
+        ),
+        (
+            &mut totals.opencode,
+            opencode,
+            ProviderPricing::OpenCode(&stored_costs.opencode),
+        ),
+        (&mut totals.cursor, cursor, ProviderPricing::CursorEstimate),
+        (
+            &mut totals.hermes,
+            hermes,
+            ProviderPricing::Hermes(&stored_costs.hermes),
+        ),
+    ] {
+        for (model, raw_usage) in map {
+            if !usage_data.contains_key(model) {
+                let row =
+                    extract_usage_row(model, raw_usage, pricing_map, pricing.source_for(model));
+                slot.accumulate_row(&row);
+            }
+        }
+    }
+
+    let crate::models::ProviderTotals {
+        claude: ref t_claude,
+        codex: ref t_codex,
+        copilot: ref t_copilot,
+        gemini: ref t_gemini,
+        grok: ref t_grok,
+        deepseek: ref t_deepseek,
+        antigravity: ref t_antigravity,
+        opencode: ref t_opencode,
+        cursor: ref t_cursor,
+        hermes: ref t_hermes,
+        overall: ref mut t_overall,
+    } = *totals;
+    for stats in [
+        t_claude,
+        t_codex,
+        t_copilot,
+        t_gemini,
+        t_grok,
+        t_deepseek,
+        t_antigravity,
+        t_opencode,
+        t_cursor,
+        t_hermes,
+    ] {
+        t_overall.total_tokens += stats.total_tokens;
+        t_overall.total_cost += stats.total_cost;
     }
 
     // Sort by ascending cost with a model-name tie-break so hash-map iteration order cannot reorder equal-cost rows.
@@ -338,12 +456,6 @@ pub fn build_usage_summary(
         summary.totals.accumulate(row);
     }
 
-    summary.provider_totals = calculate_provider_totals_from_per_provider(
-        per_provider,
-        provider_days,
-        pricing_map,
-        stored_costs,
-    );
     summary
 }
 

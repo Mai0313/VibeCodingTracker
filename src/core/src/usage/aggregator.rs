@@ -3,8 +3,8 @@
 //! File-backed providers fix their provider from the source path rather than content detection and parse in [`ParseMode::UsageOnly`]; OpenCode, Cursor, and Hermes are read from SQLite. Results land in [`UsageData`], storing both cross-provider model totals and source-scoped per-provider maps.
 
 use crate::config::ProvidersConfig;
-use crate::constants::{FastHashMap, capacity};
-use crate::ledger::{DayEntry, SessionLedger, stamp};
+use crate::constants::{FastHashMap, FastHashSet, capacity};
+use crate::ledger::{CompactUsage, DayEntry, SessionLedger, stamp};
 use crate::models::TimeRange;
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, ProviderActiveDays, UsageResult,
@@ -28,7 +28,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -181,16 +181,16 @@ pub fn aggregate_usage_from_paths_with_providers(
     let mut per_provider = PerProviderUsage::default();
     let mut stored_costs = StoredCosts::default();
 
-    let mut claude_dates: HashSet<String> = HashSet::new();
-    let mut codex_dates: HashSet<String> = HashSet::new();
-    let mut copilot_dates: HashSet<String> = HashSet::new();
-    let mut gemini_dates: HashSet<String> = HashSet::new();
-    let mut grok_dates: HashSet<String> = HashSet::new();
-    let mut deepseek_dates: HashSet<String> = HashSet::new();
-    let mut antigravity_dates: HashSet<String> = HashSet::new();
-    let mut opencode_dates: HashSet<String> = HashSet::new();
-    let mut cursor_dates: HashSet<String> = HashSet::new();
-    let mut hermes_dates: HashSet<String> = HashSet::new();
+    let mut claude_dates: FastHashSet<String> = FastHashSet::default();
+    let mut codex_dates: FastHashSet<String> = FastHashSet::default();
+    let mut copilot_dates: FastHashSet<String> = FastHashSet::default();
+    let mut gemini_dates: FastHashSet<String> = FastHashSet::default();
+    let mut grok_dates: FastHashSet<String> = FastHashSet::default();
+    let mut deepseek_dates: FastHashSet<String> = FastHashSet::default();
+    let mut antigravity_dates: FastHashSet<String> = FastHashSet::default();
+    let mut opencode_dates: FastHashSet<String> = FastHashSet::default();
+    let mut cursor_dates: FastHashSet<String> = FastHashSet::default();
+    let mut hermes_dates: FastHashSet<String> = FastHashSet::default();
 
     if providers.claude && paths.claude_session_dir.exists() {
         // Recursive walk collects both top-level `<session>.jsonl` and `<session>/subagents/agent-*.jsonl`.
@@ -337,7 +337,7 @@ pub fn aggregate_usage_from_paths_with_providers(
         );
     }
 
-    let mut all_dates: HashSet<&String> = HashSet::new();
+    let mut all_dates: FastHashSet<&String> = FastHashSet::default();
     all_dates.extend(claude_dates.iter());
     all_dates.extend(codex_dates.iter());
     all_dates.extend(copilot_dates.iter());
@@ -527,7 +527,7 @@ pub fn aggregate_daily_usage_from_paths_with_cache_opts(
     let remotes = ledger.remote_names();
     Ok(DailyUsageCollection {
         data: DailyUsageData {
-            days: accumulator.days,
+            days: accumulator.finish(),
             remotes,
         },
         diagnostics,
@@ -614,38 +614,96 @@ fn scan_usage_into_sink<S: crate::scan::CompactSink>(
     Ok(diagnostics)
 }
 
+#[derive(Default)]
+struct PerProviderCompactUsage {
+    claude: FastHashMap<String, CompactUsage>,
+    codex: FastHashMap<String, CompactUsage>,
+    copilot: FastHashMap<String, CompactUsage>,
+    gemini: FastHashMap<String, CompactUsage>,
+    opencode: FastHashMap<String, CompactUsage>,
+    cursor: FastHashMap<String, CompactUsage>,
+    hermes: FastHashMap<String, CompactUsage>,
+    grok: FastHashMap<String, CompactUsage>,
+    deepseek: FastHashMap<String, CompactUsage>,
+    antigravity: FastHashMap<String, CompactUsage>,
+}
+
+impl PerProviderCompactUsage {
+    fn provider_mut(&mut self, provider: ExtensionType) -> &mut FastHashMap<String, CompactUsage> {
+        match provider {
+            ExtensionType::ClaudeCode => &mut self.claude,
+            ExtensionType::Codex => &mut self.codex,
+            ExtensionType::Copilot => &mut self.copilot,
+            ExtensionType::Gemini => &mut self.gemini,
+            ExtensionType::Grok => &mut self.grok,
+            ExtensionType::DeepSeek => &mut self.deepseek,
+            ExtensionType::Antigravity => &mut self.antigravity,
+            ExtensionType::OpenCode => &mut self.opencode,
+            ExtensionType::Cursor => &mut self.cursor,
+            ExtensionType::Hermes => &mut self.hermes,
+        }
+    }
+
+    /// Computes cross-provider `models` once from the per-provider maps and converts every bucket to canonical flat JSON.
+    fn finish(self) -> (UsageResult, PerProviderUsage) {
+        let mut merged: FastHashMap<String, CompactUsage> = FastHashMap::default();
+        for map in [
+            &self.claude,
+            &self.codex,
+            &self.copilot,
+            &self.gemini,
+            &self.opencode,
+            &self.cursor,
+            &self.hermes,
+            &self.grok,
+            &self.deepseek,
+            &self.antigravity,
+        ] {
+            for (model, usage) in map {
+                match merged.get_mut(model) {
+                    Some(existing) => existing.add_assign(usage),
+                    None => {
+                        merged.insert(model.clone(), usage.clone());
+                    }
+                }
+            }
+        }
+
+        let to_values = |map: FastHashMap<String, CompactUsage>| -> UsageResult {
+            map.into_iter()
+                .map(|(model, usage)| (model, usage.to_flat_value()))
+                .collect()
+        };
+
+        let models = to_values(merged);
+        let per_provider = PerProviderUsage {
+            claude: to_values(self.claude),
+            codex: to_values(self.codex),
+            copilot: to_values(self.copilot),
+            gemini: to_values(self.gemini),
+            opencode: to_values(self.opencode),
+            cursor: to_values(self.cursor),
+            hermes: to_values(self.hermes),
+            grok: to_values(self.grok),
+            deepseek: to_values(self.deepseek),
+            antigravity: to_values(self.antigravity),
+        };
+        (models, per_provider)
+    }
+}
+
 fn fold_day_usage_into(
-    models: &mut UsageResult,
-    per_provider: &mut PerProviderUsage,
+    per_provider: &mut PerProviderCompactUsage,
     stored_costs: &mut StoredCosts,
     provider: ExtensionType,
     day: &DayEntry,
 ) {
-    let provider_result = match provider {
-        ExtensionType::ClaudeCode => &mut per_provider.claude,
-        ExtensionType::Codex => &mut per_provider.codex,
-        ExtensionType::Copilot => &mut per_provider.copilot,
-        ExtensionType::Gemini => &mut per_provider.gemini,
-        ExtensionType::Grok => &mut per_provider.grok,
-        ExtensionType::DeepSeek => &mut per_provider.deepseek,
-        ExtensionType::Antigravity => &mut per_provider.antigravity,
-        ExtensionType::OpenCode => &mut per_provider.opencode,
-        ExtensionType::Cursor => &mut per_provider.cursor,
-        ExtensionType::Hermes => &mut per_provider.hermes,
-    };
-    // Use `get_mut` before `insert` to avoid cloning `model` on existing keys.
-    for (model, raw) in &day.usage {
-        let usage = DayEntry::usage_value(raw);
+    let provider_result = per_provider.provider_mut(provider);
+    for (model, usage) in &day.usage {
         match provider_result.get_mut(model) {
-            Some(existing) => merge_usage_values(existing, &usage),
+            Some(existing) => existing.add_assign(usage),
             None => {
                 provider_result.insert(model.clone(), usage.clone());
-            }
-        }
-        match models.get_mut(model) {
-            Some(existing) => merge_usage_values(existing, &usage),
-            None => {
-                models.insert(model.clone(), usage);
             }
         }
     }
@@ -657,14 +715,25 @@ fn fold_day_usage_into(
     };
     if let Some(stored) = stored {
         for (model, cost) in &day.stored_cost {
-            *stored.entry(model.clone()).or_insert(0.0) += cost;
+            match stored.get_mut(model) {
+                Some(existing) => *existing += cost,
+                None => {
+                    stored.insert(model.clone(), *cost);
+                }
+            }
         }
     }
 }
 
 #[derive(Default)]
+struct CompactDayBucket {
+    per_provider: PerProviderCompactUsage,
+    stored_costs: StoredCosts,
+}
+
+#[derive(Default)]
 struct DailyUsageAccumulator {
-    days: BTreeMap<String, DayUsageData>,
+    days: BTreeMap<String, CompactDayBucket>,
 }
 
 impl crate::scan::CompactSink for DailyUsageAccumulator {
@@ -677,7 +746,6 @@ impl crate::scan::CompactSink for DailyUsageAccumulator {
             None => self.days.entry(date.to_string()).or_default(),
         };
         fold_day_usage_into(
-            &mut bucket.models,
             &mut bucket.per_provider,
             &mut bucket.stored_costs,
             provider,
@@ -686,27 +754,44 @@ impl crate::scan::CompactSink for DailyUsageAccumulator {
     }
 }
 
+impl DailyUsageAccumulator {
+    fn finish(self) -> BTreeMap<String, DayUsageData> {
+        self.days
+            .into_iter()
+            .map(|(date, bucket)| {
+                let (models, per_provider) = bucket.per_provider.finish();
+                (
+                    date,
+                    DayUsageData {
+                        models,
+                        per_provider,
+                        stored_costs: bucket.stored_costs,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 #[derive(Default)]
 struct UsageAccumulator {
-    models: UsageResult,
-    per_provider: PerProviderUsage,
+    per_provider: PerProviderCompactUsage,
     stored_costs: StoredCosts,
-    claude_dates: HashSet<String>,
-    codex_dates: HashSet<String>,
-    copilot_dates: HashSet<String>,
-    gemini_dates: HashSet<String>,
-    grok_dates: HashSet<String>,
-    deepseek_dates: HashSet<String>,
-    antigravity_dates: HashSet<String>,
-    opencode_dates: HashSet<String>,
-    cursor_dates: HashSet<String>,
-    hermes_dates: HashSet<String>,
+    claude_dates: FastHashSet<String>,
+    codex_dates: FastHashSet<String>,
+    copilot_dates: FastHashSet<String>,
+    gemini_dates: FastHashSet<String>,
+    grok_dates: FastHashSet<String>,
+    deepseek_dates: FastHashSet<String>,
+    antigravity_dates: FastHashSet<String>,
+    opencode_dates: FastHashSet<String>,
+    cursor_dates: FastHashSet<String>,
+    hermes_dates: FastHashSet<String>,
 }
 
 impl crate::scan::CompactSink for UsageAccumulator {
     fn fold(&mut self, provider: ExtensionType, date: &str, day: &DayEntry) {
         fold_day_usage_into(
-            &mut self.models,
             &mut self.per_provider,
             &mut self.stored_costs,
             provider,
@@ -726,28 +811,35 @@ impl crate::scan::CompactSink for UsageAccumulator {
                 ExtensionType::Cursor => &mut self.cursor_dates,
                 ExtensionType::Hermes => &mut self.hermes_dates,
             };
-            dates.insert(date.to_string());
+            if !dates.contains(date) {
+                dates.insert(date.to_string());
+            }
         }
     }
 }
 
 impl UsageAccumulator {
     fn finish(self) -> UsageData {
-        let mut all_dates: HashSet<&String> = HashSet::new();
-        all_dates.extend(self.claude_dates.iter());
-        all_dates.extend(self.codex_dates.iter());
-        all_dates.extend(self.copilot_dates.iter());
-        all_dates.extend(self.gemini_dates.iter());
-        all_dates.extend(self.grok_dates.iter());
-        all_dates.extend(self.deepseek_dates.iter());
-        all_dates.extend(self.antigravity_dates.iter());
-        all_dates.extend(self.opencode_dates.iter());
-        all_dates.extend(self.cursor_dates.iter());
-        all_dates.extend(self.hermes_dates.iter());
+        let mut all_dates: FastHashSet<&str> = FastHashSet::default();
+        for set in [
+            &self.claude_dates,
+            &self.codex_dates,
+            &self.copilot_dates,
+            &self.gemini_dates,
+            &self.grok_dates,
+            &self.deepseek_dates,
+            &self.antigravity_dates,
+            &self.opencode_dates,
+            &self.cursor_dates,
+            &self.hermes_dates,
+        ] {
+            all_dates.extend(set.iter().map(String::as_str));
+        }
         let total_days = all_dates.len();
+        let (models, per_provider) = self.per_provider.finish();
         UsageData {
-            models: self.models,
-            per_provider: self.per_provider,
+            models,
+            per_provider,
             provider_days: ProviderActiveDays {
                 claude: self.claude_dates.len(),
                 codex: self.codex_dates.len(),
@@ -773,7 +865,7 @@ fn process_usage_directory<F>(
     provider: ExtensionType,
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
-    unique_dates: &mut HashSet<String>,
+    unique_dates: &mut FastHashSet<String>,
     filter_fn: F,
     time_range: TimeRange,
     max_depth: Option<usize>,
@@ -826,7 +918,7 @@ fn process_opencode_usage(
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
     stored_costs: &mut FastHashMap<String, f64>,
-    unique_dates: &mut HashSet<String>,
+    unique_dates: &mut FastHashSet<String>,
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_opencode_usage(db_path, time_range)?;
@@ -846,7 +938,7 @@ fn process_cursor_usage(
     tracking_db: &Path,
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
-    unique_dates: &mut HashSet<String>,
+    unique_dates: &mut FastHashSet<String>,
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_cursor_usage(chats_dir, tracking_db, time_range)?;
@@ -860,7 +952,7 @@ fn process_hermes_usage(
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
     stored_costs: &mut FastHashMap<String, f64>,
-    unique_dates: &mut HashSet<String>,
+    unique_dates: &mut FastHashSet<String>,
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_hermes_usage(db_path, time_range)?;
@@ -880,7 +972,7 @@ fn fold_database_sessions(
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
     mut stored_costs: Option<&mut FastHashMap<String, f64>>,
-    unique_dates: &mut HashSet<String>,
+    unique_dates: &mut FastHashSet<String>,
 ) {
     for (date, analysis, session_cost) in sessions {
         let conversation_usage = extract_conversation_usage_from_analysis(analysis);
