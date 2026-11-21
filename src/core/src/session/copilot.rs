@@ -68,9 +68,94 @@ pub(crate) fn parse_copilot_jsonl_path(
     )
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+struct CopilotDisjointTokens {
+    input_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+}
+
+impl CopilotDisjointTokens {
+    fn from_shutdown(usage: &CopilotModelUsage, token_details_input: Option<i64>) -> Self {
+        // Copilot's `usage.inputTokens` includes `cacheReadTokens + cacheWriteTokens`, whereas `tokenDetails.input.tokenCount` (when present) reports uncached input directly.
+        let input_tokens = token_details_input
+            .unwrap_or_else(|| {
+                usage
+                    .input_tokens
+                    .saturating_sub(usage.cache_read_tokens)
+                    .saturating_sub(usage.cache_write_tokens)
+            })
+            .max(0);
+        // Copilot's `outputTokens` includes `reasoningTokens`, whereas the flat usage shape keeps output and reasoning disjoint.
+        let output_tokens = usage
+            .output_tokens
+            .saturating_sub(usage.reasoning_tokens)
+            .max(0);
+        Self {
+            input_tokens,
+            output_tokens,
+            reasoning_tokens: usage.reasoning_tokens.max(0),
+            cache_read_tokens: usage.cache_read_tokens.max(0),
+            cache_write_tokens: usage.cache_write_tokens.max(0),
+        }
+    }
+
+    fn is_monotonic_from(self, prev: Self) -> bool {
+        self.input_tokens >= prev.input_tokens
+            && self.output_tokens >= prev.output_tokens
+            && self.reasoning_tokens >= prev.reasoning_tokens
+            && self.cache_read_tokens >= prev.cache_read_tokens
+            && self.cache_write_tokens >= prev.cache_write_tokens
+    }
+
+    fn add_assign(&mut self, delta: Self) {
+        self.input_tokens += delta.input_tokens;
+        self.output_tokens += delta.output_tokens;
+        self.reasoning_tokens += delta.reasoning_tokens;
+        self.cache_read_tokens += delta.cache_read_tokens;
+        self.cache_write_tokens += delta.cache_write_tokens;
+    }
+
+    fn delta_from(self, prev: Self) -> Self {
+        Self {
+            input_tokens: (self.input_tokens - prev.input_tokens).max(0),
+            output_tokens: (self.output_tokens - prev.output_tokens).max(0),
+            reasoning_tokens: (self.reasoning_tokens - prev.reasoning_tokens).max(0),
+            cache_read_tokens: (self.cache_read_tokens - prev.cache_read_tokens).max(0),
+            cache_write_tokens: (self.cache_write_tokens - prev.cache_write_tokens).max(0),
+        }
+    }
+
+    fn to_json(self) -> Value {
+        json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_output_tokens": self.reasoning_tokens,
+            "cache_read_input_tokens": self.cache_read_tokens,
+            "cache_creation_input_tokens": self.cache_write_tokens,
+        })
+    }
+}
+
+struct CopilotShutdownMetric {
+    usage: Option<CopilotModelUsage>,
+    token_details_input: Option<i64>,
+}
+
+struct CopilotShutdownAccumulator {
+    accumulated: CopilotDisjointTokens,
+    last_snapshot: CopilotDisjointTokens,
+}
+
 struct CopilotFold {
     state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
+    // Per-model running total and previous `session.shutdown` snapshot so resumed sessions handle both cumulative and per-run reset counters.
+    shutdown_totals: FastHashMap<String, CopilotShutdownAccumulator>,
+    // Latches true once any model drops across `session.shutdown`, indicating older per-run reset counters for the rest of the session.
+    per_run_resets: bool,
     // Pending tool calls indexed by `toolCallId`.
     pending_tools: FastHashMap<String, PendingTool>,
     // Active model for fallback `assistant.message.outputTokens` attribution when `session.shutdown` never arrives.
@@ -86,6 +171,8 @@ impl CopilotFold {
         Self {
             state: SessionParseState::with_mode(mode),
             conversation_usage: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
+            shutdown_totals: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
+            per_run_resets: false,
             pending_tools: FastHashMap::with_capacity(32),
             current_model: String::new(),
             shutdown_seen: false,
@@ -103,6 +190,8 @@ impl CopilotFold {
                 | "session.shutdown"
                 | "session.info"
                 | "session.mode_changed"
+                | "session.usage_checkpoint"
+                | "session.permissions_changed"
                 | "system.message"
                 | "user.message"
                 | "assistant.message"
@@ -130,26 +219,58 @@ impl CopilotFold {
         ts
     }
 
-    fn apply_shutdown_metrics(&mut self, metrics: BTreeMap<String, Option<CopilotModelUsage>>) {
+    fn apply_shutdown_metrics(&mut self, metrics: BTreeMap<String, CopilotShutdownMetric>) {
         self.diagnostics.record_relevant(true);
-        for (model, usage) in metrics {
-            if model.is_empty() {
-                continue;
-            }
-            let Some(usage) = usage else {
-                continue;
+        let parsed: Vec<(String, CopilotDisjointTokens)> = metrics
+            .into_iter()
+            .filter_map(|(model, metric)| {
+                if model.is_empty() {
+                    return None;
+                }
+                let usage = metric.usage?;
+                let current =
+                    CopilotDisjointTokens::from_shutdown(&usage, metric.token_details_input);
+                Some((canonicalize_model_name(&model), current))
+            })
+            .collect();
+
+        // Detect a per-run reset across any model before applying deltas so sibling models and later runs accumulate in full.
+        if !self.per_run_resets
+            && parsed.iter().any(|(canonical, current)| {
+                self.shutdown_totals
+                    .get(canonical)
+                    .is_some_and(|entry| !current.is_monotonic_from(entry.last_snapshot))
+            })
+        {
+            self.per_run_resets = true;
+        }
+
+        for (canonical, current) in parsed {
+            let accumulated = match self.shutdown_totals.get_mut(&canonical) {
+                Some(entry) => {
+                    let delta = if self.per_run_resets {
+                        // Older Copilot builds reset per-run counters across `session.resume`; add each reset segment in full.
+                        current
+                    } else {
+                        current.delta_from(entry.last_snapshot)
+                    };
+                    entry.accumulated.add_assign(delta);
+                    entry.last_snapshot = current;
+                    entry.accumulated
+                }
+                None => {
+                    self.shutdown_totals.insert(
+                        canonical.clone(),
+                        CopilotShutdownAccumulator {
+                            accumulated: current,
+                            last_snapshot: current,
+                        },
+                    );
+                    current
+                }
             };
-            // Copilot's `outputTokens` includes `reasoningTokens`, whereas the flat usage shape keeps output and reasoning disjoint.
-            let output_tokens = usage.output_tokens.saturating_sub(usage.reasoning_tokens);
-            let usage_json = json!({
-                "input_tokens": usage.input_tokens,
-                "output_tokens": output_tokens,
-                "reasoning_output_tokens": usage.reasoning_tokens,
-                "cache_read_input_tokens": usage.cache_read_tokens,
-                "cache_creation_input_tokens": usage.cache_write_tokens,
-            });
             self.conversation_usage
-                .insert(canonicalize_model_name(&model), usage_json);
+                .insert(canonical, accumulated.to_json());
         }
         self.shutdown_seen = true;
     }
@@ -357,12 +478,28 @@ impl CopilotFold {
             "session.shutdown" => {
                 let payload_supported = shutdown_payload_supported(&event.data);
                 if payload_supported
-                    && let Ok(data) = serde_json::from_value::<CopilotShutdownData>(event.data)
+                    && let Ok(data) =
+                        serde_json::from_value::<CopilotShutdownData>(event.data.clone())
                 {
+                    let raw_metrics = event.data.get("modelMetrics").and_then(Value::as_object);
                     let metrics = data
                         .model_metrics
                         .into_iter()
-                        .map(|(model, metric)| (model, metric.usage))
+                        .map(|(model, metric)| {
+                            let token_details_input = raw_metrics
+                                .and_then(|map| map.get(&model))
+                                .and_then(|entry| entry.get("tokenDetails"))
+                                .and_then(|details| details.get("input"))
+                                .and_then(|input| input.get("tokenCount"))
+                                .and_then(Value::as_i64);
+                            (
+                                model,
+                                CopilotShutdownMetric {
+                                    usage: metric.usage,
+                                    token_details_input,
+                                },
+                            )
+                        })
                         .collect();
                     self.apply_shutdown_metrics(metrics);
                 } else {
@@ -606,7 +743,7 @@ struct BorrowedToolCompleteData<'a> {
 }
 
 struct ValidatedShutdownData {
-    model_metrics: BTreeMap<String, Option<CopilotModelUsage>>,
+    model_metrics: BTreeMap<String, CopilotShutdownMetric>,
 }
 
 impl<'de> Deserialize<'de> for ValidatedShutdownData {
@@ -623,7 +760,7 @@ impl<'de> Deserialize<'de> for ValidatedShutdownData {
                 self,
                 mut map: A,
             ) -> std::result::Result<Self::Value, A::Error> {
-                let mut metrics: Option<BTreeMap<String, Option<CopilotModelUsage>>> = None;
+                let mut metrics: Option<BTreeMap<String, CopilotShutdownMetric>> = None;
                 while let Some(key) = map.next_key::<Cow<'de, str>>()? {
                     if key == "modelMetrics" {
                         metrics = Some(map.next_value::<ValidatedModelMetricsMap>()?.0);
@@ -640,7 +777,7 @@ impl<'de> Deserialize<'de> for ValidatedShutdownData {
     }
 }
 
-struct ValidatedModelMetricsMap(BTreeMap<String, Option<CopilotModelUsage>>);
+struct ValidatedModelMetricsMap(BTreeMap<String, CopilotShutdownMetric>);
 
 impl<'de> Deserialize<'de> for ValidatedModelMetricsMap {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
@@ -668,7 +805,7 @@ impl<'de> Deserialize<'de> for ValidatedModelMetricsMap {
     }
 }
 
-struct ValidatedMetricEntry(Option<CopilotModelUsage>);
+struct ValidatedMetricEntry(CopilotShutdownMetric);
 
 impl<'de> Deserialize<'de> for ValidatedMetricEntry {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
@@ -685,20 +822,52 @@ impl<'de> Deserialize<'de> for ValidatedMetricEntry {
                 mut map: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 let mut usage: Option<CopilotModelUsage> = None;
+                let mut token_details_input: Option<i64> = None;
                 while let Some(key) = map.next_key::<Cow<'de, str>>()? {
                     if key == "usage" {
                         usage = map
                             .next_value::<Option<ValidatedCopilotUsage>>()?
                             .map(|u| u.0);
+                    } else if key == "tokenDetails" {
+                        let raw = map.next_value::<&'de RawValue>()?;
+                        token_details_input = parse_token_details_input(raw.get());
                     } else {
                         map.next_value::<IgnoredAny>()?;
                     }
                 }
-                Ok(ValidatedMetricEntry(usage))
+                Ok(ValidatedMetricEntry(CopilotShutdownMetric {
+                    usage,
+                    token_details_input,
+                }))
             }
         }
         deserializer.deserialize_map(V)
     }
+}
+
+#[derive(Deserialize)]
+struct BorrowedTokenDetails<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    input: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedTokenDetailBucket<'a> {
+    #[serde(
+        default,
+        borrow,
+        rename = "tokenCount",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    token_count: Option<&'a RawValue>,
+}
+
+fn parse_token_details_input(raw: &str) -> Option<i64> {
+    let details = serde_json::from_str::<BorrowedTokenDetails<'_>>(raw).ok()?;
+    let input_raw = details.input?;
+    let bucket = serde_json::from_str::<BorrowedTokenDetailBucket<'_>>(input_raw.get()).ok()?;
+    let count_raw = bucket.token_count?;
+    serde_json::from_str::<i64>(count_raw.get()).ok()
 }
 
 struct ValidatedCopilotUsage(CopilotModelUsage);
@@ -2210,5 +2379,278 @@ mod tests {
         assert_eq!(su.total_edit_lines, o.total_edit_lines);
         assert_eq!(su.total_edit_characters, o.total_edit_characters);
         assert_eq!(su.conversation_usage, o.conversation_usage);
+        assert_eq!(
+            o.conversation_usage["claude-sonnet-4-6"]["input_tokens"],
+            750
+        );
+    }
+
+    #[test]
+    fn shutdown_subtracts_cache_tokens_and_prefers_token_details_input() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let events = vec![event(
+            "session.shutdown",
+            json!({
+                "modelMetrics": {
+                    "claude-sonnet-5": {
+                        "usage": {
+                            "inputTokens": 1_860_010,
+                            "outputTokens": 11_182,
+                            "cacheReadTokens": 1_748_384,
+                            "cacheWriteTokens": 111_513,
+                            "reasoningTokens": 6_275
+                        },
+                        "tokenDetails": {
+                            "input": { "tokenCount": 113 },
+                            "cache_read": { "tokenCount": 1_748_384 },
+                            "cache_write": { "tokenCount": 111_513 },
+                            "output": { "tokenCount": 11_182 }
+                        }
+                    },
+                    "claude-sonnet-4.6": {
+                        "usage": {
+                            "inputTokens": 186_809,
+                            "outputTokens": 2_848,
+                            "cacheReadTokens": 151_738,
+                            "cacheWriteTokens": 0,
+                            "reasoningTokens": 1_024
+                        }
+                    },
+                    "clamped-model": {
+                        "usage": {
+                            "inputTokens": 100,
+                            "outputTokens": 20,
+                            "cacheReadTokens": 120,
+                            "cacheWriteTokens": 30,
+                            "reasoningTokens": 50
+                        }
+                    }
+                }
+            }),
+        )];
+
+        let body: String = events
+            .iter()
+            .map(|ev| format!("{}\n", serde_json::to_string(ev).unwrap()))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+
+        let owned = parse_copilot_events_with_diagnostics(events, ParseMode::Full).unwrap();
+        let streamed = super::parse_copilot_jsonl_path(&path, ParseMode::Full)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owned.diagnostics.partial_failure_count(), 0);
+        assert_eq!(streamed.diagnostics, owned.diagnostics);
+        assert_eq!(
+            streamed.analysis.records[0].conversation_usage,
+            owned.analysis.records[0].conversation_usage
+        );
+
+        let usage = &owned.analysis.records[0].conversation_usage;
+        assert_eq!(usage["claude-sonnet-5"]["input_tokens"], 113);
+        assert_eq!(
+            usage["claude-sonnet-5"]["cache_read_input_tokens"],
+            1_748_384
+        );
+        assert_eq!(
+            usage["claude-sonnet-5"]["cache_creation_input_tokens"],
+            111_513
+        );
+        assert_eq!(usage["claude-sonnet-5"]["output_tokens"], 11_182 - 6_275);
+        assert_eq!(usage["claude-sonnet-5"]["reasoning_output_tokens"], 6_275);
+
+        assert_eq!(
+            usage["claude-sonnet-4-6"]["input_tokens"],
+            186_809 - 151_738
+        );
+        assert_eq!(usage["clamped-model"]["input_tokens"], 0);
+        assert_eq!(usage["clamped-model"]["output_tokens"], 0);
+    }
+
+    #[test]
+    fn multi_shutdown_accumulates_resets_and_preserves_cumulative_totals() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Older Copilot resets counters across `session.resume`.
+        let reset_events = vec![
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-4.6": {
+                            "usage": {
+                                "inputTokens": 754_148,
+                                "outputTokens": 5_220,
+                                "cacheReadTokens": 694_725,
+                                "cacheWriteTokens": 0,
+                                "reasoningTokens": 0
+                            }
+                        }
+                    }
+                }),
+            ),
+            event("session.resume", json!({})),
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-4.6": {
+                            "usage": {
+                                "inputTokens": 470_648,
+                                "outputTokens": 2_801,
+                                "cacheReadTokens": 452_507,
+                                "cacheWriteTokens": 0,
+                                "reasoningTokens": 0
+                            }
+                        }
+                    }
+                }),
+            ),
+        ];
+        let reset_path = dir.path().join("reset.jsonl");
+        let reset_body: String = reset_events
+            .iter()
+            .map(|ev| format!("{}\n", serde_json::to_string(ev).unwrap()))
+            .collect();
+        std::fs::write(&reset_path, reset_body).unwrap();
+
+        let owned_reset =
+            parse_copilot_events_with_diagnostics(reset_events, ParseMode::Full).unwrap();
+        let streamed_reset = super::parse_copilot_jsonl_path(&reset_path, ParseMode::Full)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            streamed_reset.analysis.records[0].conversation_usage,
+            owned_reset.analysis.records[0].conversation_usage
+        );
+        let reset_usage = &owned_reset.analysis.records[0].conversation_usage["claude-sonnet-4-6"];
+        assert_eq!(
+            reset_usage["input_tokens"],
+            (754_148 - 694_725) + (470_648 - 452_507)
+        );
+        assert_eq!(reset_usage["output_tokens"], 5_220 + 2_801);
+        assert_eq!(reset_usage["cache_read_input_tokens"], 694_725 + 452_507);
+
+        // Newer Copilot reports cumulative totals across `session.resume` (including no-op resumes).
+        let cumulative_events = vec![
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-5": {
+                            "usage": {
+                                "inputTokens": 1_860_010,
+                                "outputTokens": 11_182,
+                                "cacheReadTokens": 1_748_384,
+                                "cacheWriteTokens": 111_513,
+                                "reasoningTokens": 6_275
+                            },
+                            "tokenDetails": { "input": { "tokenCount": 113 } }
+                        }
+                    }
+                }),
+            ),
+            event("session.resume", json!({})),
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-5": {
+                            "usage": {
+                                "inputTokens": 2_339_869,
+                                "outputTokens": 13_502,
+                                "cacheReadTokens": 2_151_104,
+                                "cacheWriteTokens": 188_642,
+                                "reasoningTokens": 7_379
+                            },
+                            "tokenDetails": { "input": { "tokenCount": 123 } }
+                        }
+                    }
+                }),
+            ),
+            event("session.resume", json!({})),
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-5": {
+                            "usage": {
+                                "inputTokens": 2_339_869,
+                                "outputTokens": 13_502,
+                                "cacheReadTokens": 2_151_104,
+                                "cacheWriteTokens": 188_642,
+                                "reasoningTokens": 7_379
+                            },
+                            "tokenDetails": { "input": { "tokenCount": 123 } }
+                        }
+                    }
+                }),
+            ),
+        ];
+        let owned_cum =
+            parse_copilot_events_with_diagnostics(cumulative_events, ParseMode::Full).unwrap();
+        let cum_usage = &owned_cum.analysis.records[0].conversation_usage["claude-sonnet-5"];
+        assert_eq!(cum_usage["input_tokens"], 123);
+        assert_eq!(cum_usage["output_tokens"], 13_502 - 7_379);
+        assert_eq!(cum_usage["reasoning_output_tokens"], 7_379);
+        assert_eq!(cum_usage["cache_read_input_tokens"], 2_151_104);
+        assert_eq!(cum_usage["cache_creation_input_tokens"], 188_642);
+    }
+
+    #[test]
+    fn per_run_reset_propagates_to_sibling_models_and_subsequent_shutdowns() {
+        let events = vec![
+            // Run 1: sonnet-4.6 = 1000 in / 100 out, gpt-5.4 = 200 in / 20 out.
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-4.6": { "usage": { "inputTokens": 1_000, "outputTokens": 100 } },
+                        "gpt-5.4": { "usage": { "inputTokens": 200, "outputTokens": 20 } }
+                    }
+                }),
+            ),
+            event("session.resume", json!({})),
+            // Run 2: sonnet-4.6 drops (proves per-run reset), while gpt-5.4 happens to be larger than run 1.
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-4.6": { "usage": { "inputTokens": 400, "outputTokens": 40 } },
+                        "gpt-5.4": { "usage": { "inputTokens": 300, "outputTokens": 30 } }
+                    }
+                }),
+            ),
+            event("session.resume", json!({})),
+            // Run 3: sonnet-4.6 is larger than run 2, and must still add in full rather than subtracting run 2.
+            event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "claude-sonnet-4.6": { "usage": { "inputTokens": 600, "outputTokens": 60 } }
+                    }
+                }),
+            ),
+        ];
+
+        let parsed = parse_copilot_events_with_diagnostics(events, ParseMode::Full).unwrap();
+        let usage = &parsed.analysis.records[0].conversation_usage;
+        assert_eq!(usage["claude-sonnet-4-6"]["input_tokens"], 2_000);
+        assert_eq!(usage["claude-sonnet-4-6"]["output_tokens"], 200);
+        assert_eq!(usage["gpt-5.4"]["input_tokens"], 500);
+        assert_eq!(usage["gpt-5.4"]["output_tokens"], 50);
+    }
+
+    #[test]
+    fn lifecycle_checkpoint_and_permissions_events_are_recognized() {
+        let events = vec![
+            event("session.usage_checkpoint", json!({})),
+            event("session.permissions_changed", json!({})),
+        ];
+        let parsed = parse_copilot_events_with_diagnostics(events, ParseMode::Full).unwrap();
+        assert_eq!(parsed.diagnostics.recognized_records, 2);
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert!(!parsed.diagnostics.is_complete_failure());
     }
 }
