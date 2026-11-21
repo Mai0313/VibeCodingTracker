@@ -410,19 +410,39 @@ pub fn aggregate_usage_from_home_with_diagnostics_opts(
     providers: ProvidersConfig,
     options: &UsageScanOptions,
 ) -> Result<UsageCollection> {
+    aggregate_usage_from_home_with_diagnostics_opts_and_remote_hook(
+        time_range,
+        providers,
+        options,
+        || {},
+    )
+}
+
+pub(crate) fn aggregate_usage_from_home_with_diagnostics_opts_and_remote_hook(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    options: &UsageScanOptions,
+    before_remotes: impl FnOnce(),
+) -> Result<UsageCollection> {
     let paths = resolve_paths()?;
     let mut ledger = SessionLedger::open(&paths.cache_dir);
-    let collection = aggregate_usage_from_paths_with_cache_opts(
+    let mut accumulator = UsageAccumulator::default();
+    let diagnostics = scan_usage_into_sink(
         &paths,
         time_range,
         providers,
         &mut ledger,
         options,
+        &mut accumulator,
+        before_remotes,
     )?;
     if let Err(error) = ledger.save() {
         log::warn!("failed to save the session ledger: {error:#}");
     }
-    Ok(collection)
+    Ok(UsageCollection {
+        data: accumulator.finish(),
+        diagnostics,
+    })
 }
 
 /// Scans usage from explicit `paths` with diagnostics using a transient in-memory ledger.
@@ -465,19 +485,43 @@ pub fn aggregate_daily_usage_from_home_with_diagnostics_opts(
     providers: ProvidersConfig,
     options: &UsageScanOptions,
 ) -> Result<DailyUsageCollection> {
+    aggregate_daily_usage_from_home_with_diagnostics_opts_and_remote_hook(
+        time_range,
+        providers,
+        options,
+        || {},
+    )
+}
+
+pub(crate) fn aggregate_daily_usage_from_home_with_diagnostics_opts_and_remote_hook(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    options: &UsageScanOptions,
+    before_remotes: impl FnOnce(),
+) -> Result<DailyUsageCollection> {
     let paths = resolve_paths()?;
     let mut ledger = SessionLedger::open(&paths.cache_dir);
-    let collection = aggregate_daily_usage_from_paths_with_cache_opts(
+    let mut accumulator = DailyUsageAccumulator::default();
+    let diagnostics = scan_usage_into_sink(
         &paths,
         time_range,
         providers,
         &mut ledger,
         options,
+        &mut accumulator,
+        before_remotes,
     )?;
+    let remotes = ledger.remote_names();
     if let Err(error) = ledger.save() {
         log::warn!("failed to save the session ledger: {error:#}");
     }
-    Ok(collection)
+    Ok(DailyUsageCollection {
+        data: DailyUsageData {
+            days: accumulator.finish(),
+            remotes,
+        },
+        diagnostics,
+    })
 }
 
 /// Runs an incremental usage scan from `paths` with `options`, updating `ledger` in place.
@@ -498,6 +542,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
         ledger,
         options,
         &mut accumulator,
+        || {},
     )?;
     Ok(UsageCollection {
         data: accumulator.finish(),
@@ -523,6 +568,7 @@ pub fn aggregate_daily_usage_from_paths_with_cache_opts(
         ledger,
         options,
         &mut accumulator,
+        || {},
     )?;
     let remotes = ledger.remote_names();
     Ok(DailyUsageCollection {
@@ -541,9 +587,10 @@ fn scan_usage_into_sink<S: crate::scan::CompactSink>(
     ledger: &mut SessionLedger,
     options: &UsageScanOptions,
     sink: &mut S,
+    before_remotes: impl FnOnce(),
 ) -> Result<ScanDiagnostics> {
     let tiers = options.tiers.as_deref();
-    ledger.begin_scan();
+    ledger.begin_local_scan();
     let mut diagnostics = ScanDiagnostics::default();
 
     crate::scan::scan_all_cached_files(
@@ -603,6 +650,8 @@ fn scan_usage_into_sink<S: crate::scan::CompactSink>(
         );
     }
 
+    before_remotes();
+    ledger.reload_remotes();
     crate::scan::fold_remotes(
         ledger,
         |provider| providers.includes(provider),
@@ -1086,5 +1135,35 @@ mod tests {
         let mut existing = gemini.clone();
         merge_usage_values(&mut existing, &codex);
         expect(extract_token_counts(&existing));
+    }
+
+    #[test]
+    fn remote_hook_runs_before_usage_remote_snapshots_are_folded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = crate::utils::resolve_paths_from_home(dir.path());
+        let mut ledger = SessionLedger::open(&paths.cache_dir);
+        let export = r#"{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider":"claude","sessions":{"s1":{"days":{"2026-11-20":{"usage":{"claude-test":{"input_tokens":42,"output_tokens":8}}}}}}}}}"#;
+
+        let mut accumulator = UsageAccumulator::default();
+        scan_usage_into_sink(
+            &paths,
+            TimeRange::All,
+            ProvidersConfig::default(),
+            &mut ledger,
+            &UsageScanOptions::default(),
+            &mut accumulator,
+            || {
+                crate::ledger::store_export(&paths.cache_dir, "devbox", export).unwrap();
+            },
+        )
+        .unwrap();
+        let data = accumulator.finish();
+
+        let row = data
+            .models
+            .get("claude-test")
+            .expect("remote snapshot written inside before_remotes hook must be folded");
+        assert_eq!(row["input_tokens"], 42);
+        assert_eq!(row["output_tokens"], 8);
     }
 }

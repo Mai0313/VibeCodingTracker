@@ -401,6 +401,9 @@ impl<'a> AntigravityParser<'a> {
         if let Some(remote) = &meta.git_remote {
             state.git_remote.clone_from(remote);
         }
+        if let Some(model) = &meta.first_model {
+            state.note_model(model);
+        }
         Self {
             state,
             usage: FastHashMap::default(),
@@ -537,10 +540,11 @@ impl<'a> AntigravityParser<'a> {
     }
 
     fn update_current_model(&mut self, step: i64) {
-        if let Some(model) = self.meta.step_models.get(&step)
-            && self.current_model.as_deref() != Some(model.as_str())
-        {
-            self.current_model = Some(model.clone());
+        if let Some(model) = self.meta.step_models.get(&step) {
+            self.state.note_model(model);
+            if self.current_model.as_deref() != Some(model.as_str()) {
+                self.current_model = Some(model.clone());
+            }
         }
     }
 
@@ -611,77 +615,86 @@ impl<'a> AntigravityParser<'a> {
             return;
         }
         let arg = |key: &str| call.args.get(key).and_then(Value::as_str);
-        let applied = match call.name.as_str() {
-            "read_file" => arg("Path")
-                .filter(|path| !path.is_empty())
-                .is_some_and(|path| {
-                    if matches!(self.state.mode, ParseMode::Full) {
-                        let content = read_content()
-                            .as_deref()
-                            .map(numbered_lines)
-                            .unwrap_or_default();
-                        if content.is_empty() {
-                            self.state.tool_counts.read += 1;
-                            self.state.add_non_text_read_path(path);
-                        } else {
-                            self.state.add_read_detail(path, &content, timestamp);
-                        }
-                    } else {
-                        let mut total_lines = 0usize;
-                        let mut non_empty_lines = 0usize;
-                        let mut chars_so_far = 0usize;
-                        let mut chars_up_to_last_non_empty = 0usize;
-                        if let Some(raw) = read_content() {
-                            for stripped in raw.split('\n').filter_map(strip_numbered_line) {
-                                if total_lines > 0 {
-                                    chars_so_far += 1;
+        let active_model = self.current_model.as_deref().unwrap_or(UNKNOWN_MODEL);
+        let applied =
+            self.state
+                .record_for_model(Some(active_model), |state| match call.name.as_str() {
+                    "read_file" => {
+                        arg("Path")
+                            .filter(|path| !path.is_empty())
+                            .is_some_and(|path| {
+                                if matches!(state.mode, ParseMode::Full) {
+                                    let content = read_content()
+                                        .as_deref()
+                                        .map(numbered_lines)
+                                        .unwrap_or_default();
+                                    if content.is_empty() {
+                                        state.tool_counts.read += 1;
+                                        state.add_non_text_read_path(path);
+                                    } else {
+                                        state.add_read_detail(path, &content, timestamp);
+                                    }
+                                } else {
+                                    let mut total_lines = 0usize;
+                                    let mut non_empty_lines = 0usize;
+                                    let mut chars_so_far = 0usize;
+                                    let mut chars_up_to_last_non_empty = 0usize;
+                                    if let Some(raw) = read_content() {
+                                        for stripped in
+                                            raw.split('\n').filter_map(strip_numbered_line)
+                                        {
+                                            if total_lines > 0 {
+                                                chars_so_far += 1;
+                                            }
+                                            chars_so_far +=
+                                                bytecount::num_chars(stripped.as_bytes());
+                                            total_lines += 1;
+                                            if !stripped.is_empty() {
+                                                non_empty_lines = total_lines;
+                                                chars_up_to_last_non_empty = chars_so_far;
+                                            }
+                                        }
+                                    }
+                                    if non_empty_lines > 0 {
+                                        let resolved = state.normalize_path(path);
+                                        if !resolved.is_empty() {
+                                            state.unique_files.insert(resolved);
+                                            state.total_read_lines += non_empty_lines;
+                                            state.total_read_characters +=
+                                                chars_up_to_last_non_empty;
+                                            state.tool_counts.read += 1;
+                                        }
+                                    } else if total_lines <= 1 {
+                                        state.tool_counts.read += 1;
+                                        state.add_non_text_read_path(path);
+                                    }
                                 }
-                                chars_so_far += bytecount::num_chars(stripped.as_bytes());
-                                total_lines += 1;
-                                if !stripped.is_empty() {
-                                    non_empty_lines = total_lines;
-                                    chars_up_to_last_non_empty = chars_so_far;
-                                }
-                            }
-                        }
-                        if non_empty_lines > 0 {
-                            let resolved = self.state.normalize_path(path);
-                            if !resolved.is_empty() {
-                                self.state.unique_files.insert(resolved);
-                                self.state.total_read_lines += non_empty_lines;
-                                self.state.total_read_characters += chars_up_to_last_non_empty;
-                                self.state.tool_counts.read += 1;
-                            }
-                        } else if total_lines <= 1 {
-                            self.state.tool_counts.read += 1;
-                            self.state.add_non_text_read_path(path);
-                        }
+                                true
+                            })
                     }
-                    true
-                }),
-            "write_file" => match (arg("Path"), arg("Content")) {
-                (Some(path), Some(content)) => {
-                    self.state.add_write_detail(path, content, timestamp);
-                    true
-                }
-                _ => false,
-            },
-            "edit_file" => match (arg("Path"), arg("Target"), arg("Replacement")) {
-                (Some(path), Some(old), Some(new)) => {
-                    self.state.add_edit_detail(path, old, new, timestamp);
-                    true
-                }
-                _ => false,
-            },
-            _ => match arg("CommandLine").filter(|command| !command.trim().is_empty()) {
-                Some(command) => {
-                    let description = arg("toolSummary").unwrap_or_default();
-                    self.state.add_run_command(command, description, timestamp);
-                    true
-                }
-                None => false,
-            },
-        };
+                    "write_file" => match (arg("Path"), arg("Content")) {
+                        (Some(path), Some(content)) => {
+                            state.add_write_detail(path, content, timestamp);
+                            true
+                        }
+                        _ => false,
+                    },
+                    "edit_file" => match (arg("Path"), arg("Target"), arg("Replacement")) {
+                        (Some(path), Some(old), Some(new)) => {
+                            state.add_edit_detail(path, old, new, timestamp);
+                            true
+                        }
+                        _ => false,
+                    },
+                    _ => match arg("CommandLine").filter(|command| !command.trim().is_empty()) {
+                        Some(command) => {
+                            let description = arg("toolSummary").unwrap_or_default();
+                            state.add_run_command(command, description, timestamp);
+                            true
+                        }
+                        None => false,
+                    },
+                });
         self.diagnostics.record_relevant(applied);
     }
 

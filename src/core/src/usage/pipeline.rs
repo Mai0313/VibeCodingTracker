@@ -5,11 +5,11 @@
 use crate::config::ProvidersConfig;
 use crate::models::TimeRange;
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
-use crate::usage::{
-    DailyUsageCollection, UsageCollection, UsageScanOptions,
-    aggregate_daily_usage_from_home_with_diagnostics_opts,
-    aggregate_usage_from_home_with_diagnostics_opts,
+use crate::usage::aggregator::{
+    aggregate_daily_usage_from_home_with_diagnostics_opts_and_remote_hook,
+    aggregate_usage_from_home_with_diagnostics_opts_and_remote_hook,
 };
+use crate::usage::{DailyUsageCollection, UsageCollection, UsageScanOptions};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,9 +60,25 @@ pub fn scan_usage_priced(
     providers: ProvidersConfig,
     pool: &rayon::ThreadPool,
 ) -> Result<PricedUsageScan> {
+    scan_usage_priced_with_remote_hook(time_range, providers, pool, || {})
+}
+
+/// Like [`scan_usage_priced`], invoking `before_remotes` after local scanning finishes and before remote snapshots are loaded and folded.
+#[doc(hidden)]
+pub fn scan_usage_priced_with_remote_hook(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    pool: &rayon::ThreadPool,
+    before_remotes: impl FnOnce() + Send,
+) -> Result<PricedUsageScan> {
     let (pricing, pricing_error, options) = fetch_pricing_or_degrade();
     let collection = pool.install(|| {
-        aggregate_usage_from_home_with_diagnostics_opts(time_range, providers, &options)
+        aggregate_usage_from_home_with_diagnostics_opts_and_remote_hook(
+            time_range,
+            providers,
+            &options,
+            before_remotes,
+        )
     })?;
     Ok(PricedUsageScan {
         collection,
@@ -83,9 +99,25 @@ pub fn scan_daily_usage_priced(
     providers: ProvidersConfig,
     pool: &rayon::ThreadPool,
 ) -> Result<PricedDailyUsageScan> {
+    scan_daily_usage_priced_with_remote_hook(time_range, providers, pool, || {})
+}
+
+/// Like [`scan_daily_usage_priced`], invoking `before_remotes` after local scanning finishes and before remote snapshots are loaded and folded.
+#[doc(hidden)]
+pub fn scan_daily_usage_priced_with_remote_hook(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    pool: &rayon::ThreadPool,
+    before_remotes: impl FnOnce() + Send,
+) -> Result<PricedDailyUsageScan> {
     let (pricing, pricing_error, options) = fetch_pricing_or_degrade();
     let collection = pool.install(|| {
-        aggregate_daily_usage_from_home_with_diagnostics_opts(time_range, providers, &options)
+        aggregate_daily_usage_from_home_with_diagnostics_opts_and_remote_hook(
+            time_range,
+            providers,
+            &options,
+            before_remotes,
+        )
     })?;
     Ok(PricedDailyUsageScan {
         collection,

@@ -935,3 +935,47 @@ fn export_refreshes_a_file_session_whose_analysis_half_is_missing() {
     assert_eq!(rows.data.per_provider.claude.len(), 1);
     assert!(rows.data.rows[0].edit_lines > 0);
 }
+
+#[test]
+fn ledger_persists_per_model_analysis_without_duplicating_multi_model_sessions() {
+    let home = TempHome::new();
+    let session = concat!(
+        r#"{"type":"assistant","sessionId":"s1","cwd":"/repo","timestamp":"2026-11-20T00:00:01Z","requestId":"r1","message":{"id":"m1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo check"}}]}}"#,
+        "\n",
+        r#"{"type":"assistant","sessionId":"s1","cwd":"/repo","timestamp":"2026-11-20T00:00:02Z","requestId":"r2","message":{"id":"m2","model":"claude-b","usage":{"input_tokens":20,"output_tokens":5},"content":[{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"/repo/f.rs","content":"a\nb"}}]}}"#,
+        "\n",
+        r#"{"type":"user","sessionId":"s1","cwd":"/repo","timestamp":"2026-11-20T00:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]},"toolUseResult":{"type":"create","filePath":"/repo/f.rs","content":"a\nb"}}"#,
+        "\n",
+    );
+    home.put_claude_session("proj", "multi.jsonl", session);
+    let providers = only(ExtensionType::ClaudeCode);
+
+    let mut ledger = open(&home);
+    let cold = analysis(&home, TimeRange::All, providers, &mut ledger);
+    ledger.save().unwrap();
+
+    let mut reopened = open(&home);
+    let warm = analysis(&home, TimeRange::All, providers, &mut reopened);
+    assert_eq!(reopened.stats().parsed_sources, 0);
+    assert_eq!(warm.data.rows, cold.data.rows);
+
+    let a = warm
+        .data
+        .rows
+        .iter()
+        .find(|r| r.model == "claude-a")
+        .unwrap();
+    assert_eq!(a.bash_count, 1);
+    assert_eq!(a.write_count, 0);
+    assert_eq!(a.write_lines, 0);
+
+    let b = warm
+        .data
+        .rows
+        .iter()
+        .find(|r| r.model == "claude-b")
+        .unwrap();
+    assert_eq!(b.write_count, 1);
+    assert_eq!(b.write_lines, 2);
+    assert_eq!(b.bash_count, 0);
+}

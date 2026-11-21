@@ -141,6 +141,7 @@ fn parse_grok_signals_bytes(path: &Path, bytes: &[u8], mode: ParseMode) -> Resul
     }
 
     let mut state = SessionParseState::with_mode(mode);
+    state.note_model(&model);
     apply_metadata(&mut state, path, summary.as_ref())?;
     parse_updates(path, &mut state, &mut diagnostics)?;
 

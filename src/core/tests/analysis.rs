@@ -262,8 +262,8 @@ fn batch_analysis_attributes_dsh_tools_to_the_deepseek_provider() {
     assert_eq!(row.edit_count, 1);
     assert_eq!(row.bash_count, 1);
     assert_eq!(row.todo_write_count, 1);
-    // Both models in the session bill against the same file operations.
-    assert_eq!(data.per_provider.deepseek.len(), 2);
+    // Only `demo-model` executed tool calls; `demo-reasoner` emitted usage only and must not receive duplicated file operations.
+    assert_eq!(data.per_provider.deepseek.len(), 1);
     assert_eq!(data.provider_days.deepseek, 1);
 }
 
@@ -1965,4 +1965,641 @@ fn modern_codex_item_completed_and_token_usage_record_parse_cleanly() {
     assert_eq!(single_record["totalReadLines"], 2);
     assert_eq!(single_record["totalWriteLines"], 1);
     assert_eq!(single_record["totalEditLines"], 1);
+}
+
+fn build_antigravity_gen_metadata_blob(model: &str, last_step: i64) -> Vec<u8> {
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+    fn bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
+        varint((field << 3) | 2, out);
+        varint(value.len() as u64, out);
+        out.extend_from_slice(value);
+    }
+    let mut inner = Vec::new();
+    bytes(19, model.as_bytes(), &mut inner);
+    let mut pair = Vec::new();
+    bytes(1, b"last_step_index", &mut pair);
+    let step_str = last_step.to_string();
+    bytes(2, step_str.as_bytes(), &mut pair);
+    bytes(20, &pair, &mut inner);
+    let mut outer = Vec::new();
+    bytes(1, &inner, &mut outer);
+    outer
+}
+
+#[test]
+fn multi_model_claude_session_attributes_tools_per_model_across_all_paths() {
+    let lines = [
+        json!({
+            "type": "assistant",
+            "parentUuid": null,
+            "sessionId": "claude-multi",
+            "cwd": "/repo",
+            "timestamp": "2026-11-20T00:00:01Z",
+            "requestId": "req-1",
+            "message": {
+                "id": "msg-1",
+                "model": "claude-alpha",
+                "usage": { "input_tokens": 100, "output_tokens": 20 },
+                "content": [
+                    { "type": "tool_use", "id": "tu-read", "name": "Read", "input": { "file_path": "/repo/a.rs" } },
+                    { "type": "tool_use", "id": "tu-bash", "name": "Bash", "input": { "command": "cargo check" } }
+                ]
+            }
+        }),
+        json!({
+            "type": "user",
+            "sessionId": "claude-multi",
+            "cwd": "/repo",
+            "timestamp": "2026-11-20T00:00:02Z",
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "tu-read", "content": "ok" }] },
+            "toolUseResult": { "type": "text", "file": { "filePath": "/repo/a.rs", "content": "l1\nl2\nl3" } }
+        }),
+        json!({
+            "type": "assistant",
+            "parentUuid": null,
+            "sessionId": "claude-multi",
+            "cwd": "/repo",
+            "timestamp": "2026-11-20T00:00:03Z",
+            "requestId": "req-2",
+            "message": {
+                "id": "msg-2",
+                "model": "claude-beta",
+                "usage": { "input_tokens": 200, "output_tokens": 40 },
+                "content": [
+                    { "type": "tool_use", "id": "tu-edit", "name": "Edit", "input": { "file_path": "/repo/a.rs", "old_string": "l1", "new_string": "n1\nn2" } },
+                    { "type": "tool_use", "id": "tu-write", "name": "Write", "input": { "file_path": "/repo/b.rs", "content": "w1\nw2\nw3\nw4" } }
+                ]
+            }
+        }),
+        json!({
+            "type": "user",
+            "sessionId": "claude-multi",
+            "cwd": "/repo",
+            "timestamp": "2026-11-20T00:00:04Z",
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "tu-edit", "content": "ok" }] },
+            "toolUseResult": { "filePath": "/repo/a.rs", "oldString": "l1", "newString": "n1\nn2" }
+        }),
+        json!({
+            "type": "user",
+            "sessionId": "claude-multi",
+            "cwd": "/repo",
+            "timestamp": "2026-11-20T00:00:05Z",
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "tu-write", "content": "ok" }] },
+            "toolUseResult": { "type": "create", "filePath": "/repo/b.rs", "content": "w1\nw2\nw3\nw4" }
+        }),
+        json!({
+            "type": "assistant",
+            "parentUuid": null,
+            "sessionId": "claude-multi",
+            "cwd": "/repo",
+            "timestamp": "2026-11-20T00:00:06Z",
+            "requestId": "req-3",
+            "message": {
+                "id": "msg-3",
+                "model": "claude-idle",
+                "usage": { "input_tokens": 50, "output_tokens": 10 },
+                "content": [{ "type": "text", "text": "summary only" }]
+            }
+        }),
+    ]
+    .iter()
+    .map(|v| format!("{v}\n"))
+    .collect::<String>();
+
+    let home = TempHome::new();
+    let path = home.put_claude_session("proj", "multi.jsonl", &lines);
+
+    // Single-file Full vs UsageOnly parity and JSON compatibility (`per_model_analysis` skipped in JSON).
+    let full =
+        parse_session_file_typed_as(&path, ExtensionType::ClaudeCode, ParseMode::Full).unwrap();
+    let usage_only =
+        parse_session_file_typed_as(&path, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+            .unwrap();
+    assert_eq!(
+        full.records[0].per_model_analysis,
+        usage_only.records[0].per_model_analysis
+    );
+    let json_val = parse_session_file_to_value(&path).unwrap();
+    assert!(json_val["records"][0].get("perModelAnalysis").is_none());
+
+    let projected = project_code_analysis(&full);
+    let uncached = aggregate_sessions_by_model_from_paths_with_providers(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+    )
+    .unwrap();
+    let mut ledger = SessionLedger::open(&home.paths.cache_dir);
+    let cached_cold = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        &mut ledger,
+    )
+    .unwrap();
+    ledger.save().unwrap();
+    let mut reopened = SessionLedger::open(&home.paths.cache_dir);
+    let cached_warm = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        &mut reopened,
+    )
+    .unwrap();
+
+    assert_analysis_data_eq(&cached_cold.data, &uncached);
+    assert_analysis_data_eq(&cached_warm.data, &uncached);
+    assert_eq!(projected.rows, uncached.rows);
+
+    assert_eq!(uncached.rows.len(), 2, "idle model must not get a row");
+    let alpha = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "claude-alpha")
+        .unwrap();
+    assert_eq!(alpha.read_count, 1);
+    assert_eq!(alpha.read_lines, 3);
+    assert_eq!(alpha.bash_count, 1);
+    assert_eq!(alpha.edit_count, 0);
+    assert_eq!(alpha.write_count, 0);
+
+    let beta = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "claude-beta")
+        .unwrap();
+    assert_eq!(beta.edit_count, 1);
+    assert_eq!(beta.edit_lines, 2);
+    assert_eq!(beta.write_count, 1);
+    assert_eq!(beta.write_lines, 4);
+    assert_eq!(beta.read_count, 0);
+    assert_eq!(beta.bash_count, 0);
+}
+
+#[test]
+fn multi_model_codex_session_attributes_tools_per_model() {
+    let rollout = [
+        json!({
+            "timestamp": "2026-11-20T00:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "codex-multi", "cwd": "/repo" }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:01Z",
+            "type": "turn_context",
+            "payload": { "model": "codex-alpha", "cwd": "/repo" }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 110
+                    }
+                }
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:03Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "cmd-alpha",
+                    "command": ["/bin/sh", "-lc", "sed -n '1,2p' src/a.rs"],
+                    "cwd": "file:///repo",
+                    "parsed_cmd": [{ "type": "read", "cmd": "sed -n '1,2p' src/a.rs", "path": "src/a.rs" }],
+                    "aggregated_output": "line1\nline2\n",
+                    "status": "completed"
+                }
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:04Z",
+            "type": "turn_context",
+            "payload": { "model": "codex-beta", "cwd": "/repo" }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 250,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 30,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 280
+                    }
+                }
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:06Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "FileChange",
+                    "id": "fc-beta",
+                    "status": "completed",
+                    "changes": {
+                        "/repo/src/a.rs": { "type": "update", "unified_diff": "@@ -1 +1,2 @@\n-old\n+new1\n+new2\n" }
+                    }
+                }
+            }
+        }),
+    ]
+    .iter()
+    .map(|v| format!("{v}\n"))
+    .collect::<String>();
+
+    let home = TempHome::new();
+    let path = home.put_codex_session(&format!("2026/11/20/{CODEX_ROLLOUT}"), &rollout);
+
+    let full = parse_session_file_typed_as(&path, ExtensionType::Codex, ParseMode::Full).unwrap();
+    let usage_only =
+        parse_session_file_typed_as(&path, ExtensionType::Codex, ParseMode::UsageOnly).unwrap();
+    assert_eq!(
+        full.records[0].per_model_analysis,
+        usage_only.records[0].per_model_analysis
+    );
+
+    let uncached = aggregate_sessions_by_model_from_paths_with_providers(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Codex),
+    )
+    .unwrap();
+    let mut ledger = SessionLedger::open(&home.paths.cache_dir);
+    let cached = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Codex),
+        &mut ledger,
+    )
+    .unwrap();
+    assert_analysis_data_eq(&cached.data, &uncached);
+
+    let alpha = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "codex-alpha")
+        .unwrap();
+    assert_eq!(alpha.read_count, 1);
+    assert_eq!(alpha.read_lines, 2);
+    assert_eq!(alpha.edit_count, 0);
+
+    let beta = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "codex-beta")
+        .unwrap();
+    assert_eq!(beta.edit_count, 1);
+    assert_eq!(beta.edit_lines, 2);
+    assert_eq!(beta.read_count, 0);
+}
+
+#[test]
+fn multi_model_copilot_session_attributes_tools_per_model() {
+    let events = [
+        json!({
+            "type": "session.start",
+            "id": "e1",
+            "timestamp": "2026-11-20T00:00:00Z",
+            "data": { "sessionId": "cop-multi", "producer": "copilot-agent", "context": { "cwd": "/repo" } }
+        }),
+        json!({
+            "type": "session.model_change",
+            "id": "e2",
+            "timestamp": "2026-11-20T00:00:01Z",
+            "data": { "newModel": "copilot-alpha" }
+        }),
+        json!({
+            "type": "tool.execution_start",
+            "id": "e3",
+            "timestamp": "2026-11-20T00:00:02Z",
+            "data": { "toolCallId": "tc-1", "toolName": "view", "arguments": { "path": "/repo/a.rs", "view_range": [1, 3] } }
+        }),
+        json!({
+            "type": "tool.execution_complete",
+            "id": "e4",
+            "timestamp": "2026-11-20T00:00:03Z",
+            "data": { "toolCallId": "tc-1", "success": true, "model": "copilot-alpha", "result": { "content": "a\nb\nc" } }
+        }),
+        // Subagent tool call completed by `copilot-beta` without an intervening `session.model_change`.
+        json!({
+            "type": "tool.execution_start",
+            "id": "e5",
+            "timestamp": "2026-11-20T00:00:04Z",
+            "data": { "toolCallId": "tc-2", "toolName": "bash", "arguments": { "command": "cargo test" } }
+        }),
+        json!({
+            "type": "tool.execution_complete",
+            "id": "e6",
+            "timestamp": "2026-11-20T00:00:05Z",
+            "data": { "toolCallId": "tc-2", "success": true, "model": "copilot-beta", "result": {} }
+        }),
+        json!({
+            "type": "session.shutdown",
+            "id": "e7",
+            "timestamp": "2026-11-20T00:00:06Z",
+            "data": {
+                "modelMetrics": {
+                    "copilot-alpha": { "usage": { "inputTokens": 100, "outputTokens": 20, "cacheReadTokens": 0, "cacheWriteTokens": 0 } },
+                    "copilot-beta": { "usage": { "inputTokens": 50, "outputTokens": 10, "cacheReadTokens": 0, "cacheWriteTokens": 0 } },
+                    "copilot-idle": { "usage": { "inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 0, "cacheWriteTokens": 0 } }
+                }
+            }
+        }),
+    ]
+    .iter()
+    .map(|v| format!("{v}\n"))
+    .collect::<String>();
+
+    let home = TempHome::new();
+    let path = home.put(".copilot/session-state/cop-multi/events.jsonl", &events);
+
+    let full = parse_session_file_typed_as(&path, ExtensionType::Copilot, ParseMode::Full).unwrap();
+    let usage_only =
+        parse_session_file_typed_as(&path, ExtensionType::Copilot, ParseMode::UsageOnly).unwrap();
+    let autodetect = parse_session_file_typed(&path).unwrap();
+    assert_eq!(
+        full.records[0].per_model_analysis,
+        usage_only.records[0].per_model_analysis
+    );
+    assert_eq!(
+        full.records[0].per_model_analysis,
+        autodetect.records[0].per_model_analysis
+    );
+
+    let uncached = aggregate_sessions_by_model_from_paths_with_providers(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Copilot),
+    )
+    .unwrap();
+    let mut ledger = SessionLedger::open(&home.paths.cache_dir);
+    let cached = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Copilot),
+        &mut ledger,
+    )
+    .unwrap();
+    assert_analysis_data_eq(&cached.data, &uncached);
+
+    assert_eq!(uncached.rows.len(), 2);
+    let alpha = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "copilot-alpha")
+        .unwrap();
+    assert_eq!(alpha.read_count, 1);
+    assert_eq!(alpha.read_lines, 3);
+    assert_eq!(alpha.bash_count, 0);
+
+    let beta = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "copilot-beta")
+        .unwrap();
+    assert_eq!(beta.bash_count, 1);
+    assert_eq!(beta.read_count, 0);
+}
+
+#[test]
+fn multi_model_antigravity_session_attributes_tools_per_model() {
+    let home = TempHome::new();
+    let root = home.home().join(".gemini/antigravity");
+    let conv_id = "multi-conv";
+    let db_path = root.join("conversations").join(format!("{conv_id}.db"));
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);")
+        .unwrap();
+    // Step 1 produced by `ag-alpha` (last_step_index = 0 -> step 1); step 3 produced by `ag-beta` (last_step_index = 2 -> step 3).
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1), (1, ?2)",
+        params![
+            build_antigravity_gen_metadata_blob("ag-alpha", 0),
+            build_antigravity_gen_metadata_blob("ag-beta", 2),
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let transcript = [
+        json!({
+            "step_index": 0,
+            "source": "USER",
+            "type": "USER_INPUT",
+            "created_at": "2026-11-20T00:00:00Z"
+        }),
+        json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-20T00:00:01Z",
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "tool_calls": [
+                { "name": "read_file", "args": { "Path": "/repo/a.rs" } }
+            ]
+        }),
+        json!({
+            "step_index": 2,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "created_at": "2026-11-20T00:00:02Z",
+            "status": "DONE",
+            "content": "1: fn main() {}\n2: // two"
+        }),
+        json!({
+            "step_index": 3,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-20T00:00:03Z",
+            "input_tokens": 150,
+            "output_tokens": 30,
+            "tool_calls": [
+                { "name": "write_file", "args": { "Path": "/repo/b.rs", "Content": "x\ny\nz\n" } },
+                { "name": "run_command", "args": { "CommandLine": "cargo test", "toolSummary": "Test" } }
+            ]
+        }),
+        json!({
+            "step_index": 4,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "created_at": "2026-11-20T00:00:04Z",
+            "status": "DONE",
+            "content": "ok"
+        }),
+        json!({
+            "step_index": 5,
+            "source": "SYSTEM",
+            "type": "GENERIC",
+            "created_at": "2026-11-20T00:00:05Z",
+            "status": "DONE",
+            "content": "passed"
+        }),
+    ]
+    .iter()
+    .map(|v| format!("{v}\n"))
+    .collect::<String>();
+
+    let transcript_path = root
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated/logs/transcript_full.jsonl");
+    std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    std::fs::write(&transcript_path, transcript).unwrap();
+
+    let full = parse_session_file_typed_as(
+        &transcript_path,
+        ExtensionType::Antigravity,
+        ParseMode::Full,
+    )
+    .unwrap();
+    let usage_only = parse_session_file_typed_as(
+        &transcript_path,
+        ExtensionType::Antigravity,
+        ParseMode::UsageOnly,
+    )
+    .unwrap();
+    assert_eq!(
+        full.records[0].per_model_analysis,
+        usage_only.records[0].per_model_analysis
+    );
+
+    let uncached = aggregate_sessions_by_model_from_paths_with_providers(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Antigravity),
+    )
+    .unwrap();
+    let mut ledger = SessionLedger::open(&home.paths.cache_dir);
+    let cached = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Antigravity),
+        &mut ledger,
+    )
+    .unwrap();
+    assert_analysis_data_eq(&cached.data, &uncached);
+
+    let alpha = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "ag-alpha")
+        .unwrap();
+    assert_eq!(alpha.read_count, 1);
+    assert_eq!(alpha.read_lines, 2);
+    assert_eq!(alpha.write_count, 0);
+    assert_eq!(alpha.bash_count, 0);
+
+    let beta = uncached.rows.iter().find(|r| r.model == "ag-beta").unwrap();
+    assert_eq!(beta.write_count, 1);
+    assert_eq!(beta.write_lines, 3);
+    assert_eq!(beta.bash_count, 1);
+    assert_eq!(beta.read_count, 0);
+}
+
+#[test]
+fn multi_model_gemini_session_attributes_tools_per_model() {
+    let lines = [
+        json!({ "sessionId": "gem-multi", "projectHash": "proj" }),
+        json!({
+            "id": "m1",
+            "type": "gemini",
+            "timestamp": "2026-11-20T00:00:01Z",
+            "model": "gemini-alpha",
+            "tokens": { "input": 100, "output": 20, "cached": 0, "thoughts": 0, "tool": 0, "total": 120 },
+            "toolCalls": [
+                {
+                    "name": "read_file",
+                    "status": "success",
+                    "args": { "file_path": "/repo/a.rs" },
+                    "result": [{ "functionResponse": { "response": { "output": "l1\nl2" } } }]
+                }
+            ]
+        }),
+        json!({
+            "id": "m2",
+            "type": "gemini",
+            "timestamp": "2026-11-20T00:00:02Z",
+            "model": "gemini-beta",
+            "tokens": { "input": 150, "output": 30, "cached": 0, "thoughts": 0, "tool": 0, "total": 180 },
+            "toolCalls": [
+                {
+                    "name": "write_file",
+                    "status": "success",
+                    "args": { "file_path": "/repo/b.rs", "content": "w1\nw2\nw3" },
+                    "result": [{ "functionResponse": { "response": { "output": "ok" } } }]
+                }
+            ]
+        }),
+    ]
+    .iter()
+    .map(|v| format!("{v}\n"))
+    .collect::<String>();
+
+    let home = TempHome::new();
+    let path = home.put_gemini_session("proj", "session-multi.jsonl", &lines);
+
+    let full = parse_session_file_typed_as(&path, ExtensionType::Gemini, ParseMode::Full).unwrap();
+    let usage_only =
+        parse_session_file_typed_as(&path, ExtensionType::Gemini, ParseMode::UsageOnly).unwrap();
+    assert_eq!(
+        full.records[0].per_model_analysis,
+        usage_only.records[0].per_model_analysis
+    );
+
+    let uncached = aggregate_sessions_by_model_from_paths_with_providers(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Gemini),
+    )
+    .unwrap();
+    let mut ledger = SessionLedger::open(&home.paths.cache_dir);
+    let cached = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Gemini),
+        &mut ledger,
+    )
+    .unwrap();
+    assert_analysis_data_eq(&cached.data, &uncached);
+
+    let alpha = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "gemini-alpha")
+        .unwrap();
+    assert_eq!(alpha.read_count, 1);
+    assert_eq!(alpha.read_lines, 2);
+    assert_eq!(alpha.write_count, 0);
+
+    let beta = uncached
+        .rows
+        .iter()
+        .find(|r| r.model == "gemini-beta")
+        .unwrap();
+    assert_eq!(beta.write_count, 1);
+    assert_eq!(beta.write_lines, 3);
+    assert_eq!(beta.read_count, 0);
 }

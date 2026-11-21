@@ -221,12 +221,6 @@ impl SessionLedger {
         self.retained = 0;
     }
 
-    /// Starts one scan and resets its per-scan counters.
-    pub(crate) fn begin_scan(&mut self) {
-        self.begin_local_scan();
-        self.reload_remotes();
-    }
-
     /// Records that `count` sources were read during this scan.
     pub(crate) fn record_parses(&mut self, count: usize) {
         self.parsed_sources += count;
