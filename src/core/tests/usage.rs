@@ -1152,6 +1152,85 @@ fn usage_json_rows_flatten_the_codex_nested_shape() {
 }
 
 #[test]
+fn codex_cache_write_tokens_bill_at_cache_creation_rate() {
+    use serde_json::json;
+    use std::collections::HashMap;
+    use vct_core::pricing::{ModelPricing, ModelPricingMap, clear_pricing_cache};
+    use vct_core::usage::price_usage_data;
+
+    clear_pricing_cache();
+    let home = TempHome::new();
+    let rollout = [
+        json!({
+            "timestamp": "2026-07-12T00:00:00Z",
+            "type": "turn_context",
+            "payload": { "model": "gpt-6-astra" }
+        }),
+        json!({
+            "timestamp": "2026-07-12T00:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100_000,
+                        "cached_input_tokens": 60_000,
+                        "cache_write_input_tokens": 30_000,
+                        "output_tokens": 2_000,
+                        "reasoning_output_tokens": 500,
+                        "total_tokens": 102_000
+                    }
+                }
+            }
+        }),
+    ]
+    .iter()
+    .map(|v| format!("{v}\n"))
+    .collect::<String>();
+    home.put_codex_session(&format!("2026/07/12/{CODEX_ROLLOUT}"), &rollout);
+
+    let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate codex");
+    let mut prices = HashMap::new();
+    prices.insert(
+        "gpt-6-astra".to_string(),
+        ModelPricing {
+            input_cost_per_token: 10e-6,
+            output_cost_per_token: 50e-6,
+            cache_read_input_token_cost: 1e-6,
+            cache_creation_input_token_cost: 12.5e-6,
+            ..Default::default()
+        },
+    );
+    let rows = price_usage_data(&data, &ModelPricingMap::new(prices));
+    let row = rows
+        .iter()
+        .find(|row| row.model == "gpt-6-astra")
+        .expect("a priced row for gpt-6-astra");
+
+    assert_eq!(
+        row.usage,
+        json!({
+            "input_tokens": 10_000,
+            "cache_read_input_tokens": 60_000,
+            "cache_creation_input_tokens": 30_000,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 30_000,
+                "ephemeral_1h_input_tokens": 0,
+            },
+            "output_tokens": 1_500,
+            "reasoning_output_tokens": 500,
+            "total_tokens": 102_000,
+        })
+    );
+    // 10k * $10/M ($0.10) + 60k * $1/M ($0.06) + 30k * $12.5/M ($0.375) + 2k * $50/M ($0.10) = $0.635
+    assert!(
+        (row.cost_usd - 0.635).abs() < 1e-9,
+        "expected $0.635, got {}",
+        row.cost_usd
+    );
+}
+
+#[test]
 fn usage_json_reports_absent_cache_buckets_as_zero() {
     use std::collections::HashMap;
     use vct_core::pricing::{ModelPricingMap, clear_pricing_cache};

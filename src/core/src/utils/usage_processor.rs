@@ -202,10 +202,11 @@ pub fn process_claude_usage(
     }
 }
 
-/// The five integer fields of a Codex `total_token_usage` object.
-pub const CODEX_TOKEN_FIELDS: [&str; 5] = [
+/// The six integer fields of a Codex `total_token_usage` object.
+pub const CODEX_TOKEN_FIELDS: [&str; 6] = [
     "input_tokens",
     "cached_input_tokens",
+    "cache_write_input_tokens",
     "output_tokens",
     "reasoning_output_tokens",
     "total_tokens",
@@ -213,11 +214,12 @@ pub const CODEX_TOKEN_FIELDS: [&str; 5] = [
 
 /// Snapshot of Codex's cumulative `total_token_usage` counters for delta attribution across turns and model switches.
 ///
-/// Stores raw Codex counters (`input_tokens` includes `cached_input_tokens`; `output_tokens` includes `reasoning_output_tokens`).
+/// Stores raw Codex counters (`input_tokens` includes `cached_input_tokens` and `cache_write_input_tokens`; `output_tokens` includes `reasoning_output_tokens`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CodexTokenTotals {
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
+    pub cache_write_input_tokens: i64,
     pub output_tokens: i64,
     pub reasoning_output_tokens: i64,
     pub total_tokens: i64,
@@ -236,6 +238,7 @@ impl CodexTokenTotals {
         Self {
             input_tokens: field("input_tokens"),
             cached_input_tokens: field("cached_input_tokens"),
+            cache_write_input_tokens: field("cache_write_input_tokens"),
             output_tokens: field("output_tokens"),
             reasoning_output_tokens: field("reasoning_output_tokens"),
             total_tokens: field("total_tokens"),
@@ -246,6 +249,7 @@ impl CodexTokenTotals {
         match key {
             "input_tokens" => self.input_tokens,
             "cached_input_tokens" => self.cached_input_tokens,
+            "cache_write_input_tokens" => self.cache_write_input_tokens,
             "output_tokens" => self.output_tokens,
             "reasoning_output_tokens" => self.reasoning_output_tokens,
             "total_tokens" => self.total_tokens,
@@ -318,16 +322,17 @@ pub fn process_codex_usage(
     if tier_level > 0 {
         let field = |key: &str| delta.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
         let cached = field("cached_input_tokens");
+        let cache_write = field("cache_write_input_tokens");
         let reasoning = field("reasoning_output_tokens");
         accumulate_tier_slice(
             existing_obj,
             tier_level,
             &TierSlice {
-                input_tokens: (field("input_tokens") - cached).max(0),
+                input_tokens: (field("input_tokens") - cached - cache_write).max(0),
                 output_tokens: (field("output_tokens") - reasoning).max(0),
                 reasoning_tokens: reasoning,
                 cache_read: cached,
-                cache_creation_5m: 0,
+                cache_creation_5m: cache_write,
                 cache_creation_1h: 0,
             },
         );
@@ -697,6 +702,7 @@ mod tests {
         let prev = CodexTokenTotals {
             input_tokens: 9_000,
             cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
             output_tokens: 1_000,
             reasoning_output_tokens: 0,
             total_tokens: 10_000,
@@ -712,6 +718,7 @@ mod tests {
         let prev = CodexTokenTotals {
             input_tokens: 20_000,
             cached_input_tokens: 4_000,
+            cache_write_input_tokens: 0,
             output_tokens: 3_289,
             reasoning_output_tokens: 1_000,
             total_tokens: 23_289,
@@ -757,6 +764,53 @@ mod tests {
         let delta = CodexTokenTotals::delta_fields(third.as_object().unwrap(), Some(&second));
         assert_eq!(delta["total_tokens"].as_i64().unwrap(), 104_576 - 23_289);
         assert_eq!(delta["cached_input_tokens"].as_i64().unwrap(), 56_000);
+    }
+
+    #[test]
+    fn codex_cache_write_deltas_and_tier_slices_are_preserved() {
+        let mut conversation_usage = FastHashMap::default();
+        let first = json!({
+            "total_token_usage": {
+                "input_tokens": 100_000,
+                "cached_input_tokens": 40_000,
+                "cache_write_input_tokens": 25_000,
+                "output_tokens": 2_000,
+                "reasoning_output_tokens": 500,
+                "total_tokens": 102_000
+            }
+        });
+        let first_total = first["total_token_usage"].as_object().unwrap();
+        let delta1 = CodexTokenTotals::delta_fields(first_total, None);
+        process_codex_usage(&mut conversation_usage, "gpt-6-astra", &delta1, &first, 0);
+        let prev = CodexTokenTotals::from_total_object(first_total, None);
+
+        let second = json!({
+            "total_token_usage": {
+                "input_tokens": 400_000,
+                "cached_input_tokens": 240_000,
+                "cache_write_input_tokens": 75_000,
+                "output_tokens": 5_000,
+                "reasoning_output_tokens": 1_500,
+                "total_tokens": 405_000
+            }
+        });
+        let second_total = second["total_token_usage"].as_object().unwrap();
+        let delta2 = CodexTokenTotals::delta_fields(second_total, Some(&prev));
+        process_codex_usage(&mut conversation_usage, "gpt-6-astra", &delta2, &second, 1);
+
+        let entry = &conversation_usage["gpt-6-astra"];
+        assert_eq!(
+            entry["total_token_usage"]["cache_write_input_tokens"],
+            75_000
+        );
+        assert_eq!(entry["above_tier"]["level_1_input_tokens"], 50_000);
+        assert_eq!(entry["above_tier"]["level_1_cache_read_tokens"], 200_000);
+        assert_eq!(
+            entry["above_tier"]["level_1_cache_creation_5m_tokens"],
+            50_000
+        );
+        assert_eq!(entry["above_tier"]["level_1_output_tokens"], 2_000);
+        assert_eq!(entry["above_tier"]["level_1_reasoning_tokens"], 1_000);
     }
 
     #[test]

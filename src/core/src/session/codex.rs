@@ -6,10 +6,11 @@ use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::parser::stream_jsonl_borrowed;
-use crate::session::state::{ParseMode, SessionParseState};
+use crate::session::state::{ParseMode, SessionParseState, TextMetrics, count_json_string_metrics};
 use crate::utils::token_merge::write_tier_slice;
 use crate::utils::{CodexTokenTotals, TierSlice, get_git_remote_url, parse_iso_timestamp};
 use anyhow::Result;
+use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde::de::Deserializer;
 use serde_json::{Value, value::RawValue};
@@ -60,6 +61,16 @@ where
         } else {
             None
         };
+        let completed_item =
+            if entry.log_type == "event_msg" && payload_type == Some("item_completed") {
+                entry
+                    .payload
+                    .item
+                    .as_ref()
+                    .and_then(|item| parse_completed_item_value(item, &fold.patch_counted_ids))
+            } else {
+                None
+            };
         fold.observe(CodexRecordRef {
             log_type: &entry.log_type,
             timestamp: &entry.timestamp,
@@ -75,6 +86,7 @@ where
             token_count,
             success: entry.payload.success,
             changes: entry.payload.changes.as_ref(),
+            completed_item,
             name: entry.payload.name.as_deref(),
             arguments: entry.payload.arguments.as_deref(),
             call_id: entry.payload.call_id.as_deref(),
@@ -178,6 +190,15 @@ pub(crate) fn parse_codex_jsonl_path(
                 }
             };
 
+            let completed_item =
+                if record.log_type == "event_msg" && payload_type == Some("item_completed") {
+                    record.payload.item.and_then(|raw| {
+                        parse_completed_item_raw(raw.get(), &fold.patch_counted_ids)
+                    })
+                } else {
+                    None
+                };
+
             fold.observe(CodexRecordRef {
                 log_type: &record.log_type,
                 timestamp: &record.timestamp,
@@ -193,6 +214,7 @@ pub(crate) fn parse_codex_jsonl_path(
                 token_count,
                 success: record.payload.success,
                 changes: changes.as_ref(),
+                completed_item,
                 name: record.payload.name.as_deref(),
                 arguments: arguments.as_deref(),
                 call_id: record.payload.call_id.as_deref(),
@@ -240,6 +262,8 @@ struct BorrowedCodexPayload<'a> {
     success: Option<bool>,
     #[serde(default, borrow)]
     changes: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    item: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -264,6 +288,7 @@ struct BorrowedExecCommandArgs<'a> {
 struct CodexTokenFields {
     input_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     reasoning_output_tokens: Option<i64>,
     total_tokens: Option<i64>,
@@ -277,6 +302,9 @@ impl CodexTokenFields {
             cached_input_tokens: self
                 .cached_input_tokens
                 .unwrap_or(carried.cached_input_tokens),
+            cache_write_input_tokens: self
+                .cache_write_input_tokens
+                .unwrap_or(carried.cache_write_input_tokens),
             output_tokens: self.output_tokens.unwrap_or(carried.output_tokens),
             reasoning_output_tokens: self
                 .reasoning_output_tokens
@@ -313,6 +341,7 @@ enum ParsedTokenCount<'a> {
 struct CodexModelUsage {
     input_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     reasoning_output_tokens: Option<i64>,
     total_tokens: Option<i64>,
@@ -352,12 +381,15 @@ impl CodexModelUsage {
     }
 
     fn into_value(self) -> Value {
-        let mut total_map = serde_json::Map::with_capacity(5);
+        let mut total_map = serde_json::Map::with_capacity(6);
         if let Some(v) = self.input_tokens {
             total_map.insert("input_tokens".to_string(), v.into());
         }
         if let Some(v) = self.cached_input_tokens {
             total_map.insert("cached_input_tokens".to_string(), v.into());
+        }
+        if let Some(v) = self.cache_write_input_tokens {
+            total_map.insert("cache_write_input_tokens".to_string(), v.into());
         }
         if let Some(v) = self.output_tokens {
             total_map.insert("output_tokens".to_string(), v.into());
@@ -401,6 +433,33 @@ impl CodexModelUsage {
     }
 }
 
+enum CompletedOutput<'a> {
+    Str(&'a str),
+    RawJson(&'a str),
+}
+
+struct CompletedParsedCmd<'a> {
+    cmd_type: Cow<'a, str>,
+    path: Option<Cow<'a, str>>,
+    cmd: Option<Cow<'a, str>>,
+}
+
+enum CompletedItem<'a> {
+    FileChange {
+        id: Option<Cow<'a, str>>,
+        status: Option<Cow<'a, str>>,
+        changes: Option<Cow<'a, Value>>,
+    },
+    CommandExecution {
+        id: Option<Cow<'a, str>>,
+        status: Option<Cow<'a, str>>,
+        cwd: Option<Cow<'a, str>>,
+        command: Vec<Cow<'a, str>>,
+        parsed_cmd: Vec<CompletedParsedCmd<'a>>,
+        aggregated_output: Option<CompletedOutput<'a>>,
+    },
+}
+
 struct CodexRecordRef<'a> {
     log_type: &'a str,
     timestamp: &'a str,
@@ -412,6 +471,7 @@ struct CodexRecordRef<'a> {
     token_count: Option<ParsedTokenCount<'a>>,
     success: Option<bool>,
     changes: Option<&'a Value>,
+    completed_item: Option<CompletedItem<'a>>,
     name: Option<&'a str>,
     arguments: Option<&'a str>,
     call_id: Option<&'a str>,
@@ -428,8 +488,13 @@ struct CodexFold<'a> {
     prev_totals: Option<CodexTokenTotals>,
     shell_calls: FastHashMap<String, PendingCodexShellCall>,
     custom_calls: FastHashMap<String, CodexCustomCall>,
-    // Call ids already counted by either a confirmed direct `apply_patch` output or a successful `patch_apply_end`; first to count wins, and unconfirmed direct outputs never register here.
+    // Completed outer `exec` cells buffered until `finish()`, where they flush only if modern `item_completed` `CommandExecution` events did not already report individual shell commands.
+    pending_exec_cells: Vec<(Option<String>, i64)>,
+    saw_item_command_execution: bool,
+    // Call ids already counted by a confirmed direct `apply_patch` output, a successful `patch_apply_end`, or a completed `FileChange` item; first to count wins, and unconfirmed direct outputs never register here.
     patch_counted_ids: FastHashSet<String>,
+    // Command ids already counted by either a paired `function_call_output` or an `item_completed` `CommandExecution`; prevents double-counting replays or paired emitters.
+    command_counted_ids: FastHashSet<String>,
     diagnostics: ParseDiagnostics,
 }
 
@@ -444,7 +509,10 @@ impl<'a> CodexFold<'a> {
             prev_totals: None,
             shell_calls: FastHashMap::with_capacity(50),
             custom_calls: FastHashMap::with_capacity(32),
+            pending_exec_cells: Vec::new(),
+            saw_item_command_execution: false,
             patch_counted_ids: FastHashSet::default(),
+            command_counted_ids: FastHashSet::default(),
             diagnostics: ParseDiagnostics::default(),
         }
     }
@@ -459,6 +527,7 @@ impl<'a> CodexFold<'a> {
                 | "inter_agent_communication_metadata"
                 | "world_state"
                 | "compacted"
+                | "token_usage_record"
         );
         if recognized {
             self.diagnostics.record_recognized_source();
@@ -545,6 +614,13 @@ impl<'a> CodexFold<'a> {
                                                         .max(0)
                                                 },
                                             ),
+                                            cache_write_input_tokens: fields
+                                                .cache_write_input_tokens
+                                                .map(|_| {
+                                                    (current.cache_write_input_tokens
+                                                        - base.cache_write_input_tokens)
+                                                        .max(0)
+                                                }),
                                             output_tokens: fields.output_tokens.map(|_| {
                                                 (current.output_tokens - base.output_tokens).max(0)
                                             }),
@@ -585,6 +661,10 @@ impl<'a> CodexFold<'a> {
                                         &mut usage.cached_input_tokens,
                                         delta.cached_input_tokens,
                                     );
+                                    add_opt_i64(
+                                        &mut usage.cache_write_input_tokens,
+                                        delta.cache_write_input_tokens,
+                                    );
                                     add_opt_i64(&mut usage.output_tokens, delta.output_tokens);
                                     add_opt_i64(
                                         &mut usage.reasoning_output_tokens,
@@ -593,19 +673,22 @@ impl<'a> CodexFold<'a> {
                                     add_opt_i64(&mut usage.total_tokens, delta.total_tokens);
                                     if level > 0 {
                                         let cached = delta.cached_input_tokens.unwrap_or(0);
+                                        let cache_write =
+                                            delta.cache_write_input_tokens.unwrap_or(0);
                                         let reasoning = delta.reasoning_output_tokens.unwrap_or(0);
                                         usage.add_tier_slice(
                                             level,
                                             TierSlice {
                                                 input_tokens: (delta.input_tokens.unwrap_or(0)
-                                                    - cached)
+                                                    - cached
+                                                    - cache_write)
                                                     .max(0),
                                                 output_tokens: (delta.output_tokens.unwrap_or(0)
                                                     - reasoning)
                                                     .max(0),
                                                 reasoning_tokens: reasoning,
                                                 cache_read: cached,
-                                                cache_creation_5m: 0,
+                                                cache_creation_5m: cache_write,
                                                 cache_creation_1h: 0,
                                             },
                                         );
@@ -646,6 +729,65 @@ impl<'a> CodexFold<'a> {
                     }
                     // A failed or deduped event is recognized but creates no file ops.
                 }
+
+                // Modern Codex reports applied file edits and executed shell commands inside `item_completed`.
+                if entry.payload_type == Some("item_completed")
+                    && let Some(item) = entry.completed_item
+                {
+                    match item {
+                        CompletedItem::FileChange {
+                            id,
+                            status,
+                            changes,
+                        } => {
+                            let already_counted = id
+                                .as_deref()
+                                .is_some_and(|id| self.patch_counted_ids.contains(id));
+                            if status.as_deref() == Some("completed") && !already_counted {
+                                match parse_patch_changes(changes.as_deref()) {
+                                    Some(patches) => {
+                                        for patch in patches {
+                                            self.state.handle_patch(patch, ts);
+                                        }
+                                        if let Some(id) = id {
+                                            self.patch_counted_ids.insert(id.into_owned());
+                                        }
+                                        self.diagnostics.record_relevant(true);
+                                    }
+                                    None => self.diagnostics.record_relevant(false),
+                                }
+                            }
+                        }
+                        CompletedItem::CommandExecution {
+                            id,
+                            status,
+                            cwd,
+                            command,
+                            parsed_cmd,
+                            aggregated_output,
+                        } => {
+                            self.saw_item_command_execution = true;
+                            let already_counted = id
+                                .as_deref()
+                                .is_some_and(|id| self.command_counted_ids.contains(id));
+                            if !already_counted {
+                                self.diagnostics.record_relevant(true);
+                                handle_command_execution(
+                                    &mut self.state,
+                                    status.as_deref(),
+                                    cwd.as_deref(),
+                                    &command,
+                                    &parsed_cmd,
+                                    aggregated_output,
+                                    ts,
+                                );
+                                if let Some(id) = id {
+                                    self.command_counted_ids.insert(id.into_owned());
+                                }
+                            }
+                        }
+                    }
+                }
             }
             "response_item" => match entry.payload_type {
                 Some("function_call") => {
@@ -681,7 +823,9 @@ impl<'a> CodexFold<'a> {
                         match call {
                             PendingCodexShellCall::Parsed(call) => {
                                 self.diagnostics.record_relevant(true);
-                                self.state.handle_shell_call(call, entry.output);
+                                if self.command_counted_ids.insert(call_id.to_string()) {
+                                    self.state.handle_shell_call(call, entry.output);
+                                }
                             }
                             PendingCodexShellCall::InvalidArguments => {
                                 self.diagnostics
@@ -714,6 +858,7 @@ impl<'a> CodexFold<'a> {
                             entry.output,
                             call_id,
                             &mut self.patch_counted_ids,
+                            &mut self.pending_exec_cells,
                         );
                         self.diagnostics.record_relevant(normalized);
                     }
@@ -725,6 +870,16 @@ impl<'a> CodexFold<'a> {
     }
 
     fn finish(mut self) -> ParsedAnalysis {
+        if !self.saw_item_command_execution {
+            for (source, timestamp) in self.pending_exec_cells {
+                // Nested tool calls in JavaScript source cannot be proven to have executed; count the completed `exec` cell as one command.
+                if let Some(source) = source {
+                    self.state.add_run_command(&source, "", timestamp);
+                } else {
+                    self.state.tool_counts.bash += 1;
+                }
+            }
+        }
         for call in self.shell_calls.into_values() {
             if matches!(call, PendingCodexShellCall::InvalidArguments) {
                 self.diagnostics.record_relevant(false);
@@ -826,6 +981,10 @@ fn parse_token_fields_value(usage: &Value) -> Option<CodexTokenFields> {
     };
     if !read_key("input_tokens", &mut fields.input_tokens)
         || !read_key("cached_input_tokens", &mut fields.cached_input_tokens)
+        || !read_key(
+            "cache_write_input_tokens",
+            &mut fields.cache_write_input_tokens,
+        )
         || !read_key("output_tokens", &mut fields.output_tokens)
         || !read_key(
             "reasoning_output_tokens",
@@ -864,6 +1023,8 @@ struct BorrowedTokenFields<'a> {
     input_tokens: Option<&'a RawValue>,
     #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
     cached_input_tokens: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    cache_write_input_tokens: Option<&'a RawValue>,
     #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
     output_tokens: Option<&'a RawValue>,
     #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
@@ -949,6 +1110,10 @@ fn parse_token_fields_raw(raw: &str) -> Option<CodexTokenFields> {
         || !parse_field(
             borrowed.cached_input_tokens,
             &mut fields.cached_input_tokens,
+        )
+        || !parse_field(
+            borrowed.cache_write_input_tokens,
+            &mut fields.cache_write_input_tokens,
         )
         || !parse_field(borrowed.output_tokens, &mut fields.output_tokens)
         || !parse_field(
@@ -1115,15 +1280,11 @@ fn dispatch_custom_call(
     output: Option<&str>,
     call_id: &str,
     patch_counted_ids: &mut FastHashSet<String>,
+    pending_exec_cells: &mut Vec<(Option<String>, i64)>,
 ) -> bool {
     match call {
         CodexCustomCall::Exec { source, timestamp } => {
-            // Nested tool calls in JavaScript source cannot be proven to have executed; count the completed `exec` cell as one command.
-            if let Some(source) = source {
-                state.add_run_command(&source, "", timestamp);
-            } else {
-                state.tool_counts.bash += 1;
-            }
+            pending_exec_cells.push((source, timestamp));
             true
         }
         CodexCustomCall::ApplyPatch { patches, timestamp } => {
@@ -1407,7 +1568,7 @@ fn parse_patch_changes(changes: Option<&Value>) -> Option<Vec<CodexPatch>> {
     Some(patches)
 }
 
-/// Builds a [`CodexPatch`] from one `patch_apply_end` `changes` entry.
+/// Builds a [`CodexPatch`] from one `patch_apply_end` or `FileChange` `changes` entry.
 fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
     if path.is_empty() {
         return None;
@@ -1419,14 +1580,376 @@ fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
         "delete" => CodexPatchAction::Delete,
         _ => return None,
     };
-    // `unified_diff` may be omitted on `add`/`delete` entries; count the operation with empty lines.
+    // `unified_diff` may be omitted on `add`/`delete` entries (`FileChange` carries full text in `content`).
     let mut patch = CodexPatch::new(action, path.to_string());
     if let Some(diff) = entry.get("unified_diff").and_then(Value::as_str) {
         for line in diff.lines() {
             patch.push_diff_line(line);
         }
+    } else if let Some(content) = entry.get("content").and_then(Value::as_str) {
+        match action {
+            CodexPatchAction::Add => patch.new_str.push_str(content),
+            CodexPatchAction::Delete => patch.old_str.push_str(content),
+            CodexPatchAction::Update => {}
+        }
     }
     Some(patch.finish())
+}
+
+#[derive(Deserialize)]
+struct BorrowedCompletedItem<'a> {
+    #[serde(rename = "type", default, borrow)]
+    item_type: Cow<'a, str>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    id: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    status: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    changes: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    command: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    cwd: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    parsed_cmd: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    aggregated_output: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedParsedCmd<'a> {
+    #[serde(
+        rename = "type",
+        default,
+        borrow,
+        deserialize_with = "deserialize_present_raw"
+    )]
+    cmd_type: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    path: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    cmd: Option<&'a RawValue>,
+}
+
+fn raw_as_cow_str<'a>(raw: Option<&'a RawValue>) -> Option<Cow<'a, str>> {
+    let raw = raw?;
+    if !raw.get().starts_with('"') {
+        return None;
+    }
+    serde_json::from_str::<Cow<'a, str>>(raw.get()).ok()
+}
+
+fn parse_raw_command_argv<'a>(raw: Option<&'a RawValue>) -> Vec<Cow<'a, str>> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let s = raw.get();
+    if s.starts_with('[') {
+        serde_json::from_str::<Vec<Cow<'a, str>>>(s).unwrap_or_default()
+    } else if s.starts_with('"') {
+        serde_json::from_str::<Cow<'a, str>>(s)
+            .map(|cmd| vec![cmd])
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+fn parse_raw_parsed_cmds<'a>(raw: Option<&'a RawValue>) -> Vec<CompletedParsedCmd<'a>> {
+    let Some(raw) = raw.filter(|raw| raw.get().starts_with('[')) else {
+        return Vec::new();
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<&'a RawValue>>(raw.get()) else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry_raw| {
+            if !entry_raw.get().starts_with('{') {
+                return None;
+            }
+            let entry = serde_json::from_str::<BorrowedParsedCmd<'a>>(entry_raw.get()).ok()?;
+            Some(CompletedParsedCmd {
+                cmd_type: raw_as_cow_str(entry.cmd_type).unwrap_or(Cow::Borrowed("")),
+                path: raw_as_cow_str(entry.path),
+                cmd: raw_as_cow_str(entry.cmd),
+            })
+        })
+        .collect()
+}
+
+fn parse_completed_item_raw<'a>(
+    raw: &'a str,
+    patch_counted_ids: &FastHashSet<String>,
+) -> Option<CompletedItem<'a>> {
+    if !raw.trim_start().starts_with('{') {
+        return None;
+    }
+    let item = serde_json::from_str::<BorrowedCompletedItem<'a>>(raw).ok()?;
+    match item.item_type.as_ref() {
+        "FileChange" => {
+            let id = raw_as_cow_str(item.id);
+            let status = raw_as_cow_str(item.status);
+            let already_counted = id
+                .as_deref()
+                .is_some_and(|id| patch_counted_ids.contains(id));
+            let changes = if status.as_deref() == Some("completed") && !already_counted {
+                item.changes
+                    .and_then(|c| serde_json::from_str::<Value>(c.get()).ok())
+                    .map(Cow::Owned)
+            } else {
+                None
+            };
+            Some(CompletedItem::FileChange {
+                id,
+                status,
+                changes,
+            })
+        }
+        "CommandExecution" => {
+            let id = raw_as_cow_str(item.id);
+            let status = raw_as_cow_str(item.status);
+            let cwd = raw_as_cow_str(item.cwd);
+            let command = parse_raw_command_argv(item.command);
+            let parsed_cmd = parse_raw_parsed_cmds(item.parsed_cmd);
+            let aggregated_output = item
+                .aggregated_output
+                .filter(|raw| raw.get().starts_with('"'))
+                .map(|raw| CompletedOutput::RawJson(raw.get()));
+            Some(CompletedItem::CommandExecution {
+                id,
+                status,
+                cwd,
+                command,
+                parsed_cmd,
+                aggregated_output,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_completed_item_value<'a>(
+    item: &'a Value,
+    patch_counted_ids: &FastHashSet<String>,
+) -> Option<CompletedItem<'a>> {
+    let obj = item.as_object()?;
+    match obj.get("type").and_then(Value::as_str)? {
+        "FileChange" => {
+            let id = obj.get("id").and_then(Value::as_str).map(Cow::Borrowed);
+            let status = obj.get("status").and_then(Value::as_str).map(Cow::Borrowed);
+            let already_counted = id
+                .as_deref()
+                .is_some_and(|id| patch_counted_ids.contains(id));
+            let changes = if status.as_deref() == Some("completed") && !already_counted {
+                obj.get("changes").map(Cow::Borrowed)
+            } else {
+                None
+            };
+            Some(CompletedItem::FileChange {
+                id,
+                status,
+                changes,
+            })
+        }
+        "CommandExecution" => {
+            let id = obj.get("id").and_then(Value::as_str).map(Cow::Borrowed);
+            let status = obj.get("status").and_then(Value::as_str).map(Cow::Borrowed);
+            let cwd = obj.get("cwd").and_then(Value::as_str).map(Cow::Borrowed);
+            let command = match obj.get("command") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(Cow::Borrowed))
+                    .collect(),
+                Some(Value::String(s)) => vec![Cow::Borrowed(s.as_str())],
+                _ => Vec::new(),
+            };
+            let parsed_cmd = obj
+                .get("parsed_cmd")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let entry = entry.as_object()?;
+                            let cmd_type = entry
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            Some(CompletedParsedCmd {
+                                cmd_type: Cow::Borrowed(cmd_type),
+                                path: entry.get("path").and_then(Value::as_str).map(Cow::Borrowed),
+                                cmd: entry.get("cmd").and_then(Value::as_str).map(Cow::Borrowed),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let aggregated_output = obj
+                .get("aggregated_output")
+                .and_then(Value::as_str)
+                .map(CompletedOutput::Str);
+            Some(CompletedItem::CommandExecution {
+                id,
+                status,
+                cwd,
+                command,
+                parsed_cmd,
+                aggregated_output,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn strip_file_uri(cwd: &str) -> Cow<'_, str> {
+    let Some(rest) = cwd.strip_prefix("file://") else {
+        return Cow::Borrowed(cwd);
+    };
+    let decoded = percent_decode_str(rest).decode_utf8_lossy();
+    let bytes = decoded.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        match decoded {
+            Cow::Borrowed(s) => Cow::Borrowed(&s[1..]),
+            Cow::Owned(s) => Cow::Owned(s[1..].to_string()),
+        }
+    } else {
+        decoded
+    }
+}
+
+fn resolve_command_path(state: &SessionParseState, cwd: Option<&str>, path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    if path.starts_with('/') || is_windows_drive_path(path) || Path::new(path).is_absolute() {
+        return path.to_string();
+    }
+    if let Some(dir) = cwd.map(strip_file_uri).filter(|dir| !dir.is_empty()) {
+        let use_backslash = dir.contains('\\')
+            || (is_windows_drive_path(dir.as_ref())
+                && (state.folder_path.contains('\\')
+                    || (state.folder_path.is_empty() && cfg!(windows))));
+        if use_backslash {
+            let base = dir.trim_end_matches(['/', '\\']).replace('/', "\\");
+            let rel = path.trim_start_matches(['/', '\\']).replace('/', "\\");
+            return format!("{base}\\{rel}");
+        }
+        let base = dir.trim_end_matches('/');
+        let rel = path.trim_start_matches('/');
+        return format!("{base}/{rel}");
+    }
+    state.normalize_path(path)
+}
+
+fn handle_command_execution(
+    state: &mut SessionParseState,
+    status: Option<&str>,
+    cwd: Option<&str>,
+    command: &[Cow<'_, str>],
+    parsed_cmd: &[CompletedParsedCmd<'_>],
+    aggregated_output: Option<CompletedOutput<'_>>,
+    ts: i64,
+) {
+    let completed = status == Some("completed");
+    let all_read = !parsed_cmd.is_empty()
+        && parsed_cmd
+            .iter()
+            .all(|entry| entry.cmd_type.as_ref() == "read");
+    let all_inspection = !parsed_cmd.is_empty()
+        && parsed_cmd
+            .iter()
+            .all(|entry| matches!(entry.cmd_type.as_ref(), "read" | "search" | "list_files"));
+
+    if completed && all_read {
+        let mut raw_paths = parsed_cmd
+            .iter()
+            .filter_map(|entry| entry.path.as_deref())
+            .filter(|path| !path.is_empty());
+        let first_path = raw_paths
+            .next()
+            .map(|path| resolve_command_path(state, cwd, path));
+        let mut recorded_detail = false;
+
+        if let Some(ref path) = first_path {
+            match aggregated_output {
+                Some(CompletedOutput::RawJson(raw)) => {
+                    if matches!(state.mode, ParseMode::UsageOnly) {
+                        if let Some(metrics) = count_json_string_metrics(raw)
+                            && metrics.lines > 0
+                        {
+                            state.add_read_counts(path, metrics.lines, metrics.chars);
+                            recorded_detail = true;
+                        }
+                    } else if let Ok(text) = serde_json::from_str::<Cow<'_, str>>(raw)
+                        && TextMetrics::from_str(text.as_ref()).lines > 0
+                    {
+                        state.add_read_detail(path, text.as_ref(), ts);
+                        recorded_detail = true;
+                    }
+                }
+                Some(CompletedOutput::Str(text)) => {
+                    let metrics = TextMetrics::from_str(text);
+                    if metrics.lines > 0 {
+                        state.add_read_detail(path, text, ts);
+                        recorded_detail = true;
+                    }
+                }
+                None => {}
+            }
+        }
+
+        if !recorded_detail {
+            state.tool_counts.read += 1;
+            if let Some(ref path) = first_path {
+                state.add_non_text_read_path(path);
+            }
+        }
+        for path in raw_paths {
+            let resolved = resolve_command_path(state, cwd, path);
+            state.add_non_text_read_path(&resolved);
+        }
+        return;
+    }
+
+    if completed && all_inspection {
+        // Pure search/list/mixed-read inspection counts as one read without attributing search output as read lines.
+        state.tool_counts.read += 1;
+        for entry in parsed_cmd {
+            if entry.cmd_type.as_ref() == "read"
+                && let Some(path) = entry.path.as_deref().filter(|p| !p.is_empty())
+            {
+                let resolved = resolve_command_path(state, cwd, path);
+                state.add_non_text_read_path(&resolved);
+            }
+        }
+        return;
+    }
+
+    let has_command = command.iter().any(|part| !part.trim().is_empty());
+    let fallback_cmd = parsed_cmd
+        .iter()
+        .find_map(|entry| entry.cmd.as_deref().filter(|c| !c.trim().is_empty()));
+    if matches!(state.mode, ParseMode::UsageOnly) {
+        if has_command || fallback_cmd.is_some() {
+            state.tool_counts.bash += 1;
+        }
+        return;
+    }
+
+    let command_str = if !has_command {
+        Cow::Borrowed(fallback_cmd.unwrap_or(""))
+    } else if command.len() == 1 {
+        Cow::Borrowed(command[0].as_ref())
+    } else {
+        Cow::Owned(command.join(" "))
+    };
+    state.add_run_command(&command_str, "", ts);
 }
 
 /// Extracts the target file path from a `sed -n '<range>' <path>` command.
@@ -2724,5 +3247,505 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(rejected_parsed.diagnostics.is_complete_failure());
+    }
+
+    #[test]
+    fn cache_write_input_tokens_match_between_value_and_streamed_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache-write.jsonl");
+        let raw_lines = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-6-astra" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100_000,
+                            "cached_input_tokens": 40_000,
+                            "cache_write_input_tokens": 20_000,
+                            "output_tokens": 2_000,
+                            "reasoning_output_tokens": 500,
+                            "total_tokens": 102_000
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 100_000,
+                            "cached_input_tokens": 40_000,
+                            "cache_write_input_tokens": 20_000,
+                            "output_tokens": 2_000,
+                            "reasoning_output_tokens": 500,
+                            "total_tokens": 102_000
+                        },
+                        "model_context_window": 400_000
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 400_000,
+                            "cached_input_tokens": 240_000,
+                            "cache_write_input_tokens": 70_000,
+                            "output_tokens": 5_000,
+                            "reasoning_output_tokens": 1_500,
+                            "total_tokens": 405_000
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 300_000,
+                            "cached_input_tokens": 200_000,
+                            "cache_write_input_tokens": 50_000,
+                            "output_tokens": 3_000,
+                            "reasoning_output_tokens": 1_000,
+                            "total_tokens": 303_000
+                        },
+                        "model_context_window": 400_000
+                    }
+                }
+            }),
+        ];
+        let body: String = raw_lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let logs: Vec<CodexLog> = raw_lines
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let tiers = crate::pricing::TierThresholds::from_entries(
+            [("gpt-6-astra", vec![272_000])].into_iter(),
+        );
+
+        let value_parsed =
+            parse_codex_log_iter_with_diagnostics(&logs, ParseMode::UsageOnly, Some(&tiers))
+                .unwrap();
+        let streamed_parsed = parse_codex_jsonl_path(&path, ParseMode::UsageOnly, Some(&tiers))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(value_parsed.diagnostics, streamed_parsed.diagnostics);
+        assert_eq!(value_parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(
+            value_parsed.analysis.records[0].conversation_usage,
+            streamed_parsed.analysis.records[0].conversation_usage
+        );
+
+        let usage = &streamed_parsed.analysis.records[0].conversation_usage["gpt-6-astra"];
+        assert_eq!(
+            usage["total_token_usage"]["cache_write_input_tokens"],
+            70_000
+        );
+        assert_eq!(usage["above_tier"]["level_1_input_tokens"], 50_000);
+        assert_eq!(usage["above_tier"]["level_1_cache_read_tokens"], 200_000);
+        assert_eq!(
+            usage["above_tier"]["level_1_cache_creation_5m_tokens"],
+            50_000
+        );
+        assert_eq!(usage["above_tier"]["level_1_output_tokens"], 2_000);
+        assert_eq!(usage["above_tier"]["level_1_reasoning_tokens"], 1_000);
+
+        let valid_only_cw = serde_json::json!({
+            "total_token_usage": { "cache_write_input_tokens": 12 }
+        });
+        assert!(is_supported_codex_usage(&valid_only_cw));
+        assert!(matches!(
+            parse_token_count_raw(&valid_only_cw.to_string()),
+            ParsedTokenCount::Valid { .. }
+        ));
+        let invalid_cw = serde_json::json!({
+            "total_token_usage": { "cache_write_input_tokens": "bad" }
+        });
+        assert!(!is_supported_codex_usage(&invalid_cw));
+        assert!(matches!(
+            parse_token_count_raw(&invalid_cw.to_string()),
+            ParsedTokenCount::Invalid
+        ));
+    }
+
+    #[test]
+    fn item_completed_file_change_and_command_execution_match_across_paths_and_modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("modern.jsonl");
+        let raw_lines = [
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "modern-codex", "cwd": "/repo" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:01Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-6.2-astra", "cwd": "/repo" }
+            }),
+            // Recognized telemetry record must produce zero partial-parse warnings.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:02Z",
+                "type": "token_usage_record",
+                "payload": { "usage": { "input_tokens": 100, "output_tokens": 10 } }
+            }),
+            // Outer `exec` cell wrapping FileChange + CommandExecution must not double-count as Bash.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": "await tools.exec_command({cmd: 'sed ...'}); await tools.apply_patch(...);",
+                    "call_id": "exec-wrap-1"
+                }
+            }),
+            // Pure single-file Read command.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "ce-read-1",
+                        "command": ["/usr/bin/zsh", "-lc", "sed -n '1,2p' src/lib.rs"],
+                        "cwd": "file:///repo",
+                        "parsed_cmd": [{ "type": "read", "cmd": "sed -n '1,2p' src/lib.rs", "path": "src/lib.rs" }],
+                        "aggregated_output": "fn one() {}\nfn two() {}\n",
+                        "status": "completed"
+                    }
+                }
+            }),
+            // Pure search command counts as 1 Read with 0 fabricated read lines.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:05Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "ce-search-1",
+                        "command": ["/usr/bin/zsh", "-lc", "rg -n foo src/"],
+                        "cwd": "file:///repo",
+                        "parsed_cmd": [
+                            { "type": "search", "cmd": "rg -n foo src/", "path": "src" },
+                            { "type": "search", "cmd": "rg -n bar src/", "path": "src" }
+                        ],
+                        "aggregated_output": "src/lib.rs:1:foo\n",
+                        "status": "completed"
+                    }
+                }
+            }),
+            // General shell command counts as 1 Bash.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:06Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "ce-bash-1",
+                        "command": ["/usr/bin/zsh", "-lc", "cargo test"],
+                        "cwd": "file:///repo",
+                        "parsed_cmd": [{ "type": "unknown", "cmd": "cargo test" }],
+                        "aggregated_output": "ok",
+                        "status": "completed"
+                    }
+                }
+            }),
+            // Failed command counts as 1 Bash, not Read.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:07Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "ce-fail-1",
+                        "command": ["/usr/bin/zsh", "-lc", "rg missing src/"],
+                        "cwd": "file:///repo",
+                        "parsed_cmd": [{ "type": "search", "cmd": "rg missing src/", "path": "src" }],
+                        "aggregated_output": "",
+                        "status": "failed"
+                    }
+                }
+            }),
+            // FileChange with add (`content`), update (`unified_diff`), and delete (`content`).
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:08Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "FileChange",
+                        "id": "fc-1",
+                        "status": "completed",
+                        "changes": {
+                            "/repo/src/new.rs": { "type": "add", "content": "pub fn added() {}\n// line 2\n" },
+                            "/repo/src/lib.rs": { "type": "update", "unified_diff": "@@ -1 +1 @@\n-old\n+new\n", "move_path": null },
+                            "/repo/src/gone.rs": { "type": "delete", "content": "deleted\n" }
+                        }
+                    }
+                }
+            }),
+            // Duplicate FileChange with the same id is ignored.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:09Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "FileChange",
+                        "id": "fc-1",
+                        "status": "completed",
+                        "changes": {
+                            "/repo/src/new.rs": { "type": "add", "content": "duplicate" }
+                        }
+                    }
+                }
+            }),
+            // Failed FileChange creates no file ops.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:10Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "FileChange",
+                        "id": "fc-failed",
+                        "status": "failed",
+                        "changes": {
+                            "/repo/src/ignored.rs": { "type": "add", "content": "nope" }
+                        }
+                    }
+                }
+            }),
+            // Unrelated item types with arbitrary shapes stay ignored without drift.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:11Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": { "type": "Extension", "command": { "nested": true } }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:12Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "exec-wrap-1",
+                    "output": "Script completed"
+                }
+            }),
+        ];
+        let body: String = raw_lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        let logs: Vec<CodexLog> = raw_lines
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+
+        let owned_full =
+            parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        let streamed_full = parse_codex_jsonl_path(&path, ParseMode::Full, None)
+            .unwrap()
+            .unwrap();
+        let owned_usage =
+            parse_codex_log_iter_with_diagnostics(&logs, ParseMode::UsageOnly, None).unwrap();
+        let streamed_usage = parse_codex_jsonl_path(&path, ParseMode::UsageOnly, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(owned_full.diagnostics.partial_failure_count(), 0);
+        assert_eq!(streamed_full.diagnostics, owned_full.diagnostics);
+        assert_eq!(owned_usage.diagnostics, owned_full.diagnostics);
+        assert_eq!(streamed_usage.diagnostics, owned_full.diagnostics);
+        assert_eq!(
+            serde_json::to_value(&streamed_full.analysis.records[0]).unwrap(),
+            serde_json::to_value(&owned_full.analysis.records[0]).unwrap()
+        );
+
+        let f = &streamed_full.analysis.records[0];
+        let u = &streamed_usage.analysis.records[0];
+        let ou = &owned_usage.analysis.records[0];
+
+        assert_eq!(f.tool_call_counts.read, 2);
+        assert_eq!(f.tool_call_counts.bash, 2);
+        assert_eq!(f.tool_call_counts.write, 1);
+        assert_eq!(f.tool_call_counts.edit, 2);
+        assert_eq!(f.total_read_lines, 2);
+        assert_eq!(f.total_write_lines, 2);
+        assert_eq!(f.total_edit_lines, 1);
+        assert_eq!(f.total_unique_files, 3);
+        assert_eq!(
+            f.write_file_details[0].content,
+            "pub fn added() {}\n// line 2"
+        );
+
+        for usage_rec in [u, ou] {
+            assert_eq!(usage_rec.tool_call_counts.read, f.tool_call_counts.read);
+            assert_eq!(usage_rec.tool_call_counts.bash, f.tool_call_counts.bash);
+            assert_eq!(usage_rec.tool_call_counts.write, f.tool_call_counts.write);
+            assert_eq!(usage_rec.tool_call_counts.edit, f.tool_call_counts.edit);
+            assert_eq!(usage_rec.total_read_lines, f.total_read_lines);
+            assert_eq!(usage_rec.total_read_characters, f.total_read_characters);
+            assert_eq!(usage_rec.total_write_lines, f.total_write_lines);
+            assert_eq!(usage_rec.total_write_characters, f.total_write_characters);
+            assert_eq!(usage_rec.total_edit_lines, f.total_edit_lines);
+            assert_eq!(usage_rec.total_edit_characters, f.total_edit_characters);
+            assert_eq!(usage_rec.total_unique_files, f.total_unique_files);
+            assert!(usage_rec.read_file_details.is_empty());
+            assert!(usage_rec.write_file_details.is_empty());
+            assert!(usage_rec.edit_file_details.is_empty());
+            assert!(usage_rec.run_command_details.is_empty());
+        }
+    }
+
+    #[test]
+    fn strip_file_uri_and_resolve_command_path_handle_percent_encoding_and_windows() {
+        assert_eq!(strip_file_uri("file:///home/user/repo"), "/home/user/repo");
+        assert_eq!(
+            strip_file_uri("file:///Users/dev/My%20Repo"),
+            "/Users/dev/My Repo"
+        );
+        assert_eq!(
+            strip_file_uri("file:///C:/Users/dev/repo"),
+            "C:/Users/dev/repo"
+        );
+        assert_eq!(strip_file_uri("file:///C%3A/My%20Repo"), "C:/My Repo");
+        assert_eq!(strip_file_uri("/plain/path"), "/plain/path");
+
+        let mut posix_state = SessionParseState::new();
+        posix_state.folder_path = "/repo".to_string();
+        assert_eq!(
+            resolve_command_path(&posix_state, Some("file:///repo"), "src/lib.rs"),
+            "/repo/src/lib.rs"
+        );
+        assert_eq!(
+            resolve_command_path(
+                &posix_state,
+                Some("file:///Users/dev/My%20Repo"),
+                "src/lib.rs"
+            ),
+            "/Users/dev/My Repo/src/lib.rs"
+        );
+
+        let mut win_state = SessionParseState::new();
+        win_state.folder_path = r"C:\Users\dev\My Repo".to_string();
+        assert_eq!(
+            resolve_command_path(
+                &win_state,
+                Some("file:///C%3A/Users/dev/My%20Repo"),
+                "src/lib.rs"
+            ),
+            r"C:\Users\dev\My Repo\src\lib.rs"
+        );
+    }
+
+    #[test]
+    fn command_execution_dedups_by_id_and_aligns_malformed_parsed_cmd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dedup-cmd.jsonl");
+        let raw_lines = [
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "dedup-cmd", "cwd": "/repo" }
+            }),
+            // Paired `function_call` + `CommandExecution` sharing `call-1` counts once.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"git status\"}",
+                    "call_id": "call-1"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "call-1",
+                        "command": ["/usr/bin/zsh", "-lc", "git status"],
+                        "cwd": "file:///repo",
+                        "parsed_cmd": [{ "type": "unknown", "cmd": "git status" }],
+                        "status": "completed"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "clean"
+                }
+            }),
+            // Duplicate `CommandExecution` replay with the same id counts once.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "call-1",
+                        "command": ["/usr/bin/zsh", "-lc", "git status"],
+                        "cwd": "file:///repo",
+                        "parsed_cmd": [{ "type": "unknown", "cmd": "git status" }],
+                        "status": "completed"
+                    }
+                }
+            }),
+            // Untyped `parsed_cmd` entry alongside `read` must classify as Bash on both paths.
+            serde_json::json!({
+                "timestamp": "2026-11-20T00:00:05Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "call-2",
+                        "command": ["/usr/bin/zsh", "-lc", "sed -n '1p' a.rs && custom_tool"],
+                        "cwd": "file:///repo",
+                        "parsed_cmd": [
+                            { "type": "read", "path": "a.rs", "cmd": "sed -n '1p' a.rs" },
+                            { "cmd": "custom_tool", "path": 123 }
+                        ],
+                        "aggregated_output": "line1\n",
+                        "status": "completed"
+                    }
+                }
+            }),
+        ];
+        let body: String = raw_lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        let logs: Vec<CodexLog> = raw_lines
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+
+        let owned = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        let streamed = parse_codex_jsonl_path(&path, ParseMode::Full, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owned.diagnostics, streamed.diagnostics);
+        assert_eq!(owned.diagnostics.partial_failure_count(), 0);
+        assert_eq!(
+            serde_json::to_value(&owned.analysis.records[0]).unwrap(),
+            serde_json::to_value(&streamed.analysis.records[0]).unwrap()
+        );
+        let rec = &streamed.analysis.records[0];
+        assert_eq!(rec.tool_call_counts.bash, 2);
+        assert_eq!(rec.tool_call_counts.read, 0);
     }
 }

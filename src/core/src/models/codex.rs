@@ -271,6 +271,9 @@ pub struct CodexPayload {
     /// Per-file changes of a `patch_apply_end` event, keyed by absolute path.
     #[serde(default)]
     pub changes: Option<Value>,
+    /// Completed item payload of an `item_completed` event (`FileChange`, `CommandExecution`, …).
+    #[serde(default)]
+    pub item: Option<Value>,
 }
 
 /// One content block of a Codex message payload.
@@ -363,6 +366,7 @@ mod tests {
             git: None,
             success: None,
             changes: None,
+            item: None,
         };
 
         assert_eq!(payload.arguments.as_deref(), Some("{}"));

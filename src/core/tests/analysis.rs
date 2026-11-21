@@ -1838,3 +1838,131 @@ fn codex_archived_sessions_contribute_analysis_exactly_once() {
     );
     assert_eq!(dataset.diagnostics.candidates, 1);
 }
+
+#[test]
+fn modern_codex_item_completed_and_token_usage_record_parse_cleanly() {
+    use serde_json::json;
+
+    let rollout = [
+        json!({
+            "timestamp": "2026-11-20T00:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "modern-codex-it", "cwd": "/repo" }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:01Z",
+            "type": "turn_context",
+            "payload": { "model": "gpt-6.2-astra", "cwd": "/repo" }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:02Z",
+            "type": "token_usage_record",
+            "payload": { "usage": { "input_tokens": 500, "output_tokens": 20 } }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:03Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 500,
+                        "cached_input_tokens": 100,
+                        "cache_write_input_tokens": 50,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                        "total_tokens": 520
+                    }
+                }
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:04Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "await tools.exec_command({cmd: 'sed -n 1,2p src/main.rs'});",
+                "call_id": "exec-1"
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "cmd-1",
+                    "command": ["/usr/bin/zsh", "-lc", "sed -n '1,2p' src/main.rs"],
+                    "cwd": "file:///repo",
+                    "parsed_cmd": [{ "type": "read", "cmd": "sed -n '1,2p' src/main.rs", "path": "src/main.rs" }],
+                    "aggregated_output": "fn main() {}\n// ok\n",
+                    "status": "completed"
+                }
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:06Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "FileChange",
+                    "id": "fc-1",
+                    "status": "completed",
+                    "changes": {
+                        "/repo/src/created.rs": { "type": "add", "content": "pub const X: i32 = 1;\n" },
+                        "/repo/src/main.rs": { "type": "update", "unified_diff": "@@ -1 +1 @@\n-fn main() {}\n+fn main() { println!(\"hi\"); }\n" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-20T00:00:07Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "exec-1",
+                "output": "Script completed"
+            }
+        }),
+    ]
+    .iter()
+    .map(|v| format!("{v}\n"))
+    .collect::<String>();
+
+    let home = TempHome::new();
+    let file_path = home.put_codex_session(&format!("2026/11/20/{CODEX_ROLLOUT}"), &rollout);
+
+    let batch = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Codex),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(batch.diagnostics.failures.len(), 0);
+    assert_eq!(batch.len(), 1);
+    let batch_record = &batch.sessions[0].analysis.records[0];
+
+    let single = parse_session_file_to_value(&file_path).unwrap();
+    assert_eq!(single["extensionName"], "Codex");
+    let single_record = &single["records"][0];
+
+    assert_eq!(batch_record.tool_call_counts.read, 1);
+    assert_eq!(batch_record.tool_call_counts.write, 1);
+    assert_eq!(batch_record.tool_call_counts.edit, 1);
+    assert_eq!(batch_record.tool_call_counts.bash, 0);
+    assert_eq!(batch_record.total_read_lines, 2);
+    assert_eq!(batch_record.total_write_lines, 1);
+    assert_eq!(batch_record.total_edit_lines, 1);
+
+    assert_eq!(single_record["toolCallCounts"]["Read"], 1);
+    assert_eq!(single_record["toolCallCounts"]["Write"], 1);
+    assert_eq!(single_record["toolCallCounts"]["Edit"], 1);
+    assert_eq!(single_record["toolCallCounts"]["Bash"], 0);
+    assert_eq!(single_record["totalReadLines"], 2);
+    assert_eq!(single_record["totalWriteLines"], 1);
+    assert_eq!(single_record["totalEditLines"], 1);
+}
