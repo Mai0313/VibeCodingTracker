@@ -14,8 +14,11 @@ use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use serde::Serialize;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
+
+/// Capacity for buffered CLI stdout writers (pretty JSON and ledger export).
+const STDOUT_BUFFER_BYTES: usize = 128 * 1024;
 
 // Opt-in only: mimalloc's lazy page purge retains roughly 10× the RSS of the system allocator across repeated TUI scan loops.
 #[cfg(feature = "mimalloc")]
@@ -290,7 +293,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             // rewrite this one's settings.
             let config = vct_core::config::load_read_only();
             let scan_pool = build_scan_pool(config.performance.resolved_scan_threads())?;
-            vct_core::remote::export(config.providers, &scan_pool, io::stdout().lock())?;
+            let stdout = io::stdout();
+            let mut writer = BufWriter::with_capacity(STDOUT_BUFFER_BYTES, stdout.lock());
+            vct_core::remote::export(config.providers, &scan_pool, &mut writer)?;
+            writer.flush()?;
         }
 
         Commands::Config { action } => {
@@ -505,9 +511,10 @@ fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
 /// Writes one pretty-printed JSON value to stdout followed by a newline.
 fn write_pretty_json(value: &impl Serialize) -> Result<()> {
     let stdout = io::stdout();
-    let mut writer = stdout.lock();
+    let mut writer = BufWriter::with_capacity(STDOUT_BUFFER_BYTES, stdout.lock());
     serde_json::to_writer_pretty(&mut writer, value)?;
     writeln!(writer)?;
+    writer.flush()?;
     Ok(())
 }
 
