@@ -18,7 +18,7 @@ Most provider fan-outs use exhaustive `match` or struct destructuring (`resolve_
 - Directory walkers MUST call `parse_session_file_typed_as` (known provider), never auto-detection (`parse_session_file_typed`), to prevent metadata preambles from misclassifying a session as Codex.
 - Streaming auto-detection (`classify_records`) MUST have no fixed peek window: a Claude metadata preamble (`permission-mode`, `file-history-snapshot`, …) can be arbitrarily long.
 - `ParseMode::UsageOnly` skips allocating `write_file_details` / `edit_file_details` (keeping TUI RSS around ~60 MB on 200+ session directories). All scalar counters, including `total_unique_files`, MUST stay identical between `Full` and `UsageOnly` when adding fields to `CodeAnalysisRecord`.
-- OpenCode, Cursor, Hermes, and Antigravity all read SQLite databases through `src/core/src/session/sqlite.rs` (read-only open, with fingerprinted private temp copy + WAL copy fallback on lock/WAL recovery). Never open a user's database read-write.
+- OpenCode, Cursor, Hermes, and Antigravity all read SQLite databases through `src/core/src/session/sqlite.rs` (cleanly closed WAL databases with header `18..20 == [2, 2]` and no `-wal` open via `file:<uri>?mode=ro&immutable=1` bracketed by pre/post fingerprints so SQLite does not create `-wal`/`-shm` sidecars; active WAL databases with `-wal` NEVER use `immutable=1` and use standard read-only open with fingerprinted private temp copy + WAL copy fallback on lock/WAL recovery). Never open a user's database read-write.
 
 ## Provider normalization and measured quirks
 
