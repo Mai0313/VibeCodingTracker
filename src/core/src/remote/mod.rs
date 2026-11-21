@@ -254,6 +254,12 @@ fn ssh_command(program: &OsStr, host: &str, remote_command: &str) -> Command {
     ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
         .arg(host)
         .arg(remote_command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        ssh.creation_flags(CREATE_NO_WINDOW);
+    }
     ssh
 }
 
