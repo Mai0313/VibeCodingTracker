@@ -5,9 +5,12 @@ use crate::utils::{
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
@@ -109,6 +112,102 @@ fn parse_threshold_suffix(suffix: &str) -> Option<i64> {
     num_part.parse::<i64>().ok().map(|n| n * 1000)
 }
 
+#[derive(Clone, Copy)]
+enum TierField {
+    Input,
+    Output,
+    CacheRead,
+    CacheCreation,
+    CacheCreation1hr,
+}
+
+struct RawThresholdTier {
+    threshold_tokens: i64,
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_creation: Option<f64>,
+    cache_creation_1hr: Option<f64>,
+}
+
+fn parse_tier_key(key: &str) -> Option<(i64, TierField)> {
+    if let Some(suffix) = key.strip_prefix("input_cost_per_token_above_") {
+        parse_threshold_suffix(suffix).map(|th| (th, TierField::Input))
+    } else if let Some(suffix) = key.strip_prefix("output_cost_per_token_above_") {
+        parse_threshold_suffix(suffix).map(|th| (th, TierField::Output))
+    } else if let Some(suffix) = key.strip_prefix("cache_read_input_token_cost_above_") {
+        parse_threshold_suffix(suffix).map(|th| (th, TierField::CacheRead))
+    } else if let Some(suffix) = key.strip_prefix("cache_creation_input_token_cost_above_") {
+        // Two possible shapes:
+        //   "200k_tokens"           → context-size tier at 200K
+        //   "1hr_above_200k_tokens" → 1hr TTL variant of the 200K tier
+        if let Some(inner) = suffix.strip_prefix("1hr_above_") {
+            parse_threshold_suffix(inner).map(|th| (th, TierField::CacheCreation1hr))
+        } else if !suffix.starts_with("1hr") {
+            parse_threshold_suffix(suffix).map(|th| (th, TierField::CacheCreation))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn set_tier_field(
+    tiers: &mut Vec<RawThresholdTier>,
+    threshold_tokens: i64,
+    field: TierField,
+    value: f64,
+) {
+    let entry = match tiers
+        .iter_mut()
+        .find(|tier| tier.threshold_tokens == threshold_tokens)
+    {
+        Some(existing) => existing,
+        None => {
+            tiers.push(RawThresholdTier {
+                threshold_tokens,
+                input: None,
+                output: None,
+                cache_read: None,
+                cache_creation: None,
+                cache_creation_1hr: None,
+            });
+            tiers.last_mut().expect("just pushed tier")
+        }
+    };
+    match field {
+        TierField::Input => entry.input = Some(value),
+        TierField::Output => entry.output = Some(value),
+        TierField::CacheRead => entry.cache_read = Some(value),
+        TierField::CacheCreation => entry.cache_creation = Some(value),
+        TierField::CacheCreation1hr => entry.cache_creation_1hr = Some(value),
+    }
+}
+
+fn finalize_tiers(pricing: &mut ModelPricing, mut raw_tiers: Vec<RawThresholdTier>) {
+    if raw_tiers.is_empty() {
+        return;
+    }
+    raw_tiers.sort_by_key(|tier| tier.threshold_tokens);
+    pricing.tiers = raw_tiers
+        .into_iter()
+        .map(|tier| ThresholdTier {
+            threshold_tokens: tier.threshold_tokens,
+            input_cost_per_token: tier.input.unwrap_or(pricing.input_cost_per_token),
+            output_cost_per_token: tier.output.unwrap_or(pricing.output_cost_per_token),
+            cache_read_input_token_cost: tier
+                .cache_read
+                .unwrap_or(pricing.cache_read_input_token_cost),
+            cache_creation_input_token_cost: tier
+                .cache_creation
+                .unwrap_or(pricing.cache_creation_input_token_cost),
+            // Leave unpublished tier 1-hour rates at 0.0 so `calculate_cost` falls back to this tier's 5-minute rate rather than a cheaper base 1-hour rate.
+            cache_creation_input_token_cost_above_1hr: tier.cache_creation_1hr.unwrap_or(0.0),
+        })
+        .collect();
+}
+
 /// Parses one `tiered_pricing` object into a [`TierRange`], returning `None` for non-token entries.
 fn parse_tier_range(value: &serde_json::Value) -> Option<TierRange> {
     let obj = value.as_object()?;
@@ -139,12 +238,7 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
     };
 
     let mut pricing = ModelPricing::default();
-    let mut tier_input: HashMap<i64, f64> = HashMap::new();
-    let mut tier_output: HashMap<i64, f64> = HashMap::new();
-    let mut tier_cache_read: HashMap<i64, f64> = HashMap::new();
-    let mut tier_cache_creation: HashMap<i64, f64> = HashMap::new();
-    // Tier-scoped 1-hour TTL rates; the base 1-hour rate lives on `pricing`.
-    let mut tier_cache_creation_1hr: HashMap<i64, f64> = HashMap::new();
+    let mut raw_tiers: Vec<RawThresholdTier> = Vec::new();
 
     for (key, raw_val) in obj {
         if key == "tiered_pricing" {
@@ -188,71 +282,14 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
                 pricing.output_cost_per_reasoning_token = num_value;
             }
             _ => {
-                if let Some(suffix) = key.strip_prefix("input_cost_per_token_above_") {
-                    if let Some(th) = parse_threshold_suffix(suffix) {
-                        tier_input.insert(th, num_value);
-                    }
-                } else if let Some(suffix) = key.strip_prefix("output_cost_per_token_above_") {
-                    if let Some(th) = parse_threshold_suffix(suffix) {
-                        tier_output.insert(th, num_value);
-                    }
-                } else if let Some(suffix) = key.strip_prefix("cache_read_input_token_cost_above_")
-                {
-                    if let Some(th) = parse_threshold_suffix(suffix) {
-                        tier_cache_read.insert(th, num_value);
-                    }
-                } else if let Some(suffix) =
-                    key.strip_prefix("cache_creation_input_token_cost_above_")
-                {
-                    // Two possible shapes:
-                    //   "200k_tokens"           → context-size tier at 200K
-                    //   "1hr_above_200k_tokens" → 1hr TTL variant of the 200K tier
-                    if let Some(inner) = suffix.strip_prefix("1hr_above_") {
-                        if let Some(th) = parse_threshold_suffix(inner) {
-                            tier_cache_creation_1hr.insert(th, num_value);
-                        }
-                    } else if !suffix.starts_with("1hr")
-                        && let Some(th) = parse_threshold_suffix(suffix)
-                    {
-                        tier_cache_creation.insert(th, num_value);
-                    }
+                if let Some((th, field)) = parse_tier_key(key) {
+                    set_tier_field(&mut raw_tiers, th, field, num_value);
                 }
             }
         }
     }
 
-    let mut thresholds: Vec<i64> = tier_input
-        .keys()
-        .chain(tier_output.keys())
-        .chain(tier_cache_read.keys())
-        .chain(tier_cache_creation.keys())
-        .chain(tier_cache_creation_1hr.keys())
-        .copied()
-        .collect();
-    thresholds.sort();
-    thresholds.dedup();
-
-    pricing.tiers = thresholds
-        .into_iter()
-        .map(|th| ThresholdTier {
-            threshold_tokens: th,
-            input_cost_per_token: *tier_input.get(&th).unwrap_or(&pricing.input_cost_per_token),
-            output_cost_per_token: *tier_output
-                .get(&th)
-                .unwrap_or(&pricing.output_cost_per_token),
-            cache_read_input_token_cost: *tier_cache_read
-                .get(&th)
-                .unwrap_or(&pricing.cache_read_input_token_cost),
-            cache_creation_input_token_cost: *tier_cache_creation
-                .get(&th)
-                .unwrap_or(&pricing.cache_creation_input_token_cost),
-            // Leave unpublished tier 1-hour rates at 0.0 so `calculate_cost` falls back to this tier's 5-minute rate rather than a cheaper base 1-hour rate.
-            cache_creation_input_token_cost_above_1hr: tier_cache_creation_1hr
-                .get(&th)
-                .copied()
-                .unwrap_or(0.0),
-        })
-        .collect();
+    finalize_tiers(&mut pricing, raw_tiers);
 
     // Sort ascending by `min_tokens` so boundary derivation and `calculate_cost` do not rely on upstream ordering.
     if let Some(ranges) = pricing.ranges.as_mut() {
@@ -263,7 +300,8 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
 }
 
 /// Parses a LiteLLM pricing JSON object into a map of [`ModelPricing`] entries, ignoring non-object payloads and entries.
-pub fn parse_litellm_pricing_map(raw: serde_json::Value) -> HashMap<String, ModelPricing> {
+#[cfg(test)]
+pub fn parse_litellm_pricing_map(raw: &serde_json::Value) -> HashMap<String, ModelPricing> {
     let obj = match raw.as_object() {
         Some(o) => o,
         None => return HashMap::new(),
@@ -272,6 +310,532 @@ pub fn parse_litellm_pricing_map(raw: serde_json::Value) -> HashMap<String, Mode
         .filter(|(_, v)| v.is_object())
         .map(|(k, v)| (k.clone(), parse_litellm_entry(v)))
         .collect()
+}
+
+/// Parses, validates, and filters a LiteLLM pricing JSON object in a single pass.
+///
+/// Rejects the payload if it is not a JSON object, if any entry has a negative or non-finite rate, or if no model has a positive price.
+pub(crate) fn parse_and_validate_litellm_map(
+    raw: &serde_json::Value,
+) -> Result<HashMap<String, ModelPricing>> {
+    let Some(obj) = raw.as_object() else {
+        anyhow::bail!("Invalid model pricing JSON: top-level value must be an object");
+    };
+    let mut pricing = HashMap::with_capacity(obj.len());
+    for (name, value) in obj {
+        if !value.is_object() {
+            continue;
+        }
+        let entry = parse_litellm_entry(value);
+        anyhow::ensure!(
+            model_pricing_rates_are_valid(&entry),
+            "Invalid model pricing JSON: negative or non-finite price"
+        );
+        if model_pricing_has_positive_rate(&entry) {
+            pricing.insert(name.clone(), entry);
+        }
+    }
+    anyhow::ensure!(
+        !pricing.is_empty(),
+        "Invalid model pricing JSON: no priced models"
+    );
+    Ok(pricing)
+}
+
+macro_rules! ignore_json_values {
+    ($ret:expr; $( $kind:ident ),+ $(,)?) => {
+        $( ignore_json_values!(@arm $ret, $kind); )+
+    };
+    (@arm $ret:expr, bool) => {
+        fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok($ret)
+        }
+    };
+    (@arm $ret:expr, num) => {
+        fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok($ret)
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok($ret)
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok($ret)
+        }
+    };
+    (@arm $ret:expr, str) => {
+        fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+            Ok($ret)
+        }
+        fn visit_borrowed_str<E: de::Error>(
+            self,
+            _: &'de str,
+        ) -> std::result::Result<Self::Value, E> {
+            Ok($ret)
+        }
+    };
+    (@arm $ret:expr, unit) => {
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok($ret)
+        }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok($ret)
+        }
+    };
+    (@arm $ret:expr, seq) => {
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok($ret)
+        }
+    };
+    (@arm $ret:expr, map) => {
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok($ret)
+        }
+    };
+}
+
+/// Zero-copy JSON string key helper that borrows unescaped slices and allocates only on escape sequences.
+struct JsonStr<'de>(Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for JsonStr<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct StrVisitor;
+
+        impl<'de> Visitor<'de> for StrVisitor {
+            type Value = JsonStr<'de>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_borrowed_str<E: de::Error>(
+                self,
+                v: &'de str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(JsonStr(Cow::Borrowed(v)))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                Ok(JsonStr(Cow::Owned(v.to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
+                Ok(JsonStr(Cow::Owned(v)))
+            }
+        }
+
+        deserializer.deserialize_str(StrVisitor)
+    }
+}
+
+/// Streaming JSON number extractor matching [`Value::as_f64`], silently ignoring non-numeric JSON values.
+struct OptF64(Option<f64>);
+
+impl<'de> Deserialize<'de> for OptF64 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct OptF64Visitor;
+
+        impl<'de> Visitor<'de> for OptF64Visitor {
+            type Value = OptF64;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                Ok(OptF64(Some(v)))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                Ok(OptF64(Some(v as f64)))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(OptF64(Some(v as f64)))
+            }
+
+            ignore_json_values!(OptF64(None); bool, str, unit, seq, map);
+        }
+
+        deserializer.deserialize_any(OptF64Visitor)
+    }
+}
+
+/// Streaming parser for `search_context_cost_per_query` objects (`medium` -> `low` -> `high`).
+struct SearchContextCost(Option<f64>);
+
+impl<'de> Deserialize<'de> for SearchContextCost {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct SearchVisitor;
+
+        impl<'de> Visitor<'de> for SearchVisitor {
+            type Value = SearchContextCost;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let (mut low, mut medium, mut high) = (None, None, None);
+                while let Some(JsonStr(key)) = map.next_key::<JsonStr<'de>>()? {
+                    match key.as_ref() {
+                        "search_context_size_medium" => medium = map.next_value::<OptF64>()?.0,
+                        "search_context_size_low" => low = map.next_value::<OptF64>()?.0,
+                        "search_context_size_high" => high = map.next_value::<OptF64>()?.0,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(SearchContextCost(Some(
+                    medium.or(low).or(high).unwrap_or(0.0),
+                )))
+            }
+
+            ignore_json_values!(SearchContextCost(None); bool, num, str, unit, seq);
+        }
+
+        deserializer.deserialize_any(SearchVisitor)
+    }
+}
+
+/// Streaming parser for a two-element numeric `[min, max]` token range.
+struct TierRangePair(Option<(i64, i64)>);
+
+impl<'de> Deserialize<'de> for TierRangePair {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct PairVisitor;
+
+        impl<'de> Visitor<'de> for PairVisitor {
+            type Value = TierRangePair;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let Some(first) = seq.next_element::<OptF64>()? else {
+                    return Ok(TierRangePair(None));
+                };
+                let Some(second) = seq.next_element::<OptF64>()? else {
+                    return Ok(TierRangePair(None));
+                };
+                let mut extra = false;
+                while seq.next_element::<IgnoredAny>()?.is_some() {
+                    extra = true;
+                }
+                if extra {
+                    return Ok(TierRangePair(None));
+                }
+                Ok(TierRangePair(match (first.0, second.0) {
+                    (Some(min), Some(max)) => Some((min as i64, max as i64)),
+                    _ => None,
+                }))
+            }
+
+            ignore_json_values!(TierRangePair(None); bool, num, str, unit, map);
+        }
+
+        deserializer.deserialize_any(PairVisitor)
+    }
+}
+
+/// Streaming parser for one object inside `tiered_pricing`.
+struct TierRangeEntry(Option<TierRange>);
+
+impl<'de> Deserialize<'de> for TierRangeEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct EntryVisitor;
+
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = TierRangeEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut range = None;
+                let (mut input, mut output, mut cache_read, mut reasoning) = (0.0, 0.0, 0.0, 0.0);
+                while let Some(JsonStr(key)) = map.next_key::<JsonStr<'de>>()? {
+                    match key.as_ref() {
+                        "range" => range = map.next_value::<TierRangePair>()?.0,
+                        "input_cost_per_token" => {
+                            input = map.next_value::<OptF64>()?.0.unwrap_or(0.0);
+                        }
+                        "output_cost_per_token" => {
+                            output = map.next_value::<OptF64>()?.0.unwrap_or(0.0);
+                        }
+                        "cache_read_input_token_cost" => {
+                            cache_read = map.next_value::<OptF64>()?.0.unwrap_or(0.0);
+                        }
+                        "output_cost_per_reasoning_token" => {
+                            reasoning = map.next_value::<OptF64>()?.0.unwrap_or(0.0);
+                        }
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(TierRangeEntry(range.map(|(min_tokens, max_tokens)| {
+                    TierRange {
+                        min_tokens,
+                        max_tokens,
+                        input_cost_per_token: input,
+                        output_cost_per_token: output,
+                        cache_read_input_token_cost: cache_read,
+                        output_cost_per_reasoning_token: reasoning,
+                    }
+                })))
+            }
+
+            ignore_json_values!(TierRangeEntry(None); bool, num, str, unit, seq);
+        }
+
+        deserializer.deserialize_any(EntryVisitor)
+    }
+}
+
+/// Streaming parser for `tiered_pricing` arrays.
+struct TieredPricingRanges(Option<Vec<TierRange>>);
+
+impl<'de> Deserialize<'de> for TieredPricingRanges {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct RangesVisitor;
+
+        impl<'de> Visitor<'de> for RangesVisitor {
+            type Value = TieredPricingRanges;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut ranges = Vec::new();
+                while let Some(TierRangeEntry(entry)) = seq.next_element::<TierRangeEntry>()? {
+                    if let Some(range) = entry {
+                        ranges.push(range);
+                    }
+                }
+                Ok(TieredPricingRanges((!ranges.is_empty()).then_some(ranges)))
+            }
+
+            ignore_json_values!(TieredPricingRanges(None); bool, num, str, unit, map);
+        }
+
+        deserializer.deserialize_any(RangesVisitor)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheLoadAbort {
+    Legacy,
+    InvalidRate,
+}
+
+struct PricingEntrySeed<'a> {
+    abort: &'a mut Option<CacheLoadAbort>,
+}
+
+impl<'de> DeserializeSeed<'de> for PricingEntrySeed<'_> {
+    type Value = Option<ModelPricing>;
+
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for PricingEntrySeed<'_> {
+    type Value = Option<ModelPricing>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a model pricing JSON entry")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut pricing = ModelPricing::default();
+        let mut raw_tiers: Vec<RawThresholdTier> = Vec::new();
+
+        while let Some(JsonStr(key)) = map.next_key::<JsonStr<'de>>()? {
+            match key.as_ref() {
+                // Reject legacy serialized-`ModelPricing` cache files whole-file to force a refetch.
+                "tiers" | "ranges" => {
+                    *self.abort = Some(CacheLoadAbort::Legacy);
+                    return Err(de::Error::custom("legacy pricing cache format"));
+                }
+                "tiered_pricing" => {
+                    if let Some(ranges) = map.next_value::<TieredPricingRanges>()?.0 {
+                        pricing.ranges = Some(ranges);
+                    }
+                }
+                "search_context_cost_per_query" => {
+                    if let Some(cost) = map.next_value::<SearchContextCost>()?.0 {
+                        pricing.web_search_cost_per_query = cost;
+                    }
+                }
+                "input_cost_per_token" => {
+                    if let Some(v) = map.next_value::<OptF64>()?.0 {
+                        pricing.input_cost_per_token = v;
+                    }
+                }
+                "output_cost_per_token" => {
+                    if let Some(v) = map.next_value::<OptF64>()?.0 {
+                        pricing.output_cost_per_token = v;
+                    }
+                }
+                "cache_read_input_token_cost" => {
+                    if let Some(v) = map.next_value::<OptF64>()?.0 {
+                        pricing.cache_read_input_token_cost = v;
+                    }
+                }
+                "cache_creation_input_token_cost" => {
+                    if let Some(v) = map.next_value::<OptF64>()?.0 {
+                        pricing.cache_creation_input_token_cost = v;
+                    }
+                }
+                "cache_creation_input_token_cost_above_1hr" => {
+                    if let Some(v) = map.next_value::<OptF64>()?.0 {
+                        pricing.cache_creation_input_token_cost_above_1hr = v;
+                    }
+                }
+                "output_cost_per_reasoning_token" => {
+                    if let Some(v) = map.next_value::<OptF64>()?.0 {
+                        pricing.output_cost_per_reasoning_token = v;
+                    }
+                }
+                other => {
+                    if let Some((th, field)) = parse_tier_key(other) {
+                        if let Some(v) = map.next_value::<OptF64>()?.0 {
+                            set_tier_field(&mut raw_tiers, th, field, v);
+                        }
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+        }
+
+        finalize_tiers(&mut pricing, raw_tiers);
+        if let Some(ranges) = pricing.ranges.as_mut() {
+            ranges.sort_by_key(|r| r.min_tokens);
+        }
+
+        Ok(Some(pricing))
+    }
+
+    ignore_json_values!(None; bool, num, str, unit, seq);
+}
+
+struct PricingCacheMapSeed<'a> {
+    initial_capacity: usize,
+    abort: &'a mut Option<CacheLoadAbort>,
+}
+
+impl<'de> DeserializeSeed<'de> for PricingCacheMapSeed<'_> {
+    type Value = HashMap<String, ModelPricing>;
+
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for PricingCacheMapSeed<'_> {
+    type Value = HashMap<String, ModelPricing>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON object mapping model names to pricing objects")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut entries = HashMap::with_capacity(self.initial_capacity);
+        while let Some(JsonStr(key)) = map.next_key::<JsonStr<'de>>()? {
+            let Some(pricing) = map.next_value_seed(PricingEntrySeed { abort: self.abort })? else {
+                continue;
+            };
+            if !model_pricing_rates_are_valid(&pricing) {
+                *self.abort = Some(CacheLoadAbort::InvalidRate);
+                return Err(de::Error::custom("negative or non-finite pricing rate"));
+            }
+            if model_pricing_has_positive_rate(&pricing) {
+                entries.insert(key.into_owned(), pricing);
+            } else {
+                entries.remove(key.as_ref());
+            }
+        }
+        Ok(entries)
+    }
+}
+
+/// Stream-parses raw LiteLLM pricing cache bytes directly into validated, priced [`ModelPricing`] entries without materializing a `serde_json::Value` DOM.
+fn parse_litellm_cache_bytes(
+    bytes: &[u8],
+    cache_path: Option<&Path>,
+) -> Result<HashMap<String, ModelPricing>> {
+    // Filtered LiteLLM entries average ~200–225 bytes each; pre-sizing avoids repeated rehashes.
+    let initial_capacity = (bytes.len() / 220).min(16_384);
+    let mut abort = None;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let parsed = PricingCacheMapSeed {
+        initial_capacity,
+        abort: &mut abort,
+    }
+    .deserialize(&mut deserializer);
+
+    match abort {
+        Some(CacheLoadAbort::Legacy) => {
+            if let Some(path) = cache_path {
+                log::warn!(
+                    "Detected pre-Phase-2 pricing cache format at {:?}; refetching to avoid silent tier/range data loss",
+                    path
+                );
+            }
+            anyhow::bail!("legacy pricing cache format detected, forcing refetch");
+        }
+        Some(CacheLoadAbort::InvalidRate) => {
+            anyhow::bail!("cached pricing JSON contains a negative or non-finite price");
+        }
+        None => {}
+    }
+
+    let pricing = parsed.context("Failed to parse cached pricing JSON")?;
+    deserializer
+        .end()
+        .context("Failed to parse cached pricing JSON")?;
+    if pricing.is_empty() {
+        anyhow::bail!("cached pricing JSON has no priced models");
+    }
+    Ok(pricing)
 }
 
 /// Returns a JSON object containing only keys with `"cost"` in their name plus `"tiered_pricing"`, preserving values verbatim.
@@ -340,41 +904,8 @@ pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
     let cache_path = find_pricing_cache_for_date_in(dir, &today)
         .ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;
 
-    let content = fs::read_to_string(&cache_path).context("Failed to read cached pricing file")?;
-    let raw: Value =
-        serde_json::from_str(&content).context("Failed to parse cached pricing JSON")?;
-
-    if !raw.is_object() {
-        anyhow::bail!("cached pricing JSON must be an object");
-    }
-
-    if looks_like_legacy_pricing_cache(&raw) {
-        log::warn!(
-            "Detected pre-Phase-2 pricing cache format at {:?}; refetching to avoid silent tier/range data loss",
-            cache_path
-        );
-        anyhow::bail!("legacy pricing cache format detected, forcing refetch");
-    }
-
-    let parsed = parse_litellm_pricing_map(raw);
-    if !pricing_rates_are_valid(&parsed) {
-        anyhow::bail!("cached pricing JSON contains a negative or non-finite price");
-    }
-    let pricing = normalize_pricing(parsed);
-    if pricing.is_empty() {
-        anyhow::bail!("cached pricing JSON has no priced models");
-    }
-    Ok(pricing)
-}
-
-/// Returns whether `raw` contains top-level `tiers` or `ranges` keys from the legacy serialized-[`ModelPricing`] cache format.
-fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
-    let Some(obj) = raw.as_object() else {
-        return false;
-    };
-    obj.values()
-        .filter_map(|v| v.as_object())
-        .any(|entry| entry.contains_key("tiers") || entry.contains_key("ranges"))
+    let bytes = fs::read(&cache_path).context("Failed to read cached pricing file")?;
+    parse_litellm_cache_bytes(&bytes, Some(&cache_path))
 }
 
 /// Writes `filtered_raw` to today's UTC cache file under `dir` and removes older cache files.
@@ -388,7 +919,7 @@ pub fn save_to_cache_in(dir: &Path, filtered_raw: &Value) -> Result<()> {
     let today = pricing_cache_date();
     let cache_path = get_pricing_cache_path_in(dir, &today);
 
-    crate::utils::write_json_atomic_pretty(&cache_path, filtered_raw)
+    crate::utils::write_json_atomic(&cache_path, filtered_raw)
         .context("Failed to write pricing cache file")?;
 
     cleanup_old_cache_in(dir);
@@ -396,43 +927,44 @@ pub fn save_to_cache_in(dir: &Path, filtered_raw: &Value) -> Result<()> {
 }
 
 /// Retains only models whose rates are all finite and non-negative and that have at least one positive base, tier, or range price.
+#[cfg(test)]
 pub fn normalize_pricing(
     mut pricing: HashMap<String, ModelPricing>,
 ) -> HashMap<String, ModelPricing> {
-    pricing.retain(|_name, p| {
-        let has_base = p.input_cost_per_token > 0.0
-            || p.output_cost_per_token > 0.0
-            || p.cache_read_input_token_cost > 0.0
-            || p.cache_creation_input_token_cost > 0.0
-            || p.cache_creation_input_token_cost_above_1hr > 0.0
-            || p.output_cost_per_reasoning_token > 0.0
-            || p.web_search_cost_per_query > 0.0;
-        let has_positive_tier = p.tiers.iter().any(|t| {
-            t.input_cost_per_token > 0.0
-                || t.output_cost_per_token > 0.0
-                || t.cache_read_input_token_cost > 0.0
-                || t.cache_creation_input_token_cost > 0.0
-                || t.cache_creation_input_token_cost_above_1hr > 0.0
-        });
-        let has_positive_range = p
-            .ranges
-            .as_ref()
-            .map(|rs| {
-                rs.iter().any(|r| {
-                    r.input_cost_per_token > 0.0
-                        || r.output_cost_per_token > 0.0
-                        || r.cache_read_input_token_cost > 0.0
-                        || r.output_cost_per_reasoning_token > 0.0
-                })
-            })
-            .unwrap_or(false);
-        model_pricing_rates_are_valid(p) && (has_base || has_positive_tier || has_positive_range)
-    });
+    pricing
+        .retain(|_name, p| model_pricing_rates_are_valid(p) && model_pricing_has_positive_rate(p));
     pricing
 }
 
-pub(crate) fn pricing_rates_are_valid(pricing: &HashMap<String, ModelPricing>) -> bool {
-    pricing.values().all(model_pricing_rates_are_valid)
+fn model_pricing_has_positive_rate(p: &ModelPricing) -> bool {
+    let has_base = p.input_cost_per_token > 0.0
+        || p.output_cost_per_token > 0.0
+        || p.cache_read_input_token_cost > 0.0
+        || p.cache_creation_input_token_cost > 0.0
+        || p.cache_creation_input_token_cost_above_1hr > 0.0
+        || p.output_cost_per_reasoning_token > 0.0
+        || p.web_search_cost_per_query > 0.0;
+    if has_base {
+        return true;
+    }
+    let has_positive_tier = p.tiers.iter().any(|t| {
+        t.input_cost_per_token > 0.0
+            || t.output_cost_per_token > 0.0
+            || t.cache_read_input_token_cost > 0.0
+            || t.cache_creation_input_token_cost > 0.0
+            || t.cache_creation_input_token_cost_above_1hr > 0.0
+    });
+    if has_positive_tier {
+        return true;
+    }
+    p.ranges.as_ref().is_some_and(|rs| {
+        rs.iter().any(|r| {
+            r.input_cost_per_token > 0.0
+                || r.output_cost_per_token > 0.0
+                || r.cache_read_input_token_cost > 0.0
+                || r.output_cost_per_reasoning_token > 0.0
+        })
+    })
 }
 
 fn model_pricing_rates_are_valid(pricing: &ModelPricing) -> bool {
@@ -820,7 +1352,7 @@ mod parser_tests {
         });
 
         let filtered = build_filtered_cost_json(&upstream);
-        let reloaded = parse_litellm_pricing_map(filtered);
+        let reloaded = parse_litellm_pricing_map(&filtered);
 
         let p = reloaded
             .get("qwen3-coder-plus")
@@ -835,8 +1367,11 @@ mod parser_tests {
     }
 
     #[test]
-    fn looks_like_legacy_pricing_cache_flags_tiers_array() {
-        let legacy = json!({
+    fn streaming_cache_parser_rejects_legacy_tiers_array() {
+        let legacy = serde_json::to_vec(&json!({
+            "valid-first": {
+                "input_cost_per_token": 1e-6
+            },
             "claude-sonnet-4-6": {
                 "input_cost_per_token": 3e-6,
                 "output_cost_per_token": 1.5e-5,
@@ -848,13 +1383,16 @@ mod parser_tests {
                     }
                 ]
             }
-        });
-        assert!(looks_like_legacy_pricing_cache(&legacy));
+        }))
+        .unwrap();
+        let err = parse_litellm_cache_bytes(&legacy, None)
+            .expect_err("legacy tiers cache must be rejected");
+        assert!(err.to_string().contains("legacy pricing cache format"));
     }
 
     #[test]
-    fn looks_like_legacy_pricing_cache_flags_ranges_field() {
-        let legacy = json!({
+    fn streaming_cache_parser_rejects_legacy_ranges_field() {
+        let legacy = serde_json::to_vec(&json!({
             "qwen-plus": {
                 "ranges": [
                     {
@@ -864,29 +1402,123 @@ mod parser_tests {
                     }
                 ]
             }
-        });
-        assert!(looks_like_legacy_pricing_cache(&legacy));
+        }))
+        .unwrap();
+        let err = parse_litellm_cache_bytes(&legacy, None)
+            .expect_err("legacy ranges cache must be rejected");
+        assert!(err.to_string().contains("legacy pricing cache format"));
     }
 
     #[test]
-    fn looks_like_legacy_pricing_cache_accepts_new_format() {
-        let new_format = json!({
+    fn streaming_cache_parser_accepts_raw_format_and_matches_dom_parser() {
+        let payload = json!({
+            "non-object-string": "ignored",
+            "non-object-array": [1, 2, 3],
+            "zero-only": { "input_cost_per_token": 0.0 },
+            "non-numeric": { "input_cost_per_token": "unknown" },
+            "provider/escaped\"model": {
+                "input_cost_per_token": 5e-6,
+                "output_cost_per_token": 2.5e-5,
+                "cache_read_input_token_cost": 5e-7,
+                "cache_creation_input_token_cost": 6.25e-6,
+                "cache_creation_input_token_cost_above_1hr": 1e-5,
+                "output_cost_per_reasoning_token": 3e-5,
+                "search_context_cost_per_query": {
+                    "search_context_size_low": 0.005,
+                    "search_context_size_medium": 0.01,
+                    "search_context_size_high": 0.02
+                }
+            },
+            "claude-sonnet-4-6": {
+                "input_cost_per_token": 3e-6,
+                "output_cost_per_token": 1.5e-5,
+                "cache_creation_input_token_cost": 3.75e-6,
+                "cache_creation_input_token_cost_above_1hr": 7.5e-6,
+                "input_cost_per_token_above_200k_tokens": 6e-6,
+                "output_cost_per_token_above_200k_tokens": 2.25e-5,
+                "cache_creation_input_token_cost_above_200k_tokens": 7.5e-6,
+                "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 1.5e-5
+            },
+            "qwen3-coder-plus": {
+                "tiered_pricing": [
+                    {"max_results_range": [0, 25], "input_cost_per_query": 0.005},
+                    {"range": [32000, 128000], "input_cost_per_token": 1.8e-6, "output_cost_per_token": 9e-6},
+                    {"range": [0, 32000], "input_cost_per_token": 1e-6, "output_cost_per_token": 5e-6}
+                ]
+            }
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let streamed = parse_litellm_cache_bytes(&bytes, None).expect("new format must load");
+        let dom = parse_and_validate_litellm_map(&payload).expect("dom parse");
+
+        assert_eq!(streamed.len(), 3);
+        assert_eq!(streamed.len(), dom.len());
+        for (k, expected) in &dom {
+            let actual = streamed.get(k).expect("streamed map has key");
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "mismatch for model {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_cache_parser_rejects_negative_rate_anywhere_in_file() {
+        for bad in [
+            json!({
+                "valid": { "input_cost_per_token": 1e-6 },
+                "neg-base": { "input_cost_per_token": -1e-6 }
+            }),
+            json!({
+                "valid": { "input_cost_per_token": 1e-6 },
+                "neg-tier": { "input_cost_per_token_above_200k_tokens": -1e-6 }
+            }),
+            json!({
+                "valid": { "input_cost_per_token": 1e-6 },
+                "neg-range": {
+                    "tiered_pricing": [{ "range": [0, 32000], "output_cost_per_token": -1e-6 }]
+                }
+            }),
+            json!({
+                "valid": { "input_cost_per_token": 1e-6 },
+                "neg-search": {
+                    "search_context_cost_per_query": { "search_context_size_medium": -0.01 }
+                }
+            }),
+        ] {
+            let bytes = serde_json::to_vec(&bad).unwrap();
+            let err = parse_litellm_cache_bytes(&bytes, None)
+                .expect_err("negative rate must reject entire cache");
+            assert!(err.to_string().contains("negative or non-finite"));
+        }
+    }
+
+    #[test]
+    fn save_to_cache_writes_compact_json_and_reloads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let filtered = build_filtered_cost_json(&json!({
             "claude-sonnet-4-6": {
                 "input_cost_per_token": 3e-6,
                 "output_cost_per_token": 1.5e-5,
                 "input_cost_per_token_above_200k_tokens": 6e-6,
-                "output_cost_per_token_above_200k_tokens": 2.25e-5
-            },
-            "qwen3-coder-plus": {
-                "tiered_pricing": [
-                    {
-                        "range": [0, 32000],
-                        "input_cost_per_token": 1e-6
-                    }
-                ]
+                "max_input_tokens": 200_000
             }
-        });
-        assert!(!looks_like_legacy_pricing_cache(&new_format));
+        }));
+        save_to_cache_in(dir.path(), &filtered).expect("save compact cache");
+
+        let path = get_pricing_cache_path_in(dir.path(), &pricing_cache_date());
+        let raw_text = fs::read_to_string(&path).expect("read saved cache");
+        assert!(
+            !raw_text.contains('\n'),
+            "pricing cache should be serialized as compact JSON"
+        );
+
+        let loaded = load_from_cache_in(dir.path()).expect("reload compact cache");
+        let sonnet = loaded.get("claude-sonnet-4-6").expect("model loaded");
+        assert_eq!(sonnet.input_cost_per_token, 3e-6);
+        assert_eq!(sonnet.tiers.len(), 1);
+        assert_eq!(sonnet.tiers[0].threshold_tokens, 200_000);
     }
 }
 

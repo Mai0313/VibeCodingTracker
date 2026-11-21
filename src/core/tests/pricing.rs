@@ -83,6 +83,48 @@ fn fetch_pricing_from_mock_parses_and_caches() {
         cache_file.exists(),
         "pricing cache should be written to the temp cache dir"
     );
+    let cache_text = std::fs::read_to_string(&cache_file).expect("read written cache");
+    assert!(
+        !cache_text.contains('\n'),
+        "pricing cache should be written as compact JSON"
+    );
+}
+
+#[test]
+fn fetch_pricing_refetches_when_cache_is_legacy_or_has_negative_rate() {
+    clear_pricing_cache();
+    let bad_caches = [
+        json!({
+            "stale": {
+                "input_cost_per_token": 1e-6,
+                "tiers": [{ "threshold_tokens": 200_000, "input_cost_per_token": 2e-6 }]
+            }
+        }),
+        json!({
+            "good": { "input_cost_per_token": 1e-6 },
+            "bad": { "output_cost_per_token": -1e-6 }
+        }),
+        json!([]),
+    ];
+
+    for bad_cache in bad_caches {
+        let server = MockServer::start();
+        let endpoint = server.mock(|when, then| {
+            when.method(GET).path("/pricing");
+            then.status(200).json_body(json!({
+                "fresh-model": { "input_cost_per_token": 4e-6 }
+            }));
+        });
+        let cache_dir = TempDir::new().unwrap();
+        let cache_file = get_pricing_cache_path_in(cache_dir.path(), &pricing_cache_date());
+        std::fs::write(&cache_file, serde_json::to_string(&bad_cache).unwrap()).unwrap();
+
+        let map = fetch_model_pricing_with(&server.url("/pricing"), cache_dir.path())
+            .expect("invalid or legacy cache must fall back to remote fetch");
+
+        endpoint.assert();
+        assert_eq!(map.get("fresh-model").pricing.input_cost_per_token, 4e-6);
+    }
 }
 
 #[test]

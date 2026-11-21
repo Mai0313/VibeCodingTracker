@@ -151,17 +151,7 @@ fn fetch_model_pricing_remote(
 
     // Filter before parsing so in-memory pricing and the on-disk cache derive from the exact same subset of keys.
     let filtered_raw = cache::build_filtered_cost_json(&raw);
-
-    let parsed = cache::parse_litellm_pricing_map(filtered_raw.clone());
-    anyhow::ensure!(
-        cache::pricing_rates_are_valid(&parsed),
-        "Invalid model pricing JSON: negative or non-finite price"
-    );
-    let pricing = cache::normalize_pricing(parsed);
-    anyhow::ensure!(
-        !pricing.is_empty(),
-        "Invalid model pricing JSON: no priced models"
-    );
+    let pricing = cache::parse_and_validate_litellm_map(&filtered_raw)?;
 
     // Persist the raw cost-key projection rather than `ModelPricing` so unparsed LiteLLM cost keys remain available to future versions.
     if let Err(e) = cache::save_to_cache_in(cache_dir, &filtered_raw) {
