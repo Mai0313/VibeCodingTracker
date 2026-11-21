@@ -27,7 +27,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use vct_core::get_version_info;
 use vct_core::scan::build_scan_pool;
 use vct_core::session::{ParseMode, parse_session_file_with_diagnostics};
-use vct_core::usage::scan_usage_priced;
+use vct_core::usage::{scan_daily_usage_priced, scan_usage_priced};
 use vct_tui::display::app::{AppOptions, Tab, run_app};
 use vct_tui::display::usage::{display_usage_table_with_pricing, display_usage_text_with_pricing};
 
@@ -171,6 +171,7 @@ fn dispatch(cli: Cli) -> Result<()> {
 
         Commands::Usage {
             json,
+            by_day,
             text,
             table,
             merge_providers,
@@ -195,28 +196,49 @@ fn dispatch(cli: Cli) -> Result<()> {
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
             prepare_remotes(&config.remotes)?;
 
-            let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
-            if json {
+            if json && by_day {
+                let scan = scan_daily_usage_priced(time_range, config.providers, &scan_pool)?;
                 if let Some(error) = &scan.pricing_error {
                     eprintln!(
                         "Warning: Failed to fetch pricing data: {error}. Costs will be unavailable."
                     );
                 }
                 report_usage_collection(&scan.collection.diagnostics)?;
-                let priced =
-                    vct_core::usage::price_usage_data(&scan.collection.data, &scan.pricing);
-                write_pretty_json(&priced)?;
-            } else if text {
-                report_usage_collection(&scan.collection.diagnostics)?;
-                display_usage_text_with_pricing(&scan.collection.data, &scan.pricing, merge);
-            } else {
-                report_usage_collection(&scan.collection.diagnostics)?;
-                display_usage_table_with_pricing(
+                let output = vct_core::usage::price_daily_usage_data(
                     &scan.collection.data,
                     &scan.pricing,
-                    scan.pricing_error.as_deref(),
-                    merge,
+                    merge_providers,
                 );
+                write_pretty_json(&output)?;
+            } else {
+                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
+                if json {
+                    if let Some(error) = &scan.pricing_error {
+                        eprintln!(
+                            "Warning: Failed to fetch pricing data: {error}. Costs will be unavailable."
+                        );
+                    }
+                    report_usage_collection(&scan.collection.diagnostics)?;
+                    let priced =
+                        vct_core::usage::price_usage_data(&scan.collection.data, &scan.pricing);
+                    let priced = if merge_providers {
+                        vct_core::usage::merge_priced_usage_rows(priced)
+                    } else {
+                        priced
+                    };
+                    write_pretty_json(&priced)?;
+                } else if text {
+                    report_usage_collection(&scan.collection.diagnostics)?;
+                    display_usage_text_with_pricing(&scan.collection.data, &scan.pricing, merge);
+                } else {
+                    report_usage_collection(&scan.collection.diagnostics)?;
+                    display_usage_table_with_pricing(
+                        &scan.collection.data,
+                        &scan.pricing,
+                        scan.pricing_error.as_deref(),
+                        merge,
+                    );
+                }
             }
         }
 
@@ -281,11 +303,12 @@ fn dispatch(cli: Cli) -> Result<()> {
 
         Commands::Quota {
             provider,
+            json,
             text,
             table,
-            ..
         } => match provider {
             Some(provider) => run_quota(provider, text, table)?,
+            None if json => run_quota_cards()?,
             None => return open_app(Tab::Quota, [false; 4], false),
         },
 
@@ -310,7 +333,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Exits with code 2 before touching `~/.vct` if the bare command has no terminal or `quota` gets a format flag without a provider.
+/// Exits with code 2 before touching `~/.vct` if the bare command has no terminal or `quota` gets `--text`/`--table` without a provider.
 fn reject_unusable_invocation(cli: &Cli) {
     use clap::CommandFactory;
     use std::io::IsTerminal;
@@ -322,13 +345,13 @@ fn reject_unusable_invocation(cli: &Cli) {
         }
         Some(Commands::Quota {
             provider: None,
-            json,
             text,
             table,
-        }) if *json || *text || *table => Cli::command()
+            ..
+        }) if *text || *table => Cli::command()
             .error(
                 clap::error::ErrorKind::MissingRequiredArgument,
-                "--json, --text and --table print one provider's response: name a provider",
+                "--text and --table print one provider's response: name a provider",
             )
             .exit(),
         _ => {}
@@ -396,7 +419,12 @@ fn opens_interactive_app(cli: &Cli) -> bool {
                 text: false,
                 table: false,
                 ..
-            } | Commands::Quota { provider: None, .. }
+            } | Commands::Quota {
+                provider: None,
+                json: false,
+                text: false,
+                table: false,
+            }
         )
     )
 }
@@ -464,6 +492,13 @@ fn run_config(action: ConfigAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Fetches normalized quota cards for all enabled providers with credentials and prints them as pretty JSON.
+fn run_quota_cards() -> Result<()> {
+    let config = vct_core::config::load_read_only();
+    let cards = vct_core::quota::fetch_quota_cards(&config.usage.quota.panels, config.providers)?;
+    write_pretty_json(&cards)
 }
 
 /// Fetches `provider`'s raw quota response and prints it as text, table, or pretty JSON, returning an error after printing if the status is non-2xx.
@@ -616,8 +651,10 @@ mod tests {
         for args in [
             &["vct", "usage", "--table"][..],
             &["vct", "usage", "--json"],
+            &["vct", "usage", "--json", "--by-day"],
             &["vct", "analysis", "--text"],
             &["vct", "analysis", "session.jsonl"],
+            &["vct", "quota", "--json"],
             &["vct", "quota", "claude"],
             &["vct", "ledger", "export"],
             &["vct", "version"],
@@ -636,8 +673,10 @@ mod tests {
         for args in [
             &["vct", "usage", "--table"][..],
             &["vct", "usage", "--json"],
+            &["vct", "usage", "--json", "--by-day"],
             &["vct", "analysis", "--text"],
             &["vct", "analysis", "session.jsonl"],
+            &["vct", "quota", "--json"],
             &["vct", "quota", "claude"],
             &["vct", "version"],
         ] {

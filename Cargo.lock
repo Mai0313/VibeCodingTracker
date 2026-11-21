@@ -3577,6 +3577,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "comfy-table",
+ "httpmock",
  "log",
  "mimalloc",
  "owo-colors",

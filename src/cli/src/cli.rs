@@ -85,6 +85,10 @@ pub enum Commands {
         #[arg(long, group = "usage_format")]
         json: bool,
 
+        /// Partition `--json` output by local calendar date (`YYYY-MM-DD`) and include remote metadata.
+        #[arg(long, requires = "json", conflicts_with_all = ["text", "table"])]
+        by_day: bool,
+
         /// Output as plain text.
         #[arg(long, group = "usage_format")]
         text: bool,
@@ -95,7 +99,7 @@ pub enum Commands {
 
         /// Merge models that share a base name across provider prefixes
         /// (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`), overriding
-        /// `usage.merge_models` when it is off. Ignored for `--json`.
+        /// `usage.merge_models` when it is off and enabling merging for `--json`.
         #[arg(long)]
         merge_providers: bool,
 
@@ -138,15 +142,15 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Watch live quota usage, or print one provider's raw quota API response.
+    /// Watch live quota usage, print normalized quota cards, or print one provider's raw quota API response.
     ///
-    /// Without a provider this opens the interactive app on its Quota tab.
+    /// Without a provider or format flag this opens the interactive app on its Quota tab. With `--json` and no provider, prints normalized quota cards for all configured providers with credentials.
     Quota {
         /// Print this provider's raw response instead (claude | codex | copilot
         /// | cursor | grok | antigravity).
         provider: Option<QuotaProvider>,
 
-        /// Output as pretty JSON (default).
+        /// Output as pretty JSON (normalized cards without a provider; raw response with one).
         #[arg(long, group = "quota_format")]
         json: bool,
 

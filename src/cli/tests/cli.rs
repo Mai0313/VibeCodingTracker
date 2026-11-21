@@ -539,7 +539,7 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
 
 #[test]
 fn test_quota_format_requires_provider() {
-    for flag in ["--json", "--text", "--table"] {
+    for flag in ["--text", "--table"] {
         Command::cargo_bin("vibe_coding_tracker")
             .unwrap()
             .arg("quota")
@@ -547,6 +547,18 @@ fn test_quota_format_requires_provider() {
             .assert()
             .code(2)
             .stderr(predicate::str::contains("name a provider"));
+    }
+}
+
+#[test]
+fn test_usage_by_day_requires_json() {
+    let home = TempHome::new();
+    for args in [
+        &["usage", "--by-day"][..],
+        &["usage", "--by-day", "--table"],
+        &["usage", "--by-day", "--text"],
+    ] {
+        child_cmd(&home).args(args).assert().code(2);
     }
 }
 
@@ -1247,4 +1259,345 @@ fn an_unreachable_remote_warns_and_leaves_the_local_result_standing() {
     );
     let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(rows[0]["model"], "claude-sonnet-4-20250514");
+}
+
+#[test]
+fn usage_json_by_day_matches_totals_reports_priced_and_remotes() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "priced.jsonl",
+        &vct_test_support::fixture_str("sessions/claude_code.jsonl"),
+    );
+    home.put_claude_session(
+        "proj",
+        "unpriced.jsonl",
+        concat!(
+            r#"{"type":"assistant","parentUuid":"root","timestamp":"2026-06-06T12:00:00Z","message":{"model":"unpriced-custom-xyzzy","usage":{"input_tokens":100,"output_tokens":50},"content":[]}}"#,
+            "\n"
+        ),
+    );
+    home.put_codex_session(
+        "2026/06/06/rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl",
+        &vct_test_support::fixture_str("sessions/codex.jsonl"),
+    );
+    home.seed_pricing_cache(&pricing_seed());
+    // Configure `devbox` so `prune_remotes` retains its offline snapshot without spawning ssh.
+    home.put(
+        ".vct/config.toml",
+        "[general]\nauto_update = false\n[remotes]\nhosts = [\"devbox\"]\n",
+    );
+    // Seed a remote snapshot directory directly so the test runs identically on every platform.
+    home.put(
+        ".vct/remotes/devbox/sessions/claude.json",
+        &serde_json::to_string(&json!({
+            "schema_version": 1,
+            "provider": "claude",
+            "sessions": {
+                "0123456789abcdef0123456789abcdef": {
+                    "days": {
+                        "2020-01-15": {
+                            "usage": {
+                                "claude-sonnet-4-20250514": {
+                                    "input_tokens": 1000,
+                                    "output_tokens": 200,
+                                    "cache_read_input_tokens": 0,
+                                    "cache_creation_input_tokens": 0
+                                }
+                            },
+                            "active": { "usage": true, "analysis": false }
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap(),
+    );
+
+    let totals_out = child_cmd(&home)
+        .args(["usage", "--json", "--all"])
+        .output()
+        .expect("spawn vct usage --json");
+    assert!(
+        totals_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&totals_out.stderr)
+    );
+    let totals_rows: Vec<serde_json::Value> = serde_json::from_slice(&totals_out.stdout).unwrap();
+
+    let by_day_out = child_cmd(&home)
+        .args(["usage", "--json", "--by-day", "--all"])
+        .output()
+        .expect("spawn vct usage --json --by-day");
+    assert!(
+        by_day_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&by_day_out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&by_day_out.stdout).unwrap();
+    assert_eq!(payload["remotes"], json!(["devbox"]));
+
+    let days = payload["days"].as_array().expect("days array");
+    assert!(!days.is_empty());
+    // Dates are sorted ascending.
+    let dates: Vec<&str> = days.iter().map(|d| d["date"].as_str().unwrap()).collect();
+    let mut sorted_dates = dates.clone();
+    sorted_dates.sort_unstable();
+    assert_eq!(dates, sorted_dates);
+    assert!(dates.contains(&"2020-01-15"));
+
+    // Sum per-day tokens and costs per model and compare against `usage --json`.
+    let mut summed_tokens: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    let mut summed_costs: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut saw_priced = false;
+    let mut saw_unpriced = false;
+
+    for day in days {
+        for row in day["models"].as_array().unwrap() {
+            let model = row["model"].as_str().unwrap().to_string();
+            let priced = row["priced"].as_bool().expect("boolean priced field");
+            if model == "claude-sonnet-4-20250514" {
+                assert!(priced);
+                saw_priced = true;
+            } else if model == "unpriced-custom-xyzzy" {
+                assert!(!priced);
+                saw_unpriced = true;
+            }
+            let total = row["usage"]["total_tokens"].as_i64().unwrap();
+            let cost = row["cost_usd"].as_f64().unwrap();
+            *summed_tokens.entry(model.clone()).or_insert(0) += total;
+            *summed_costs.entry(model).or_insert(0.0) += cost;
+        }
+    }
+    assert!(saw_priced && saw_unpriced);
+
+    assert_eq!(summed_tokens.len(), totals_rows.len());
+    for row in &totals_rows {
+        let model = row["model"].as_str().unwrap();
+        assert_eq!(
+            summed_tokens[model],
+            row["usage"]["total_tokens"].as_i64().unwrap(),
+            "per-day token sum drifted for {model}"
+        );
+        assert!(
+            (summed_costs[model] - row["cost_usd"].as_f64().unwrap()).abs() < 1e-9,
+            "per-day cost sum drifted for {model}"
+        );
+    }
+
+    // `--daily` composes with `--by-day` and excludes the older 2020-01-15 remote day.
+    let daily_out = child_cmd(&home)
+        .args(["usage", "--json", "--by-day", "--daily"])
+        .output()
+        .expect("spawn vct usage --json --by-day --daily");
+    assert!(daily_out.status.success());
+    let daily_payload: serde_json::Value = serde_json::from_slice(&daily_out.stdout).unwrap();
+    let daily_dates: Vec<&str> = daily_payload["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["date"].as_str().unwrap())
+        .collect();
+    assert!(!daily_dates.contains(&"2020-01-15"));
+}
+
+#[test]
+fn usage_json_merge_providers_applies_only_when_requested() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "variants.jsonl",
+        concat!(
+            r#"{"type":"assistant","parentUuid":"root","timestamp":"2026-06-06T12:00:00Z","message":{"model":"openai/claude-sonnet-4-20250514","usage":{"input_tokens":1000,"output_tokens":100},"content":[]}}"#,
+            "\n",
+            r#"{"type":"assistant","parentUuid":"root","timestamp":"2026-06-06T12:01:00Z","message":{"model":"claude-sonnet-4-20250514","usage":{"input_tokens":2000,"output_tokens":200},"content":[]}}"#,
+            "\n"
+        ),
+    );
+    home.seed_pricing_cache(&pricing_seed());
+
+    // Default `usage --json` stays unmerged even though `usage.merge_models` defaults to true.
+    let raw_out = child_cmd(&home)
+        .args(["usage", "--json"])
+        .output()
+        .expect("spawn vct usage --json");
+    assert!(raw_out.status.success());
+    let raw_rows: Vec<serde_json::Value> = serde_json::from_slice(&raw_out.stdout).unwrap();
+    assert_eq!(raw_rows.len(), 2);
+    let raw_cost: f64 = raw_rows
+        .iter()
+        .map(|r| r["cost_usd"].as_f64().unwrap())
+        .sum();
+
+    // `--merge-providers` collapses both into the base model and sums costs verbatim.
+    let merged_out = child_cmd(&home)
+        .args(["usage", "--json", "--merge-providers"])
+        .output()
+        .expect("spawn vct usage --json --merge-providers");
+    assert!(merged_out.status.success());
+    let merged_rows: Vec<serde_json::Value> = serde_json::from_slice(&merged_out.stdout).unwrap();
+    assert_eq!(merged_rows.len(), 1);
+    assert_eq!(merged_rows[0]["model"], "claude-sonnet-4-20250514");
+    assert_eq!(merged_rows[0]["usage"]["input_tokens"], json!(3000));
+    assert_eq!(merged_rows[0]["usage"]["output_tokens"], json!(300));
+    assert!((merged_rows[0]["cost_usd"].as_f64().unwrap() - raw_cost).abs() < 1e-9);
+
+    // `--by-day --merge-providers` collapses within each day too.
+    let daily_merged = child_cmd(&home)
+        .args(["usage", "--json", "--by-day", "--merge-providers"])
+        .output()
+        .expect("spawn vct usage --json --by-day --merge-providers");
+    assert!(daily_merged.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&daily_merged.stdout).unwrap();
+    let models = payload["days"][0]["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["model"], "claude-sonnet-4-20250514");
+    assert_eq!(models[0]["priced"], json!(true));
+    assert!((models[0]["cost_usd"].as_f64().unwrap() - raw_cost).abs() < 1e-9);
+}
+
+#[test]
+fn quota_json_empty_panels_returns_empty_array() {
+    let home = TempHome::new();
+    home.put(
+        ".vct/config.toml",
+        "[general]\nauto_update = false\n[usage.quota]\npanels = []\n",
+    );
+
+    let output = child_cmd(&home)
+        .args(["quota", "--json"])
+        .env_remove("ANTIGRAVITY_LS_ADDRESS")
+        .env_remove("ANTIGRAVITY_CSRF_TOKEN")
+        .env_remove("ANTIGRAVITY_APP_DATA_DIR")
+        .env_remove("CLOUD_CODE_URL")
+        .output()
+        .expect("spawn vct quota --json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cards: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(cards.is_empty());
+}
+
+#[test]
+fn quota_json_fetches_normalized_cards_caches_and_isolates_auth_failure() {
+    use httpmock::prelude::*;
+
+    let server = MockServer::start();
+    let ls_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary")
+            .header("x-antigravity-csrf-token", "test-csrf");
+        then.status(200).json_body(json!({
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "displayName": "5h Limit",
+                                "window": "5h",
+                                "remainingFraction": 0.75,
+                                "resetTime": "2026-12-01T00:00:00Z"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }));
+    });
+
+    let home = TempHome::new();
+    let future_reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 7200;
+    // Codex session fallback (local-only, no `auth.json`).
+    home.put_codex_session(
+        "2026/06/06/rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl",
+        &format!(
+            "{}\n",
+            json!({
+                "timestamp": "2026-06-06T10:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "plan_type": "plus",
+                        "primary": {
+                            "used_percent": 12.5,
+                            "window_minutes": 300,
+                            "resets_at": future_reset
+                        },
+                        "secondary": {
+                            "used_percent": 4.0,
+                            "window_minutes": 10080,
+                            "resets_at": future_reset + 86400
+                        }
+                    }
+                }
+            })
+        ),
+    );
+    // Invalid Cursor credentials file -> `needs_login: true` without any external HTTP request.
+    home.put(".config/cursor/auth.json", r#"{"accessToken":"not-a-jwt"}"#);
+
+    let output = child_cmd(&home)
+        .args(["quota", "--json"])
+        .env("ANTIGRAVITY_LS_ADDRESS", server.address().to_string())
+        .env("ANTIGRAVITY_CSRF_TOKEN", "test-csrf")
+        .env_remove("ANTIGRAVITY_APP_DATA_DIR")
+        .env_remove("CLOUD_CODE_URL")
+        .output()
+        .expect("spawn vct quota --json");
+    assert!(
+        output.status.success(),
+        "vct quota --json failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ls_mock.assert();
+
+    let cards: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let providers: Vec<&str> = cards
+        .iter()
+        .map(|c| c["provider"].as_str().unwrap())
+        .collect();
+    assert_eq!(providers, vec!["codex", "cursor", "antigravity"]);
+
+    let codex = &cards[0];
+    assert_eq!(codex["source"], "session_fallback");
+    assert_eq!(codex["plan"], "plus");
+    assert_eq!(codex["needs_login"], false);
+    assert!(codex["error"].is_null());
+    assert_eq!(codex["buckets"].as_array().unwrap().len(), 2);
+    assert_eq!(codex["buckets"][0]["window"], "5h");
+    assert_eq!(codex["buckets"][0]["used_percent"], 12.5);
+
+    let cursor = &cards[1];
+    assert_eq!(cursor["needs_login"], true);
+    assert!(
+        cursor["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("cursor-agent login"))
+    );
+
+    let agy = &cards[2];
+    assert_eq!(agy["source"], "api");
+    assert!(agy["plan"].is_null());
+    assert_eq!(agy["needs_login"], false);
+    assert!(agy["error"].is_null());
+    assert_eq!(agy["buckets"][0]["label"], "Gemini Models");
+    assert_eq!(agy["buckets"][0]["window"], "5h");
+    assert!((agy["buckets"][0]["used_percent"].as_f64().unwrap() - 25.0).abs() < 1e-9);
+    assert_eq!(agy["buckets"][0]["resets_at"], json!(1_796_083_200));
+
+    // Per-provider caches are persisted, and `config.toml` is never created by `quota --json`.
+    assert!(home.home().join(".vct/quota/antigravity.json").exists());
+    assert!(home.home().join(".vct/quota/codex.json").exists());
+    assert!(!home.home().join(".vct/config.toml").exists());
 }
