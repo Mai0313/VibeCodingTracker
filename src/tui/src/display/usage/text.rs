@@ -17,11 +17,20 @@ pub fn display_usage_text(usage_data: &UsageData, merge: bool) {
     let pricing_map =
         fetch_model_pricing().unwrap_or_else(|_| ModelPricingMap::new(HashMap::new()));
 
+    display_usage_text_with_pricing(usage_data, merge, &pricing_map);
+}
+
+/// Prints the plain-text usage report with the supplied model prices.
+pub fn display_usage_text_with_pricing(
+    usage_data: &UsageData,
+    merge: bool,
+    pricing_map: &ModelPricingMap,
+) {
     let mut summary = build_usage_summary(
         &usage_data.models,
         &usage_data.per_provider,
         &usage_data.provider_days,
-        &pricing_map,
+        pricing_map,
         &usage_data.stored_costs,
     );
 
