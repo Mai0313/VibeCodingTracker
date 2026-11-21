@@ -28,7 +28,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -64,6 +64,34 @@ pub use crate::scan::{ScanDiagnostics, ScanFailure};
 pub struct UsageCollection {
     /// Successfully collected usage.
     pub data: UsageData,
+    /// Candidate, success, and failure counts from the scan.
+    pub diagnostics: ScanDiagnostics,
+}
+
+/// Token usage accumulated for one local calendar date (`YYYY-MM-DD`).
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct DayUsageData {
+    /// Tokens aggregated across all providers for this day, keyed by model name.
+    pub models: UsageResult,
+    /// Tokens partitioned by originating provider for this day.
+    pub per_provider: PerProviderUsage,
+    /// Provider-authoritative per-model costs (USD) for this day.
+    pub stored_costs: StoredCosts,
+}
+
+/// Per-day aggregated token usage paired with synced remote snapshot names.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct DailyUsageData {
+    /// Usage partitioned by local calendar date (`YYYY-MM-DD`), sorted ascending.
+    pub days: BTreeMap<String, DayUsageData>,
+    /// Sorted names of synced remote snapshots included in the scan.
+    pub remotes: Vec<String>,
+}
+
+/// Per-day usage data paired with source-collection diagnostics.
+pub struct DailyUsageCollection {
+    /// Successfully collected per-day usage.
+    pub data: DailyUsageData,
     /// Candidate, success, and failure counts from the scan.
     pub diagnostics: ScanDiagnostics,
 }
@@ -425,6 +453,33 @@ pub fn aggregate_usage_from_paths_with_cache(
     )
 }
 
+/// Scans usage from the current user's resolved paths with `options`, updating the on-disk session ledger and partitioning results by local calendar date (`YYYY-MM-DD`).
+///
+/// Retains sessions whose source files have been deleted; ledger save failures are logged without failing the scan.
+///
+/// # Errors
+///
+/// Returns an error if [`resolve_paths`] cannot determine provider directories.
+pub fn aggregate_daily_usage_from_home_with_diagnostics_opts(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    options: &UsageScanOptions,
+) -> Result<DailyUsageCollection> {
+    let paths = resolve_paths()?;
+    let mut ledger = SessionLedger::open(&paths.cache_dir);
+    let collection = aggregate_daily_usage_from_paths_with_cache_opts(
+        &paths,
+        time_range,
+        providers,
+        &mut ledger,
+        options,
+    )?;
+    if let Err(error) = ledger.save() {
+        log::warn!("failed to save the session ledger: {error:#}");
+    }
+    Ok(collection)
+}
+
 /// Runs an incremental usage scan from `paths` with `options`, updating `ledger` in place.
 ///
 /// Each session's usage half records the tier-threshold fingerprint used to classify it; entries stamped without a matching fingerprint (including those written by an analysis scan) are re-read.
@@ -435,9 +490,60 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
     ledger: &mut SessionLedger,
     options: &UsageScanOptions,
 ) -> Result<UsageCollection> {
+    let mut accumulator = UsageAccumulator::default();
+    let diagnostics = scan_usage_into_sink(
+        paths,
+        time_range,
+        providers,
+        ledger,
+        options,
+        &mut accumulator,
+    )?;
+    Ok(UsageCollection {
+        data: accumulator.finish(),
+        diagnostics,
+    })
+}
+
+/// Runs an incremental per-day usage scan from `paths` with `options`, updating `ledger` in place.
+///
+/// Uses the same ledger, provider filters, time-range cutoff, tier thresholds, and remote-session deduplication as [`aggregate_usage_from_paths_with_cache_opts`], preserving local `YYYY-MM-DD` day boundaries.
+pub fn aggregate_daily_usage_from_paths_with_cache_opts(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    ledger: &mut SessionLedger,
+    options: &UsageScanOptions,
+) -> Result<DailyUsageCollection> {
+    let mut accumulator = DailyUsageAccumulator::default();
+    let diagnostics = scan_usage_into_sink(
+        paths,
+        time_range,
+        providers,
+        ledger,
+        options,
+        &mut accumulator,
+    )?;
+    let remotes = ledger.remote_names();
+    Ok(DailyUsageCollection {
+        data: DailyUsageData {
+            days: accumulator.days,
+            remotes,
+        },
+        diagnostics,
+    })
+}
+
+fn scan_usage_into_sink<S: crate::scan::CompactSink>(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    ledger: &mut SessionLedger,
+    options: &UsageScanOptions,
+    sink: &mut S,
+) -> Result<ScanDiagnostics> {
     let tiers = options.tiers.as_deref();
     ledger.begin_scan();
-    let mut accumulator = UsageAccumulator::default();
     let mut diagnostics = ScanDiagnostics::default();
 
     crate::scan::scan_all_cached_files(
@@ -446,7 +552,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
         time_range,
         ledger,
         ScanFeature::Usage,
-        &mut accumulator,
+        sink,
         &mut diagnostics,
         tiers,
     )?;
@@ -460,7 +566,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
             stamp::tiers_fingerprint(tiers),
             time_range,
             ledger,
-            &mut accumulator,
+            sink,
             &mut diagnostics,
             || {
                 read_opencode_usage_contributions(&paths.opencode_db, TimeRange::All, tiers)
@@ -476,7 +582,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
             None,
             time_range,
             ledger,
-            &mut accumulator,
+            sink,
             &mut diagnostics,
         );
     }
@@ -488,7 +594,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
             None,
             time_range,
             ledger,
-            &mut accumulator,
+            sink,
             &mut diagnostics,
             || {
                 read_hermes_usage_contributions(&paths.hermes_db, TimeRange::All)
@@ -501,14 +607,83 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
         ledger,
         |provider| providers.includes(provider),
         time_range,
-        &mut accumulator,
+        sink,
     );
 
     diagnostics.finalize();
-    Ok(UsageCollection {
-        data: accumulator.finish(),
-        diagnostics,
-    })
+    Ok(diagnostics)
+}
+
+fn fold_day_usage_into(
+    models: &mut UsageResult,
+    per_provider: &mut PerProviderUsage,
+    stored_costs: &mut StoredCosts,
+    provider: ExtensionType,
+    day: &DayEntry,
+) {
+    let provider_result = match provider {
+        ExtensionType::ClaudeCode => &mut per_provider.claude,
+        ExtensionType::Codex => &mut per_provider.codex,
+        ExtensionType::Copilot => &mut per_provider.copilot,
+        ExtensionType::Gemini => &mut per_provider.gemini,
+        ExtensionType::Grok => &mut per_provider.grok,
+        ExtensionType::DeepSeek => &mut per_provider.deepseek,
+        ExtensionType::Antigravity => &mut per_provider.antigravity,
+        ExtensionType::OpenCode => &mut per_provider.opencode,
+        ExtensionType::Cursor => &mut per_provider.cursor,
+        ExtensionType::Hermes => &mut per_provider.hermes,
+    };
+    // Use `get_mut` before `insert` to avoid cloning `model` on existing keys.
+    for (model, raw) in &day.usage {
+        let usage = DayEntry::usage_value(raw);
+        match provider_result.get_mut(model) {
+            Some(existing) => merge_usage_values(existing, &usage),
+            None => {
+                provider_result.insert(model.clone(), usage.clone());
+            }
+        }
+        match models.get_mut(model) {
+            Some(existing) => merge_usage_values(existing, &usage),
+            None => {
+                models.insert(model.clone(), usage);
+            }
+        }
+    }
+
+    let stored = match provider {
+        ExtensionType::OpenCode => Some(&mut stored_costs.opencode),
+        ExtensionType::Hermes => Some(&mut stored_costs.hermes),
+        _ => None,
+    };
+    if let Some(stored) = stored {
+        for (model, cost) in &day.stored_cost {
+            *stored.entry(model.clone()).or_insert(0.0) += cost;
+        }
+    }
+}
+
+#[derive(Default)]
+struct DailyUsageAccumulator {
+    days: BTreeMap<String, DayUsageData>,
+}
+
+impl crate::scan::CompactSink for DailyUsageAccumulator {
+    fn fold(&mut self, provider: ExtensionType, date: &str, day: &DayEntry) {
+        if day.usage.is_empty() {
+            return;
+        }
+        let bucket = match self.days.get_mut(date) {
+            Some(bucket) => bucket,
+            None => self.days.entry(date.to_string()).or_default(),
+        };
+        fold_day_usage_into(
+            &mut bucket.models,
+            &mut bucket.per_provider,
+            &mut bucket.stored_costs,
+            provider,
+            day,
+        );
+    }
 }
 
 #[derive(Default)]
@@ -530,45 +705,13 @@ struct UsageAccumulator {
 
 impl crate::scan::CompactSink for UsageAccumulator {
     fn fold(&mut self, provider: ExtensionType, date: &str, day: &DayEntry) {
-        let provider_result = match provider {
-            ExtensionType::ClaudeCode => &mut self.per_provider.claude,
-            ExtensionType::Codex => &mut self.per_provider.codex,
-            ExtensionType::Copilot => &mut self.per_provider.copilot,
-            ExtensionType::Gemini => &mut self.per_provider.gemini,
-            ExtensionType::Grok => &mut self.per_provider.grok,
-            ExtensionType::DeepSeek => &mut self.per_provider.deepseek,
-            ExtensionType::Antigravity => &mut self.per_provider.antigravity,
-            ExtensionType::OpenCode => &mut self.per_provider.opencode,
-            ExtensionType::Cursor => &mut self.per_provider.cursor,
-            ExtensionType::Hermes => &mut self.per_provider.hermes,
-        };
-        // Use `get_mut` before `insert` to avoid cloning `model` on existing keys.
-        for (model, raw) in &day.usage {
-            let usage = DayEntry::usage_value(raw);
-            match provider_result.get_mut(model) {
-                Some(existing) => merge_usage_values(existing, &usage),
-                None => {
-                    provider_result.insert(model.clone(), usage.clone());
-                }
-            }
-            match self.models.get_mut(model) {
-                Some(existing) => merge_usage_values(existing, &usage),
-                None => {
-                    self.models.insert(model.clone(), usage);
-                }
-            }
-        }
-
-        let stored = match provider {
-            ExtensionType::OpenCode => Some(&mut self.stored_costs.opencode),
-            ExtensionType::Hermes => Some(&mut self.stored_costs.hermes),
-            _ => None,
-        };
-        if let Some(stored) = stored {
-            for (model, cost) in &day.stored_cost {
-                *stored.entry(model.clone()).or_insert(0.0) += cost;
-            }
-        }
+        fold_day_usage_into(
+            &mut self.models,
+            &mut self.per_provider,
+            &mut self.stored_costs,
+            provider,
+            day,
+        );
 
         if day.active.usage {
             let dates = match provider {

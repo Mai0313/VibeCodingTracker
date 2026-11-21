@@ -427,7 +427,7 @@ fn build_usage_row_from_counts(
 }
 
 /// Returns the slice after the first `/`, or `model` unchanged when no `/` is present, preserving version and date suffixes.
-fn base_model_key(model: &str) -> &str {
+pub(crate) fn base_model_key(model: &str) -> &str {
     model.split_once('/').map(|(_, rest)| rest).unwrap_or(model)
 }
 

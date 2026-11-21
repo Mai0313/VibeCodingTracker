@@ -63,7 +63,7 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
 }
 
 /// Sums two normalized [`TokenCounts`] field by field.
-fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
+pub(crate) fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
     // Tier slices are indexed by price level; extra levels on the longer side carry over unchanged.
     let mut above_tiers = a.above_tiers.clone();
     above_tiers.resize(
@@ -97,7 +97,7 @@ pub fn normalize_usage_value(usage: &Value) -> Value {
 }
 
 /// Serializes normalized [`TokenCounts`] into the flat JSON schema readable by [`extract_token_counts`], always preserving `total_tokens`.
-fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
+pub(crate) fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("input_tokens".into(), json!(c.input_tokens));
     obj.insert("output_tokens".into(), json!(c.output_tokens));
