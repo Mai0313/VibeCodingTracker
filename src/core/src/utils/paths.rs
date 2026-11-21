@@ -44,8 +44,6 @@ pub struct HelperPaths {
     pub dsh_dir: PathBuf,
     /// DeepSeek Harness session logs (`$DSH_HOME/sessions` or `~/.dsh/sessions`).
     pub dsh_session_dir: PathBuf,
-    /// Antigravity conversation roots under `~/.gemini/*/brain`, written by the `agy` CLI, the Desktop app, and another build in the same layout.
-    pub antigravity_brain_dirs: [PathBuf; 3],
     /// OpenCode data root (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`).
     pub opencode_dir: PathBuf,
     /// OpenCode SQLite database (`<opencode_dir>/opencode.db`).
@@ -64,9 +62,23 @@ impl HelperPaths {
         [&self.codex_session_dir, &self.codex_archived_session_dir]
     }
 
-    /// Returns all Antigravity conversation roots in discovery order.
-    pub fn antigravity_session_dirs(&self) -> [&Path; 3] {
-        self.antigravity_brain_dirs.each_ref().map(PathBuf::as_path)
+    /// Discovers existing Antigravity conversation roots (`<gemini_dir>/*/brain`) in deterministic path order.
+    ///
+    /// Skips [`Self::gemini_session_dir`] (`tmp`) and any entry without a `brain` directory.
+    /// Returns an empty `Vec` if [`Self::gemini_dir`] is absent or unreadable.
+    pub fn antigravity_session_dirs(&self) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(&self.gemini_dir) else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|dir| dir != &self.gemini_session_dir)
+            .map(|dir| dir.join("brain"))
+            .filter(|brain| brain.is_dir())
+            .collect();
+        dirs.sort();
+        dirs
     }
 }
 
@@ -189,8 +201,6 @@ fn build_paths(
     let cursor_chats_dir = cursor_data_dir.join("chats");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
-    let antigravity_brain_dirs =
-        ["antigravity-cli", "antigravity", "jetski"].map(|app| gemini_dir.join(app).join("brain"));
     let grok_dir = resolve_grok_home(home_dir, grok_home);
     let grok_session_dir = grok_dir.join("sessions");
     let dsh_dir = resolve_dsh_home(home_dir, dsh_home);
@@ -224,7 +234,6 @@ fn build_paths(
         grok_session_dir,
         dsh_dir,
         dsh_session_dir,
-        antigravity_brain_dirs,
         opencode_dir,
         opencode_db,
         hermes_db,
@@ -483,11 +492,7 @@ mod tests {
         assert_eq!(p.gemini_session_dir, home.join(".gemini").join("tmp"));
         assert_eq!(p.grok_session_dir, home.join(".grok").join("sessions"));
         assert_eq!(p.dsh_session_dir, home.join(".dsh").join("sessions"));
-        assert_eq!(
-            p.antigravity_brain_dirs,
-            ["antigravity-cli", "antigravity", "jetski"]
-                .map(|app| home.join(".gemini").join(app).join("brain"))
-        );
+        assert!(p.antigravity_session_dirs().is_empty());
         assert_eq!(p.opencode_db, p.opencode_dir.join("opencode.db"));
         assert!(p.opencode_dir.ends_with("opencode"));
         assert_eq!(p.hermes_db, home.join(".hermes").join("state.db"));
@@ -510,6 +515,36 @@ mod tests {
         ] {
             assert!(d.starts_with(home), "{d:?} should be under {home:?}");
         }
+    }
+
+    #[test]
+    fn antigravity_session_dirs_discovers_brain_subdirs_dynamically() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let p = resolve_paths_from_home(home);
+        assert!(p.antigravity_session_dirs().is_empty());
+
+        // Populate after `resolve_paths_from_home` to verify dynamic discovery.
+        let gemini = home.join(".gemini");
+        fs::create_dir_all(gemini.join("custom-build").join("brain")).unwrap();
+        fs::create_dir_all(gemini.join("antigravity").join("brain")).unwrap();
+        fs::create_dir_all(gemini.join("antigravity-cli").join("brain")).unwrap();
+        // Gemini CLI's `tmp/` must never be treated as an Antigravity root, even with a `brain` subdir.
+        fs::create_dir_all(gemini.join("tmp").join("brain")).unwrap();
+        // Entries without a `brain` directory or where `brain` is a file are ignored.
+        fs::create_dir_all(gemini.join("no-brain")).unwrap();
+        fs::create_dir_all(gemini.join("file-brain")).unwrap();
+        fs::write(gemini.join("file-brain").join("brain"), "").unwrap();
+        fs::write(gemini.join("settings.json"), "{}").unwrap();
+
+        assert_eq!(
+            p.antigravity_session_dirs(),
+            vec![
+                gemini.join("antigravity").join("brain"),
+                gemini.join("antigravity-cli").join("brain"),
+                gemini.join("custom-build").join("brain"),
+            ]
+        );
     }
 
     #[test]

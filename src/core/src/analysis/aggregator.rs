@@ -22,7 +22,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // Defined in `models` so the scan cache can share it without a cycle; re-exported here to preserve `analysis::AggregatedAnalysisRow`.
 pub use crate::models::AggregatedAnalysisRow;
@@ -379,8 +379,11 @@ where
     }
 
     if providers.antigravity {
+        let antigravity_dirs = paths.antigravity_session_dirs();
+        let antigravity_dir_refs: Vec<&Path> =
+            antigravity_dirs.iter().map(PathBuf::as_path).collect();
         visit_file_sessions(
-            &paths.antigravity_session_dirs(),
+            &antigravity_dir_refs,
             ExtensionType::Antigravity,
             is_antigravity_session_file,
             time_range,

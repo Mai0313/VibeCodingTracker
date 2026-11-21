@@ -873,14 +873,14 @@ mod tests {
             "claude-opus-5-5"
         );
         assert_eq!(
-            model_name("gemini-4-carbon-high|carbon-g-jetski/cns/x-d/home/y/checkpoints/1"),
-            "gemini-4-carbon-high"
+            model_name("gemini-3.5-pro-high|backend-pool/serving/checkpoints/1"),
+            "gemini-3.5-pro-high"
         );
         assert_eq!(
-            model_name("gemini-4-carbon-high|carbon-g-jetski"),
-            "gemini-4-carbon-high"
+            model_name("gemini-3.5-pro-high|backend-pool"),
+            "gemini-3.5-pro-high"
         );
-        assert_eq!(model_name("gemini-4-argon"), "gemini-4-argon");
+        assert_eq!(model_name("gemini-3.5-flash"), "gemini-3.5-flash");
     }
 
     #[test]

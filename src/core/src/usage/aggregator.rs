@@ -29,7 +29,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Aggregated token usage, per-provider active-day counts, and stored provider costs.
@@ -246,8 +246,11 @@ pub fn aggregate_usage_from_paths_with_providers(
     }
 
     if providers.antigravity {
+        let antigravity_dirs = paths.antigravity_session_dirs();
+        let antigravity_dir_refs: Vec<&Path> =
+            antigravity_dirs.iter().map(PathBuf::as_path).collect();
         process_usage_directory(
-            &paths.antigravity_session_dirs(),
+            &antigravity_dir_refs,
             ExtensionType::Antigravity,
             &mut result,
             &mut per_provider.antigravity,

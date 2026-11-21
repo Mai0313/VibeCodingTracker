@@ -276,7 +276,7 @@ Totals (by Provider)
 - `~/.hermes/state.db`（Hermes，SQLite 数据库，遵循 `$HERMES_HOME`；仅 `usage`）
 - `$GROK_HOME/sessions/*/*/signals.json`（Grok CLI，默认使用 `~/.grok`；同层的 `updates.jsonl` 提供 `analysis` 数据）
 - `$DSH_HOME/sessions/*/*/session.jsonl.zstd`（DeepSeek Harness，默认使用 `~/.dsh`；若该 root 配置为 `compression = "none"` 则写成 `session.jsonl`，两种都会读取）
-- `~/.gemini/{antigravity-cli,antigravity,jetski}/brain/*/.system_generated/logs/transcript_full.jsonl`（Antigravity：`agy` CLI、Desktop app 与其他 Antigravity 版本合并算作同一个 provider；每段对话的 model 取自同层的 `conversations/<id>.db`）
+- `~/.gemini/*/brain/*/.system_generated/logs/transcript_full.jsonl`（Antigravity：`agy` CLI、Desktop app 与其他 Antigravity 版本合并算作同一个 provider；每段对话的 model 取自同层的 `conversations/<id>.db`）
 
 Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.json` 的 `contextTokensUsed` 记为 cache-read token，并按该 model 的 cache-read 费率估算费用。这不是累计的 billed usage。`analysis` 会从同层的 `updates.jsonl` 还原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。至于你实际计费的额度，请参见 [Quota 命令](#quota-%E5%91%BD%E4%BB%A4) 下的 Grok 额度面板。
 
@@ -499,7 +499,7 @@ vct quota
 - **Copilot** — 方案类型，以及你的 premium 请求额度，以两个进度条呈现：已用百分比，以及已用 / 总量的请求数（例如 `45/1500`），来自 GitHub 的 Copilot API（`GET /copilot_internal/user`），从 `~/.copilot/config.json` 读取。该请求会模拟 Copilot CLI。token 为长期有效，因此不需要刷新；遇到 `401` / `403` 时会显示 `run: copilot login` 提示。
 - **Cursor** — 方案类型、total / auto / API **已用**百分比，以及按需消费，来自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。
 - **Grok** — 方案类型，以及当前每周或每月周期内的方案内含额度用量，来自 Grok CLI 自己的计费端点（`GET /v1/billing?format=credits`），从 `~/.grok/auth.json` 读取。预付余额只有在非零时才会显示；按量付费的消费则在你有过消费、或设置了上限之后才会显示。该请求会模拟 Grok CLI；遇到 `401` / `403` 时会显示 `run: grok login` 提示。
-- **Antigravity** — 每个共享模型池的额度（agy 的是 Gemini 以及 Claude / GPT，各有 5 小时与每周额度），来自 `agy` CLI 自己的 `/usage` 命令（`agy -p /usage --output-format json`）。卡片直接使用 agy 给出的模型池名称，每个额度则按 agy 的时间窗原样标示（`5h` 排在最前，然后是 `weekly`）；卡片放不下所有模型池时，其余的以 `+N` 标出。`/usage` 不提供方案名称，所以第一行只显示数据的新旧。vct 会运行 `PATH` 上的 `agy`，找不到时改找 agy 的安装位置（`~/.local/bin/agy`、`%LOCALAPPDATA%\agy\bin\agy.exe`），或 Linux 上的 `/google/bin/releases/jetski-devs/tools/cli`、macOS 上的 `/usr/local/bin/jetski`；尚未登录的 agy 不会挡掉在那里找到的版本。agy 会自行维持登录状态，因此 vct 只检查 agy 的登录项是否存在（Windows 凭据管理器的 `gemini:antigravity`、macOS Keychain 的 `gemini` / `antigravity`，或 `~/.gemini/antigravity-cli/antigravity-oauth-token`）及其最后修改时间，从不读取或写入 token；这两个路径上的版本有自己的登录方式，找到它就够了。每次轮询都会启动一次 agy（需要几秒、约 260 MB），所以这张卡片最多每 5 分钟更新一次。agy 无法登录时，卡片会显示 `run: agy acp --login` 提示，而且在该登录项变动之前，仪表盘不会再运行 agy。
+- **Antigravity** — 每个共享模型池的额度（agy 的是 Gemini 以及 Claude / GPT，各有 5 小时与每周额度），来自 `agy` CLI 自己的 `/usage` 命令（`agy -p /usage --output-format json`）。卡片直接使用 agy 给出的模型池名称，每个额度则按 agy 的时间窗原样标示（`5h` 排在最前，然后是 `weekly`）；卡片放不下所有模型池时，其余的以 `+N` 标出。`/usage` 不提供方案名称，所以第一行只显示数据的新旧。vct 会运行 `PATH` 上的 `agy`，找不到时改找 agy 的安装位置（`~/.local/bin/agy`、`%LOCALAPPDATA%\agy\bin\agy.exe`）。agy 会自行维持登录状态，因此 vct 只检查 agy 的登录项是否存在（Windows 凭据管理器的 `gemini:antigravity`、macOS Keychain 的 `gemini` / `antigravity`，或 `~/.gemini/antigravity-cli/antigravity-oauth-token`）及其最后修改时间，从不读取或写入 token。每次轮询都会启动一次 agy（需要几秒、约 260 MB），所以这张卡片最多每 5 分钟更新一次。agy 无法登录时，卡片会显示 `run: agy acp --login` 提示，而且在该登录项变动之前，仪表盘不会再运行 agy。
 
 **自动刷新 token。** 对 Claude、Codex 和 Grok，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式）。写入 Grok 的凭证文件时，会保留文件中其他所有的登录信息。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。Antigravity 的 token 属于 agy，每当 vct 向它询问 `/usage` 时由 agy 自行刷新。
 

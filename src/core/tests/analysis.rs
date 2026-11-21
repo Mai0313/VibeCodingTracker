@@ -270,7 +270,7 @@ fn batch_analysis_attributes_dsh_tools_to_the_deepseek_provider() {
 #[test]
 fn batch_analysis_attributes_antigravity_tools_to_its_provider() {
     let home = TempHome::new();
-    home.put_antigravity_fixture_session("jetski", "conversation");
+    home.put_antigravity_fixture_session("custom-build", "conversation");
 
     let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All)
         .expect("aggregate Antigravity analysis");
@@ -531,9 +531,9 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
     );
     home.put_grok_fixture_session("workspace", "grok-session");
     home.put_dsh_fixture_session("dsh-project", "dsh-session");
-    // Two of Antigravity's three roots, so both are walked and kept apart.
+    // Multiple Antigravity roots under `~/.gemini/*/brain`, so all are walked and kept apart.
     home.put_antigravity_fixture_session("antigravity-cli", "agy-conversation");
-    home.put_antigravity_fixture_session("jetski", "other-conversation");
+    home.put_antigravity_fixture_session("custom-build", "other-conversation");
     seed_opencode_tie_breaker_db(&home.paths.opencode_db);
     home.put_cursor_session(
         "cursor-project",

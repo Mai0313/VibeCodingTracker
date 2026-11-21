@@ -291,9 +291,9 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
     );
     seed_hermes_usage_db(&home.paths.hermes_db);
     home.put_dsh_fixture_session("dsh-project", "dsh-session");
-    // Two of Antigravity's three roots, so both are walked and kept apart.
+    // Multiple Antigravity roots under `~/.gemini/*/brain`, so all are walked and kept apart.
     home.put_antigravity_fixture_session("antigravity-cli", "agy-conversation");
-    home.put_antigravity_fixture_session("jetski", "other-conversation");
+    home.put_antigravity_fixture_session("custom-build", "other-conversation");
 
     let providers = ProvidersConfig::default();
     let uncached =
@@ -602,11 +602,11 @@ fn dsh_usage_counts_each_step_once() {
     assert_eq!(data.provider_days.deepseek, 1);
 }
 
-/// The `agy` CLI, the Desktop app and one more build are three roots of one provider.
+/// Every `~/.gemini/*/brain` root adds up to the single Antigravity provider.
 #[test]
 fn antigravity_roots_add_up_to_one_provider() {
     let home = TempHome::new();
-    for app in ["antigravity-cli", "antigravity", "jetski"] {
+    for app in ["antigravity-cli", "antigravity", "custom-build"] {
         home.put_antigravity_fixture_session(app, &format!("{app}-conversation"));
     }
 

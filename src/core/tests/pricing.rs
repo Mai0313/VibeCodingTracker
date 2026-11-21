@@ -318,18 +318,18 @@ fn normalized_collisions_prefer_official_vendor_over_reseller_prefixes() {
     clear_pricing_cache();
 
     let mut raw_map = HashMap::new();
-    raw_map.insert("kyma/gemini-4-argon".to_string(), pricing_at(5.4));
-    raw_map.insert("gemini/gemini-4-argon".to_string(), pricing_at(2.0));
-    raw_map.insert("vertex_ai/gemini-4-argon".to_string(), pricing_at(2.1));
+    raw_map.insert("kyma/gemini-3.5-pro".to_string(), pricing_at(5.4));
+    raw_map.insert("gemini/gemini-3.5-pro".to_string(), pricing_at(2.0));
+    raw_map.insert("vertex_ai/gemini-3.5-pro".to_string(), pricing_at(2.1));
     raw_map.insert("azure/mistral-large-latest".to_string(), pricing_at(8.0));
     raw_map.insert("mistral/mistral-large-latest".to_string(), pricing_at(0.7));
     let pricing_map = ModelPricingMap::new(raw_map);
 
-    let gemini = pricing_map.get("gemini-4-argon");
+    let gemini = pricing_map.get("gemini-3.5-pro");
     assert_eq!(gemini.pricing.input_cost_per_token, 2.0);
     assert_eq!(
         gemini.matched_model.as_deref(),
-        Some("gemini/gemini-4-argon")
+        Some("gemini/gemini-3.5-pro")
     );
 
     let mistral = pricing_map.get("mistral-large-latest");
