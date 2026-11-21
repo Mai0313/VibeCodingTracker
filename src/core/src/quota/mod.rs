@@ -4,6 +4,7 @@
 
 pub mod antigravity;
 pub mod cache;
+pub mod cards;
 pub mod claude;
 pub mod codex_session;
 pub mod copilot;
@@ -20,6 +21,7 @@ pub use cache::{
     load_cursor_cache, load_grok_cache, save_antigravity_cache, save_claude_cache,
     save_codex_cache, save_copilot_cache, save_cursor_cache, save_grok_cache,
 };
+pub use cards::{QuotaCard, QuotaCardBucket, fetch_quota_cards};
 pub use claude::{CLAUDE_LOGIN_HINT, ClaudeState};
 pub use copilot::{COPILOT_LOGIN_HINT, CopilotState};
 pub use cursor::{CURSOR_LOGIN_HINT, CursorState};
