@@ -67,33 +67,75 @@ pub(crate) fn is_cacheable_sqlite_failure(error: &anyhow::Error) -> bool {
 
 /// Runs `f` against `db_path` read-only, falling back to a read-write connection on a private temporary copy so SQLite can recover a copied WAL without touching `db_path`.
 ///
+/// Cleanly closed WAL-mode databases (header bytes `18..20 == [2, 2]` with no `-wal` sidecar) are opened via `file:<uri>?mode=ro&immutable=1` bracketed by pre/post fingerprints so SQLite does not create `-wal`/`-shm` sidecars in the user's directory; concurrent writes trigger fallback to the private temporary copy.
+///
 /// `probe_table` must exist in every supported schema.
 pub(crate) fn with_readonly_connection<T>(
     db_path: &Path,
     probe_table: &str,
     temp_prefix: &str,
     label: &str,
-    f: impl FnOnce(&Connection) -> Result<T>,
+    f: impl FnMut(&Connection) -> Result<T>,
+) -> Result<T> {
+    with_readonly_connection_inner(db_path, probe_table, temp_prefix, label, f, || {})
+}
+
+fn with_readonly_connection_inner<T>(
+    db_path: &Path,
+    probe_table: &str,
+    temp_prefix: &str,
+    label: &str,
+    mut f: impl FnMut(&Connection) -> Result<T>,
+    after_immutable_read: impl FnOnce(),
 ) -> Result<T> {
     let probe_sql = format!(
         "SELECT EXISTS(SELECT 1 FROM {} LIMIT 1)",
         quoted_identifier(probe_table)
     );
-    if let Ok(conn) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        && probe(&conn, &probe_sql).is_ok()
+
+    if let Ok(before) = database_fingerprint(db_path)
+        && before.wal.is_none()
+        && header_is_wal(db_path)
     {
-        return f(&conn);
+        if let Some(uri) = sqlite_immutable_uri(db_path) {
+            let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            if let Ok(conn) = Connection::open_with_flags(&uri, flags) {
+                let _ = conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA query_only = ON;");
+                if probe(&conn, &probe_sql).is_ok() {
+                    let result = f(&conn);
+                    drop(conn);
+                    after_immutable_read();
+                    if let Ok(after) = database_fingerprint(db_path)
+                        && after == before
+                    {
+                        return result;
+                    }
+                }
+            }
+        }
+        // Skip plain read-only open here so a cleanly closed WAL DB never gets sidecars created on disk; fall straight through to `StableTempCopy`.
+    } else {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if let Ok(conn) = Connection::open_with_flags(db_path, flags) {
+            let _ = conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA query_only = ON;");
+            if probe(&conn, &probe_sql).is_ok() {
+                return f(&conn);
+            }
+        }
     }
 
     // Name `db_path` in error context rather than the temp copy, which is deleted on return.
     let copy = StableTempCopy::new(db_path, temp_prefix)?;
-    let conn = Connection::open_with_flags(&copy.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .with_context(|| {
-            format!(
-                "Failed to open a copy of the {label} DB at {}",
-                db_path.display()
-            )
-        })?;
+    let rw_flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(&copy.db_path, rw_flags).with_context(|| {
+        format!(
+            "Failed to open a copy of the {label} DB at {}",
+            db_path.display()
+        )
+    })?;
+    let _ = conn.execute_batch("PRAGMA temp_store = MEMORY;");
     probe(&conn, &probe_sql).with_context(|| {
         format!(
             "Failed to read a copy of the {label} DB at {}",
@@ -101,6 +143,141 @@ pub(crate) fn with_readonly_connection<T>(
         )
     })?;
     f(&conn)
+}
+
+/// Returns whether `db_path`'s SQLite header marks WAL format (`bytes 18..20 == [2, 2]`).
+fn header_is_wal(db_path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(db_path) else {
+        return false;
+    };
+    let mut header = [0u8; 20];
+    if std::io::Read::read_exact(&mut file, &mut header).is_err() {
+        return false;
+    }
+    &header[..16] == b"SQLite format 3\0" && header[18..20] == [2, 2]
+}
+
+/// Builds a `file:...` SQLite URI with `mode=ro&immutable=1`, percent-encoding URI delimiters and normalizing Windows separators.
+fn sqlite_immutable_uri(db_path: &Path) -> Option<String> {
+    sqlite_immutable_uri_from_str(db_path.to_str()?, cfg!(windows))
+}
+
+fn sqlite_immutable_uri_from_str(raw: &str, is_windows: bool) -> Option<String> {
+    let mut uri = String::with_capacity(raw.len() + 32);
+    let body = if is_windows {
+        let stripped = raw.strip_prefix(r"\\?\").unwrap_or(raw);
+        if stripped.starts_with(r"\\")
+            || stripped.starts_with("UNC\\")
+            || stripped.starts_with("//")
+        {
+            return None;
+        }
+        let bytes = stripped.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            uri.push_str("file:///");
+        } else if stripped.starts_with('/') || stripped.starts_with('\\') {
+            uri.push_str("file://");
+        } else {
+            uri.push_str("file:");
+        }
+        stripped
+    } else if raw.starts_with('/') {
+        // Empty authority (`file://`) + leading `/` keeps paths starting with `//` out of the URI authority slot.
+        uri.push_str("file://");
+        raw
+    } else {
+        uri.push_str("file:");
+        raw
+    };
+
+    for ch in body.chars() {
+        match ch {
+            '\\' if is_windows => uri.push('/'),
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3F"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    Some(uri)
+}
+
+/// Returns the epoch-millis of the first instant of `date` in `tz`.
+pub(crate) fn day_start_millis<Tz: chrono::TimeZone>(tz: &Tz, date: chrono::NaiveDate) -> i64 {
+    use chrono::{Offset, TimeDelta};
+
+    let midnight = date.and_time(chrono::NaiveTime::MIN);
+    // `earliest()` handles fall-back DST transitions where local midnight occurs twice.
+    if let Some(start) = tz.from_local_datetime(&midnight).earliest() {
+        return start.timestamp_millis();
+    }
+    // Spring-forward zones that jump at local midnight (e.g. `America/Santiago`) have no `00:00`; compute the transition instant using the pre-jump offset probed 24h earlier.
+    let before = tz.offset_from_utc_datetime(&(midnight - TimeDelta::days(1)));
+    (midnight - TimeDelta::seconds(i64::from(before.fix().local_minus_utc())))
+        .and_utc()
+        .timestamp_millis()
+}
+
+/// Small per-scan cache mapping epoch-millisecond timestamps to local `YYYY-MM-DD` strings.
+///
+/// Caches exact `[day_start_ms, next_day_start_ms)` ranges so DST transitions (23h/24h/25h days and midnight gaps) stay exact while avoiding repeated `chrono::Local` lookups.
+#[derive(Default)]
+pub(crate) struct LocalDateCache {
+    entries: [(i64, i64, String); 4],
+    len: usize,
+    next_slot: usize,
+    scratch: String,
+}
+
+impl LocalDateCache {
+    /// Formats `ms` as local `YYYY-MM-DD`, returning `None` for out-of-range timestamps.
+    pub(crate) fn format_ms(&mut self, ms: i64) -> Option<&str> {
+        self.format_ms_in(&chrono::Local, ms)
+    }
+
+    fn format_ms_in<Tz: chrono::TimeZone>(&mut self, tz: &Tz, ms: i64) -> Option<&str> {
+        if let Some(idx) = self.entries[..self.len]
+            .iter()
+            .position(|(start, end, _)| ms >= *start && ms < *end)
+        {
+            return Some(self.entries[idx].2.as_str());
+        }
+
+        let dt = chrono::DateTime::from_timestamp_millis(ms)?;
+        let naive_date = dt.with_timezone(tz).date_naive();
+        let start = day_start_millis(tz, naive_date);
+        let end = naive_date.succ_opt().map(|next| day_start_millis(tz, next));
+
+        if let Some(end) = end
+            && ms >= start
+            && ms < end
+        {
+            let slot = if self.len < self.entries.len() {
+                let slot = self.len;
+                self.len += 1;
+                slot
+            } else {
+                let slot = self.next_slot;
+                self.next_slot = (self.next_slot + 1) % self.entries.len();
+                slot
+            };
+            let buf = &mut self.entries[slot].2;
+            buf.clear();
+            let _ =
+                std::fmt::Write::write_fmt(buf, format_args!("{}", naive_date.format("%Y-%m-%d")));
+            self.entries[slot].0 = start;
+            self.entries[slot].1 = end;
+            Some(self.entries[slot].2.as_str())
+        } else {
+            self.scratch.clear();
+            let _ = std::fmt::Write::write_fmt(
+                &mut self.scratch,
+                format_args!("{}", naive_date.format("%Y-%m-%d")),
+            );
+            Some(self.scratch.as_str())
+        }
+    }
 }
 
 fn probe(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
@@ -316,5 +493,237 @@ mod tests {
 
         assert_eq!(attempts.get(), MAX_COPY_ATTEMPTS);
         assert!(error.to_string().contains("after 3 attempts"));
+    }
+
+    #[test]
+    fn cleanly_closed_wal_db_creates_no_sidecar_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Include URI-special characters (`%`, `#`, spaces, and `?` on Unix where legal in filenames).
+        let file_name = if cfg!(windows) {
+            "wal %20#1.db"
+        } else {
+            "wal %20#1?v=2.db"
+        };
+        let db_path = dir.path().join(file_name);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (value INTEGER NOT NULL); \
+                 INSERT INTO entries VALUES (7), (11);",
+            )
+            .unwrap();
+        }
+        let wal_path = append_suffix(&db_path, "-wal");
+        let shm_path = append_suffix(&db_path, "-shm");
+        assert!(header_is_wal(&db_path));
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
+
+        let sum: i64 =
+            with_readonly_connection(&db_path, "entries", "vct-sqlite-test-", "Example", |conn| {
+                Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?)
+            })
+            .unwrap();
+
+        assert_eq!(sum, 18);
+        assert!(
+            !wal_path.exists(),
+            "read-only open must not create a -wal sidecar"
+        );
+        assert!(
+            !shm_path.exists(),
+            "read-only open must not create a -shm sidecar"
+        );
+    }
+
+    #[test]
+    fn active_wal_db_reads_uncheckpointed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("active.db");
+        let writer = Connection::open(&db_path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE entries (value INTEGER NOT NULL); \
+                 INSERT INTO entries VALUES (10); \
+                 PRAGMA wal_checkpoint(TRUNCATE); \
+                 INSERT INTO entries VALUES (32);",
+            )
+            .unwrap();
+        assert!(append_suffix(&db_path, "-wal").exists());
+
+        let sum: i64 =
+            with_readonly_connection(&db_path, "entries", "vct-sqlite-test-", "Example", |conn| {
+                Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(sum, 42);
+
+        // Even if the DB is closed leaving a `-wal` without `-shm` (copied into a directory), `StableTempCopy` recovers the uncheckpointed rows.
+        let orphan_dir = tempfile::tempdir().unwrap();
+        let orphan_db = orphan_dir.path().join("orphan.db");
+        std::fs::copy(&db_path, &orphan_db).unwrap();
+        std::fs::copy(
+            append_suffix(&db_path, "-wal"),
+            append_suffix(&orphan_db, "-wal"),
+        )
+        .unwrap();
+        drop(writer);
+        assert!(!append_suffix(&orphan_db, "-shm").exists());
+
+        let recovered_sum: i64 = with_readonly_connection(
+            &orphan_db,
+            "entries",
+            "vct-sqlite-test-",
+            "Example",
+            |conn| Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?),
+        )
+        .unwrap();
+        assert_eq!(recovered_sum, 42);
+    }
+
+    #[test]
+    fn concurrent_wal_write_during_immutable_read_falls_back_to_stable_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("race.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (value INTEGER NOT NULL); \
+                 INSERT INTO entries VALUES (1);",
+            )
+            .unwrap();
+        }
+        assert!(!append_suffix(&db_path, "-wal").exists());
+
+        let calls = Cell::new(0usize);
+        let mut live_writer: Option<Connection> = None;
+        let sum: i64 = with_readonly_connection_inner(
+            &db_path,
+            "entries",
+            "vct-sqlite-test-",
+            "Example",
+            |conn| {
+                calls.set(calls.get() + 1);
+                Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?)
+            },
+            || {
+                let writer = Connection::open(&db_path).unwrap();
+                writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+                writer
+                    .execute("INSERT INTO entries VALUES (99)", [])
+                    .unwrap();
+                live_writer = Some(writer);
+            },
+        )
+        .unwrap();
+        drop(live_writer);
+
+        assert_eq!(
+            calls.get(),
+            2,
+            "immutable read must retry via StableTempCopy when -wal appears mid-read"
+        );
+        assert_eq!(sum, 100);
+    }
+
+    #[test]
+    fn sqlite_immutable_uri_escapes_delimiters_and_windows_paths() {
+        assert_eq!(
+            sqlite_immutable_uri_from_str("/tmp/a%20b?c#d.db", false).as_deref(),
+            Some("file:///tmp/a%2520b%3Fc%23d.db?mode=ro&immutable=1")
+        );
+        assert_eq!(
+            sqlite_immutable_uri_from_str("//tmp/a.db", false).as_deref(),
+            Some("file:////tmp/a.db?mode=ro&immutable=1")
+        );
+        assert_eq!(
+            sqlite_immutable_uri_from_str("rel/a.db", false).as_deref(),
+            Some("file:rel/a.db?mode=ro&immutable=1")
+        );
+        assert_eq!(
+            sqlite_immutable_uri_from_str(r"C:\Users\me\a%b#c.db", true).as_deref(),
+            Some("file:///C:/Users/me/a%25b%23c.db?mode=ro&immutable=1")
+        );
+        assert_eq!(
+            sqlite_immutable_uri_from_str(r"\\?\C:\Users\me\a.db", true).as_deref(),
+            Some("file:///C:/Users/me/a.db?mode=ro&immutable=1")
+        );
+        assert_eq!(
+            sqlite_immutable_uri_from_str(r"dir\a.db", true).as_deref(),
+            Some("file:dir/a.db?mode=ro&immutable=1")
+        );
+        assert_eq!(
+            sqlite_immutable_uri_from_str(r"\\server\share\a.db", true),
+            None
+        );
+        assert_eq!(
+            sqlite_immutable_uri_from_str(r"\\?\UNC\server\share\a.db", true),
+            None
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanly_closed_wal_non_utf8_path_falls_back_without_sidecars() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("seed.db");
+        {
+            let conn = Connection::open(&src_path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (value INTEGER NOT NULL); \
+                 INSERT INTO entries VALUES (7);",
+            )
+            .unwrap();
+        }
+        let non_utf8_path = dir
+            .path()
+            .join(OsString::from_vec(b"closed-\xff.db".to_vec()));
+        std::fs::rename(&src_path, &non_utf8_path).unwrap();
+        assert!(sqlite_immutable_uri(&non_utf8_path).is_none());
+        assert!(header_is_wal(&non_utf8_path));
+        assert!(!append_suffix(&non_utf8_path, "-wal").exists());
+
+        let sum: i64 = with_readonly_connection(
+            &non_utf8_path,
+            "entries",
+            "vct-sqlite-test-",
+            "Example",
+            |conn| Ok(conn.query_row("SELECT SUM(value) FROM entries", [], |row| row.get(0))?),
+        )
+        .unwrap();
+        assert_eq!(sum, 7);
+        assert!(
+            !append_suffix(&non_utf8_path, "-wal").exists(),
+            "non-UTF-8 cleanly closed WAL DB must fall back to StableTempCopy without creating -wal"
+        );
+        assert!(
+            !append_suffix(&non_utf8_path, "-shm").exists(),
+            "non-UTF-8 cleanly closed WAL DB must fall back to StableTempCopy without creating -shm"
+        );
+    }
+
+    #[test]
+    fn local_date_cache_matches_chrono_across_multiple_days() {
+        let mut cache = LocalDateCache::default();
+        let base_ms = 1_780_757_089_000i64;
+        for day_offset in [0i64, 0, 1, 2, 3, 4, 5, 1, 4, -1, 180] {
+            for intra_day_ms in [0i64, 3_600_000, 43_200_000, 86_399_999] {
+                let ms = base_ms + day_offset * 86_400_000 + intra_day_ms;
+                let expected = chrono::DateTime::from_timestamp_millis(ms)
+                    .unwrap()
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string();
+                assert_eq!(cache.format_ms(ms), Some(expected.as_str()));
+            }
+        }
+        assert_eq!(cache.format_ms(i64::MAX), None);
     }
 }

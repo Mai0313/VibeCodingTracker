@@ -8,7 +8,7 @@ use crate::constants::FastHashMap;
 use crate::models::TimeRange;
 use crate::models::{CodeAnalysis, ExtensionType};
 use crate::session::diagnostics::{DatabaseUsageRead, UsageContribution, UsageTokenContribution};
-use crate::session::sqlite::with_readonly_connection;
+use crate::session::sqlite::{LocalDateCache, with_readonly_connection};
 use crate::utils::{get_current_user, get_machine_id};
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
@@ -101,6 +101,7 @@ impl RowTally {
 /// Unplaceable per-model rows are omitted from the per-session sums; their tokens fall through to the session residual and are re-attributed to the session's model.
 fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsageRead> {
     let cutoff = cutoff_string(time_range);
+    let mut date_cache = LocalDateCache::default();
 
     let mut out = Vec::new();
     let mut summed: FastHashMap<String, RowSums> = FastHashMap::default();
@@ -108,14 +109,26 @@ fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsa
 
     // Older Hermes databases predate `session_model_usage`; check table existence so a missing table falls back to `sessions` without reporting schema drift.
     if table_exists(conn, "session_model_usage")?
-        && let Err(error) = collect_per_model_rows(conn, &cutoff, &mut summed, &mut out, &mut tally)
+        && let Err(error) = collect_per_model_rows(
+            conn,
+            &cutoff,
+            &mut date_cache,
+            &mut summed,
+            &mut out,
+            &mut tally,
+        )
     {
         report_unreadable("per-model usage rows", &error, &mut tally);
     }
 
-    if let Err(error) =
-        reconcile_session_residuals(conn, &cutoff, &mut summed, &mut out, &mut tally)
-    {
+    if let Err(error) = reconcile_session_residuals(
+        conn,
+        &cutoff,
+        &mut date_cache,
+        &mut summed,
+        &mut out,
+        &mut tally,
+    ) {
         report_unreadable("session residuals", &error, &mut tally);
     }
     // Report only unattributed per-model rows that no session residual picked up.
@@ -150,6 +163,7 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 fn collect_per_model_rows(
     conn: &Connection,
     cutoff: &Option<String>,
+    date_cache: &mut LocalDateCache,
     summed: &mut FastHashMap<String, RowSums>,
     out: &mut Vec<UsageContribution>,
     tally: &mut RowTally,
@@ -163,8 +177,8 @@ fn collect_per_model_rows(
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         // `session_id` has no fallback; propagate read errors to stop this pass rather than silently dropping the row.
-        let session_id: String = row.get(0)?;
-        let model: Option<String> = row.get(1)?;
+        let session_id = row.get_ref(0)?.as_str()?;
+        let model = row.get_ref(1)?.as_str_or_null()?;
         // Treat any NULL numeric column as unplaceable so the session residual carries the row; defaulting a NULL `reasoning_tokens` (e.g. pre-migration) to 0 would mis-bill all output tokens and lose reasoning.
         let (
             Some(input),
@@ -206,14 +220,15 @@ fn collect_per_model_rows(
             mark_unattributed(summed, session_id, carries_usage);
             continue;
         };
-        let Some(date) = ms_to_local_date((seconds * 1000.0) as i64) else {
+        let timestamp_ms = (seconds * 1000.0) as i64;
+        let Some(date) = date_cache.format_ms(timestamp_ms) else {
             mark_unattributed(summed, session_id, carries_usage);
             continue;
         };
-        let model = model.as_deref().unwrap_or("").trim();
+        let model = model.unwrap_or("").trim();
         if model.is_empty() {
             // Only mark missing-model rows that fall inside the active window; dateless rows above are unplaceable in every window.
-            if !is_before_cutoff(&date, cutoff) {
+            if !is_before_cutoff(date, cutoff) {
                 mark_unattributed(summed, session_id, carries_usage);
             }
             continue;
@@ -221,7 +236,11 @@ fn collect_per_model_rows(
         tally.attributed();
 
         // Accumulate raw sums even for pre-cutoff rows; residuals are session-level and cutoff-filtered separately, so omitting old rows would double-count them.
-        let acc = summed.entry(session_id.clone()).or_default();
+        let acc = if let Some(acc) = summed.get_mut(session_id) {
+            acc
+        } else {
+            summed.entry(session_id.to_owned()).or_default()
+        };
         acc.input += input;
         acc.output += raw_output;
         acc.cache_read += cache_read;
@@ -230,7 +249,7 @@ fn collect_per_model_rows(
         acc.estimated += estimated;
         acc.actual += actual;
 
-        if is_before_cutoff(&date, cutoff) {
+        if is_before_cutoff(date, cutoff) {
             continue;
         }
 
@@ -240,10 +259,10 @@ fn collect_per_model_rows(
         let cost = if actual > 0.0 { actual } else { estimated };
         // Per-model rows are session-aggregated with no per-request context, so tier level is always 0.
         out.push(UsageContribution::single_model(
-            session_id,
-            date,
-            (seconds * 1000.0) as i64,
-            model.to_string(),
+            session_id.to_owned(),
+            date.to_owned(),
+            timestamp_ms,
+            model.to_owned(),
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
             0,
@@ -258,6 +277,7 @@ fn collect_per_model_rows(
 fn reconcile_session_residuals(
     conn: &Connection,
     cutoff: &Option<String>,
+    date_cache: &mut LocalDateCache,
     summed: &mut FastHashMap<String, RowSums>,
     out: &mut Vec<UsageContribution>,
     tally: &mut RowTally,
@@ -270,9 +290,8 @@ fn reconcile_session_residuals(
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let id: String = row.get(0)?;
-        let model: Option<String> = row.get(1)?;
-        let acc = summed.get(&id);
+        let id = row.get_ref(0)?.as_str()?;
+        let acc = summed.get(id);
         let input =
             (row.get::<_, Option<i64>>(2)?.unwrap_or(0) - acc.map_or(0, |a| a.input)).max(0);
         // `sessions.output_tokens` includes reasoning; subtract the reasoning residual from output just like per-model rows.
@@ -305,6 +324,7 @@ fn reconcile_session_residuals(
             continue;
         }
 
+        let model = row.get_ref(1)?.as_str_or_null()?.unwrap_or("").trim();
         let Some(seconds) = row
             .get::<_, Option<f64>>(9)?
             .or(row.get::<_, Option<f64>>(10)?)
@@ -312,29 +332,29 @@ fn reconcile_session_residuals(
             tally.dropped(1);
             continue;
         };
-        let Some(date) = ms_to_local_date((seconds * 1000.0) as i64) else {
+        let timestamp_ms = (seconds * 1000.0) as i64;
+        let Some(date) = date_cache.format_ms(timestamp_ms) else {
             tally.dropped(1);
             continue;
         };
-        let model = model.as_deref().unwrap_or("").trim();
-        let out_of_window = is_before_cutoff(&date, cutoff);
+        let out_of_window = is_before_cutoff(date, cutoff);
         if model.is_empty() && !out_of_window {
             tally.dropped(1);
             continue;
         }
         tally.attributed();
         // Clear `unattributed` marks: the residual carries any unplaced per-model tokens (or the whole session falls outside the active window).
-        clear_unattributed(summed, &id);
+        clear_unattributed(summed, id);
         if out_of_window {
             continue;
         }
 
         let cost = if actual > 0.0 { actual } else { estimated };
         out.push(UsageContribution::single_model(
-            id,
-            date,
-            (seconds * 1000.0) as i64,
-            model.to_string(),
+            id.to_owned(),
+            date.to_owned(),
+            timestamp_ms,
+            model.to_owned(),
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
             0,
@@ -346,11 +366,18 @@ fn reconcile_session_residuals(
 /// Increments `session_id`'s `unattributed` count when `carries_usage` is true.
 fn mark_unattributed(
     summed: &mut FastHashMap<String, RowSums>,
-    session_id: String,
+    session_id: &str,
     carries_usage: bool,
 ) {
     if carries_usage {
-        summed.entry(session_id).or_default().unattributed += 1;
+        if let Some(sums) = summed.get_mut(session_id) {
+            sums.unattributed += 1;
+        } else {
+            summed
+                .entry(session_id.to_owned())
+                .or_default()
+                .unattributed += 1;
+        }
     }
 }
 
@@ -384,15 +411,6 @@ fn session_usage_value(
         cache_read_tokens: cache_read,
         cache_creation_tokens: cache_write,
     }
-}
-
-/// Converts a millisecond epoch timestamp into a local `YYYY-MM-DD` date.
-fn ms_to_local_date(ms: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp_millis(ms).map(|dt| {
-        dt.with_timezone(&chrono::Local)
-            .format("%Y-%m-%d")
-            .to_string()
-    })
 }
 
 /// Pre-computes the `YYYY-MM-DD` cutoff for `time_range`, if any.

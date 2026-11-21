@@ -135,9 +135,7 @@ where
         }
     }
 
-    let cutoff = time_range
-        .cutoff_date()
-        .map(|d| d.format("%Y-%m-%d").to_string());
+    let cutoff = cutoff_system_time(time_range);
 
     // Typical scans find 10-50 session files.
     let mut results = Vec::with_capacity(20);
@@ -190,14 +188,13 @@ where
                 continue;
             }
         };
-        let datetime: chrono::DateTime<chrono::Local> = modified.into();
-        let date_key = datetime.format("%Y-%m-%d").to_string();
-
-        if let Some(ref cutoff_str) = cutoff
-            && date_key.as_str() < cutoff_str.as_str()
+        if let Some(cutoff_time) = cutoff
+            && modified < cutoff_time
         {
             continue;
         }
+        let datetime: chrono::DateTime<chrono::Local> = modified.into();
+        let date_key = datetime.format("%Y-%m-%d").to_string();
 
         results.push(FileInfo {
             path: path.to_path_buf(),
@@ -218,6 +215,21 @@ where
     }
 }
 
+/// Returns the inclusive local-midnight [`SystemTime`] lower bound for `time_range`, or `None` for [`TimeRange::All`].
+fn cutoff_system_time(time_range: TimeRange) -> Option<SystemTime> {
+    use chrono::{Local, NaiveTime, Offset, TimeDelta, TimeZone};
+
+    let date = time_range.cutoff_date()?;
+    let midnight = date.and_time(NaiveTime::MIN);
+    if let Some(start) = Local.from_local_datetime(&midnight).earliest() {
+        return Some(SystemTime::from(start));
+    }
+    // Spring-forward gap at local midnight: first instant of `date` is the transition instant.
+    let before = Local.offset_from_utc_datetime(&(midnight - TimeDelta::days(1)));
+    let utc = (midnight - TimeDelta::seconds(i64::from(before.fix().local_minus_utc()))).and_utc();
+    Some(SystemTime::from(utc))
+}
+
 /// Discovers matching files within `time_range` across `dirs` in order, dropping sessions whose [`session_key`] was already seen in an earlier root.
 pub(crate) fn collect_provider_files_diagnostics<F>(
     dirs: &[&Path],
@@ -229,21 +241,19 @@ pub(crate) fn collect_provider_files_diagnostics<F>(
 where
     F: Fn(&Path) -> bool + Sync,
 {
-    let cutoff = time_range
-        .cutoff_date()
-        .map(|d| d.format("%Y-%m-%d").to_string());
+    let cutoff = cutoff_system_time(time_range);
     let collect_root = |root: &Path| -> FileDiscovery {
         let candidates = collect_candidates_in_root(root, Some(provider), &filter_fn, max_depth);
         let files = candidates
             .files
             .into_iter()
             .filter_map(|candidate| {
-                let modified_date = candidate.modified_date();
-                if let Some(ref cutoff_str) = cutoff
-                    && modified_date.as_str() < cutoff_str.as_str()
+                if let Some(cutoff_time) = cutoff
+                    && candidate.modified < cutoff_time
                 {
                     return None;
                 }
+                let modified_date = candidate.modified_date();
                 Some(FileInfo {
                     path: candidate.path,
                     modified_date,
@@ -352,12 +362,233 @@ fn sort_failures(failures: &mut [FileDiscoveryFailure]) {
     });
 }
 
+fn should_descend_dir(
+    path: &Path,
+    file_name: &OsStr,
+    depth: usize,
+    provider: Option<ExtensionType>,
+) -> bool {
+    match provider {
+        // Claude Code stores raw tool output under `<session>/tool-results/`; requiring depth >= 2 keeps a top-level project named `tool-results` walkable.
+        Some(ExtensionType::ClaudeCode) => !(depth >= 2 && file_name == OsStr::new("tool-results")),
+        // Gemini CLI logs live directly under `chats/` or one subagent directory below `chats/`; skip non-`chats` subtrees and deeper nesting.
+        Some(ExtensionType::Gemini) => {
+            let parent_is_chats = path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == OsStr::new("chats"));
+            match depth {
+                0 | 1 => true,
+                2 => file_name == OsStr::new("chats") || parent_is_chats,
+                3 => parent_is_chats,
+                _ => false,
+            }
+        }
+        _ => true,
+    }
+}
+
 fn should_descend(entry: &DirEntry, depth_offset: usize, provider: Option<ExtensionType>) -> bool {
-    // Claude Code stores raw tool output under `<session>/tool-results/`; requiring depth >= 2 keeps a top-level project named `tool-results` walkable.
-    !(provider == Some(ExtensionType::ClaudeCode)
-        && entry.depth() + depth_offset >= 2
-        && entry.file_type().is_dir()
-        && entry.file_name() == OsStr::new("tool-results"))
+    if !entry.file_type().is_dir() {
+        return true;
+    }
+    should_descend_dir(
+        entry.path(),
+        entry.file_name(),
+        entry.depth() + depth_offset,
+        provider,
+    )
+}
+
+/// Fixed-depth leaf layout probed via direct `stat` instead of walking sibling subtrees.
+struct FixedLeafLayout {
+    required_depth: usize,
+    dir_levels: usize,
+    leaves: &'static [&'static [&'static str]],
+}
+
+fn fixed_leaf_layout(provider: Option<ExtensionType>) -> Option<FixedLeafLayout> {
+    match provider? {
+        ExtensionType::Copilot => Some(FixedLeafLayout {
+            required_depth: COPILOT_SESSION_MAX_DEPTH,
+            dir_levels: 1,
+            leaves: &[&["events.jsonl"]],
+        }),
+        ExtensionType::Grok => Some(FixedLeafLayout {
+            required_depth: GROK_SESSION_MAX_DEPTH,
+            dir_levels: 2,
+            leaves: &[&["signals.json"]],
+        }),
+        ExtensionType::DeepSeek => Some(FixedLeafLayout {
+            required_depth: DSH_SESSION_MAX_DEPTH,
+            dir_levels: 2,
+            leaves: &[&["session.jsonl.zstd"], &["session.jsonl"]],
+        }),
+        ExtensionType::Antigravity => Some(FixedLeafLayout {
+            required_depth: ANTIGRAVITY_SESSION_MAX_DEPTH,
+            dir_levels: 1,
+            leaves: &[&[".system_generated", "logs", "transcript_full.jsonl"]],
+        }),
+        _ => None,
+    }
+}
+
+fn probe_leaf<F>(
+    base: &Path,
+    components: &[&str],
+    filter_fn: &F,
+    files: &mut Vec<DiscoveredFile>,
+    failures: &mut Vec<FileDiscoveryFailure>,
+) where
+    F: Fn(&Path) -> bool,
+{
+    let mut candidate = base.to_path_buf();
+    for component in components {
+        candidate.push(component);
+    }
+    if !filter_fn(&candidate) {
+        return;
+    }
+    let metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return;
+        }
+        Err(error) => {
+            failures.push(FileDiscoveryFailure {
+                path: candidate,
+                error: error.to_string(),
+            });
+            return;
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return;
+    }
+    let modified = match metadata.modified() {
+        Ok(modified) => modified,
+        Err(error) => {
+            failures.push(FileDiscoveryFailure {
+                path: candidate,
+                error: error.to_string(),
+            });
+            return;
+        }
+    };
+    files.push(DiscoveredFile {
+        path: candidate,
+        modified,
+        len: metadata.len(),
+    });
+}
+
+fn collect_fixed_layout_in_root<F>(
+    dir: &Path,
+    layout: FixedLeafLayout,
+    filter_fn: &F,
+    max_depth: Option<usize>,
+) -> CandidateDiscovery
+where
+    F: Fn(&Path) -> bool,
+{
+    if max_depth.is_some_and(|depth| depth < layout.required_depth) {
+        return CandidateDiscovery::default();
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return CandidateDiscovery {
+                files: Vec::new(),
+                failures: vec![FileDiscoveryFailure {
+                    path: dir.to_path_buf(),
+                    error: error.to_string(),
+                }],
+            };
+        }
+    };
+
+    let mut files = Vec::new();
+    let mut failures = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path: dir.to_path_buf(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if layout.dir_levels == 1 {
+            for leaf in layout.leaves {
+                probe_leaf(&path, leaf, filter_fn, &mut files, &mut failures);
+            }
+            continue;
+        }
+        let children = match fs::read_dir(&path) {
+            Ok(children) => children,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        for child in children {
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    failures.push(FileDiscoveryFailure {
+                        path: path.clone(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let child_path = child.path();
+            let child_type = match child.file_type() {
+                Ok(child_type) => child_type,
+                Err(error) => {
+                    failures.push(FileDiscoveryFailure {
+                        path: child_path,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if !child_type.is_dir() {
+                continue;
+            }
+            for leaf in layout.leaves {
+                probe_leaf(&child_path, leaf, filter_fn, &mut files, &mut failures);
+            }
+        }
+    }
+
+    sort_failures(&mut failures);
+    CandidateDiscovery { files, failures }
 }
 
 fn walk_subtree<F>(
@@ -451,6 +682,12 @@ where
         }
     };
 
+    if root_meta.is_dir()
+        && let Some(layout) = fixed_leaf_layout(provider)
+    {
+        return collect_fixed_layout_in_root(dir, layout, filter_fn, max_depth);
+    }
+
     if !root_meta.is_dir() || max_depth.is_some_and(|depth| depth < 2) {
         let mut out = walk_subtree(dir, 0, provider, filter_fn, max_depth);
         sort_failures(&mut out.failures);
@@ -508,10 +745,7 @@ where
             }
         };
         if file_type.is_dir() {
-            if !(provider == Some(ExtensionType::ClaudeCode)
-                && depth_offset + 1 >= 2
-                && entry.file_name() == OsStr::new("tool-results"))
-            {
+            if should_descend_dir(&path, &entry.file_name(), depth_offset + 1, provider) {
                 subdirs.push(path);
             }
         } else if file_type.is_file() && filter_fn(&path) {
@@ -565,6 +799,11 @@ where
 
     CandidateDiscovery { files, failures }
 }
+
+/// Maximum traversal depth for Gemini CLI session scans.
+///
+/// Chat logs sit at `<root>/<project>/chats/<session>.jsonl` (depth 3) or `<root>/<project>/chats/<parent>/<subagent>.jsonl` (depth 4).
+pub(crate) const GEMINI_SESSION_MAX_DEPTH: usize = 4;
 
 /// Maximum traversal depth for Copilot CLI session scans.
 ///
@@ -1288,5 +1527,233 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["agent-one.jsonl", "sess-a.jsonl", "top.jsonl"]);
+    }
+
+    /// Temporarily removes directory permissions on Unix and restores them on drop so `TempDir` cleanup always succeeds.
+    #[cfg(unix)]
+    struct UnreadableDirGuard<'a>(&'a Path);
+
+    #[cfg(unix)]
+    impl<'a> UnreadableDirGuard<'a> {
+        fn new(path: &'a Path) -> Self {
+            Self::with_mode(path, 0o000)
+        }
+
+        fn with_mode(path: &'a Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UnreadableDirGuard<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn antigravity_direct_stat_discovers_transcripts_without_walking_sibling_dirs() {
+        let dir = tempdir().unwrap();
+        let brain = dir.path().join("brain");
+        let conv = brain.join("conv-a");
+        let logs = conv.join(".system_generated").join("logs");
+        let steps = conv.join("steps");
+        let chunks = conv.join("chunks");
+        let empty_conv = brain.join("conv-empty");
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&steps).unwrap();
+        fs::create_dir_all(&chunks).unwrap();
+        fs::create_dir_all(&empty_conv).unwrap();
+
+        let transcript = logs.join("transcript_full.jsonl");
+        File::create(&transcript).unwrap();
+        File::create(logs.join("transcript.jsonl")).unwrap();
+        File::create(chunks.join("transcript_full.jsonl")).unwrap();
+        fs::write(brain.join("loose.jsonl"), "{}").unwrap();
+
+        #[cfg(unix)]
+        let _steps_guard = UnreadableDirGuard::new(&steps);
+
+        let roots = [brain.as_path()];
+        let found = collect_provider_candidates_diagnostics(
+            &roots,
+            ExtensionType::Antigravity,
+            is_antigravity_session_file,
+            Some(ANTIGRAVITY_SESSION_MAX_DEPTH),
+        );
+        assert!(found.failures.is_empty(), "failures: {:?}", found.failures);
+        let paths: Vec<PathBuf> = found.files.into_iter().map(|f| f.path).collect();
+        assert_eq!(paths, [transcript]);
+
+        // A depth cap shallower than 4 yields nothing.
+        let shallow = collect_provider_candidates_diagnostics(
+            &roots,
+            ExtensionType::Antigravity,
+            is_antigravity_session_file,
+            Some(3),
+        );
+        assert!(shallow.files.is_empty());
+        assert!(shallow.failures.is_empty());
+    }
+
+    #[test]
+    fn gemini_candidate_discovery_prunes_non_chat_subtrees() {
+        let dir = tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        let chats = tmp.join("project-hash").join("chats");
+        let subagent_dir = chats.join("parent-session");
+        let deep_artifacts = subagent_dir.join("artifacts");
+        let checkpoints = tmp.join("project-hash").join("checkpoints");
+        let bin_dir = tmp.join("bin");
+        fs::create_dir_all(&deep_artifacts).unwrap();
+        fs::create_dir_all(&checkpoints).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let main_chat = chats.join("session.jsonl");
+        let subagent_chat = subagent_dir.join("subagent.jsonl");
+        File::create(&main_chat).unwrap();
+        File::create(&subagent_chat).unwrap();
+        File::create(chats.join("legacy.json")).unwrap();
+        File::create(deep_artifacts.join("ignored.jsonl")).unwrap();
+        File::create(checkpoints.join("ignored.jsonl")).unwrap();
+        File::create(bin_dir.join("rg")).unwrap();
+
+        #[cfg(unix)]
+        let _guards = (
+            UnreadableDirGuard::new(&checkpoints),
+            UnreadableDirGuard::new(&deep_artifacts),
+        );
+
+        let roots = [tmp.as_path()];
+        let found = collect_provider_candidates_diagnostics(
+            &roots,
+            ExtensionType::Gemini,
+            is_gemini_session_file,
+            Some(GEMINI_SESSION_MAX_DEPTH),
+        );
+        assert!(found.failures.is_empty(), "failures: {:?}", found.failures);
+        let mut paths: Vec<PathBuf> = found.files.into_iter().map(|f| f.path).collect();
+        paths.sort();
+        assert_eq!(paths, [subagent_chat, main_chat]);
+    }
+
+    #[test]
+    fn copilot_grok_and_dsh_direct_stat_skip_sibling_subtrees() {
+        let dir = tempdir().unwrap();
+
+        // Copilot: `session-state/<session>/events.jsonl`
+        let copilot_root = dir.path().join("session-state");
+        let copilot_sess = copilot_root.join("sess-1");
+        let copilot_snapshots = copilot_sess.join("rewind-snapshots");
+        fs::create_dir_all(&copilot_snapshots).unwrap();
+        let copilot_log = copilot_sess.join("events.jsonl");
+        File::create(&copilot_log).unwrap();
+
+        // Grok: `sessions/<workspace>/<session>/signals.json`
+        let grok_root = dir.path().join("grok").join("sessions");
+        let grok_sess = grok_root.join("ws").join("sess-1");
+        let grok_snapshots = grok_sess.join("snapshots");
+        fs::create_dir_all(&grok_snapshots).unwrap();
+        let grok_log = grok_sess.join("signals.json");
+        File::create(&grok_log).unwrap();
+
+        // DSH: `sessions/<project>/<session>/session.jsonl[.zstd]`
+        let dsh_root = dir.path().join("dsh").join("sessions");
+        let dsh_sess1 = dsh_root.join("proj").join("s1");
+        let dsh_sess2 = dsh_root.join("proj").join("s2");
+        let dsh_blobs = dsh_sess1.join("blobs");
+        fs::create_dir_all(&dsh_blobs).unwrap();
+        fs::create_dir_all(&dsh_sess2).unwrap();
+        let dsh_zstd = dsh_sess1.join("session.jsonl.zstd");
+        let dsh_plain = dsh_sess2.join("session.jsonl");
+        File::create(&dsh_zstd).unwrap();
+        File::create(&dsh_plain).unwrap();
+
+        // Execute-only (`0o111`) on the session directories blocks `read_dir` (WalkDir) while allowing direct `symlink_metadata` of the fixed leaf filename.
+        #[cfg(unix)]
+        let _guards = (
+            UnreadableDirGuard::with_mode(&copilot_sess, 0o111),
+            UnreadableDirGuard::with_mode(&grok_sess, 0o111),
+            UnreadableDirGuard::with_mode(&dsh_sess1, 0o111),
+            UnreadableDirGuard::new(&copilot_snapshots),
+            UnreadableDirGuard::new(&grok_snapshots),
+            UnreadableDirGuard::new(&dsh_blobs),
+        );
+
+        let copilot_found = collect_provider_candidates_diagnostics(
+            &[copilot_root.as_path()],
+            ExtensionType::Copilot,
+            is_copilot_session_file,
+            Some(COPILOT_SESSION_MAX_DEPTH),
+        );
+        assert!(copilot_found.failures.is_empty());
+        assert_eq!(
+            copilot_found
+                .files
+                .into_iter()
+                .map(|f| f.path)
+                .collect::<Vec<_>>(),
+            [copilot_log]
+        );
+
+        let grok_found = collect_provider_candidates_diagnostics(
+            &[grok_root.as_path()],
+            ExtensionType::Grok,
+            is_grok_session_file,
+            Some(GROK_SESSION_MAX_DEPTH),
+        );
+        assert!(grok_found.failures.is_empty());
+        assert_eq!(
+            grok_found
+                .files
+                .into_iter()
+                .map(|f| f.path)
+                .collect::<Vec<_>>(),
+            [grok_log]
+        );
+
+        let dsh_found = collect_provider_candidates_diagnostics(
+            &[dsh_root.as_path()],
+            ExtensionType::DeepSeek,
+            is_dsh_session_file,
+            Some(DSH_SESSION_MAX_DEPTH),
+        );
+        assert!(dsh_found.failures.is_empty());
+        let mut dsh_paths: Vec<PathBuf> = dsh_found.files.into_iter().map(|f| f.path).collect();
+        dsh_paths.sort();
+        assert_eq!(dsh_paths, [dsh_zstd, dsh_plain]);
+    }
+
+    #[test]
+    fn system_time_cutoff_filters_old_files_before_formatting_dates() {
+        let dir = tempdir().unwrap();
+        let old_path = dir.path().join("old.jsonl");
+        let fresh_path = dir.path().join("fresh.jsonl");
+        let old_file = File::create(&old_path).unwrap();
+        let ten_days_ago = SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        old_file.set_modified(ten_days_ago).unwrap();
+        File::create(&fresh_path).unwrap();
+
+        let generic_daily =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::Daily).unwrap();
+        assert_eq!(generic_daily.len(), 1);
+        assert_eq!(generic_daily[0].path, fresh_path);
+
+        let generic_all =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(generic_all.len(), 2);
+
+        let provider_daily = collect_provider_files_diagnostics(
+            &[dir.path()],
+            ExtensionType::Codex,
+            is_codex_session_file,
+            TimeRange::Daily,
+            None,
+        );
+        assert_eq!(provider_daily.files.len(), 1);
+        assert_eq!(provider_daily.files[0].path, fresh_path);
     }
 }
