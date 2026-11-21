@@ -26,7 +26,7 @@ use vct_core::scan::build_scan_pool;
 use vct_core::session::{ParseMode, parse_session_file_with_diagnostics};
 use vct_core::usage::scan_usage_priced;
 use vct_tui::display::app::{AppOptions, Tab, run_app};
-use vct_tui::display::usage::{display_usage_table, display_usage_text};
+use vct_tui::display::usage::{display_usage_table_with_pricing, display_usage_text_with_pricing};
 
 /// Runs process-wide setup before argument parsing, short-circuits bare `--version`/`-V`, and dispatches via [`run`].
 fn main() -> Result<()> {
@@ -192,25 +192,26 @@ fn dispatch(cli: Cli) -> Result<()> {
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
             prepare_remotes(&config.remotes)?;
 
+            let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
+            if json && let Some(error) = &scan.pricing_error {
+                eprintln!(
+                    "Warning: Failed to fetch pricing data: {error}. Costs will be unavailable."
+                );
+            }
+            report_usage_collection(&scan.collection.diagnostics)?;
             if json {
-                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
-                if let Some(error) = &scan.pricing_error {
-                    eprintln!(
-                        "Warning: Failed to fetch pricing data: {error}. Costs will be unavailable."
-                    );
-                }
-                report_usage_collection(&scan.collection.diagnostics)?;
                 let priced =
                     vct_core::usage::price_usage_data(&scan.collection.data, &scan.pricing);
                 write_pretty_json(&priced)?;
             } else if text {
-                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
-                report_usage_collection(&scan.collection.diagnostics)?;
-                display_usage_text(&scan.collection.data, merge);
+                display_usage_text_with_pricing(&scan.collection.data, merge, &scan.pricing);
             } else {
-                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
-                report_usage_collection(&scan.collection.diagnostics)?;
-                display_usage_table(&scan.collection.data, merge);
+                display_usage_table_with_pricing(
+                    &scan.collection.data,
+                    merge,
+                    &scan.pricing,
+                    scan.pricing_error.as_deref(),
+                );
             }
         }
 

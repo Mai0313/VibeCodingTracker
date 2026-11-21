@@ -22,30 +22,43 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         return;
     }
 
-    println!("{}", "Token Usage Statistics".bright_cyan().bold());
-    println!();
-
-    let pricing_map = match fetch_model_pricing() {
-        Ok(map) => map,
-        Err(e) => {
-            log::warn!("failed to fetch pricing data: {e}; costs shown as $0.00");
-            eprintln!("Warning: Failed to fetch pricing data: {}", e);
-            eprintln!("Costs will be shown as $0.00");
-            ModelPricingMap::new(HashMap::new())
-        }
+    let (pricing, error) = match fetch_model_pricing() {
+        Ok(map) => (map, None),
+        Err(error) => (
+            ModelPricingMap::new(HashMap::new()),
+            Some(error.to_string()),
+        ),
     };
+    display_usage_table_with_pricing(usage_data, merge, &pricing, error.as_deref());
+}
 
+/// Prints the usage table with the supplied model prices, warning if their lookup failed.
+pub fn display_usage_table_with_pricing(
+    usage_data: &UsageData,
+    merge: bool,
+    pricing_map: &ModelPricingMap,
+    pricing_error: Option<&str>,
+) {
     let mut summary = build_usage_summary(
         &usage_data.models,
         &usage_data.per_provider,
         &usage_data.provider_days,
-        &pricing_map,
+        pricing_map,
         &usage_data.stored_costs,
     );
 
     if summary.rows.is_empty() {
         println!("No usage data found in enabled provider sessions");
         return;
+    }
+
+    println!("{}", "Token Usage Statistics".bright_cyan().bold());
+    println!();
+
+    if let Some(error) = pricing_error {
+        log::warn!("failed to fetch pricing data: {error}; costs shown as $0.00");
+        eprintln!("Warning: Failed to fetch pricing data: {error}");
+        eprintln!("Costs will be shown as $0.00");
     }
 
     // Totals are a row-wise sum, so they are identical merged or not.

@@ -19,5 +19,5 @@ pub(crate) use interactive::{
 #[cfg(test)]
 pub(crate) use quota_tab::draw_quota_tab;
 pub(crate) use quota_tab::draw_quota_tab_with_border;
-pub use table::display_usage_table;
-pub use text::display_usage_text;
+pub use table::{display_usage_table, display_usage_table_with_pricing};
+pub use text::{display_usage_text, display_usage_text_with_pricing};
