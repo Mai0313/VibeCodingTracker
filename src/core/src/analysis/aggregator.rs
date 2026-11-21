@@ -1,7 +1,7 @@
 //! Session collection and per-model aggregation for the `analysis` command.
 
 use crate::config::ProvidersConfig;
-use crate::constants::{FastHashMap, capacity};
+use crate::constants::{FastHashMap, FastHashSet, capacity};
 use crate::ledger::{DayEntry, SessionLedger, merge_analysis_rows};
 use crate::models::TimeRange;
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
@@ -21,7 +21,6 @@ use crate::utils::{
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Serialize, Serializer, ser::SerializeSeq};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 // Defined in `models` so the scan cache can share it without a cycle; re-exported here to preserve `analysis::AggregatedAnalysisRow`.
@@ -557,7 +556,7 @@ pub fn project_code_analysis(analysis: &CodeAnalysis) -> AnalysisData {
     let mut projection = AnalysisProjection::new();
     projection.add_analysis(provider, analysis);
 
-    let mut dates = HashSet::new();
+    let mut dates: FastHashSet<String> = FastHashSet::default();
     for record in &analysis.records {
         if let Some(date) = local_date_from_millis(record.timestamp) {
             dates.insert(date);
@@ -567,7 +566,7 @@ pub fn project_code_analysis(analysis: &CodeAnalysis) -> AnalysisData {
         dates.insert("single".to_string());
     }
     for date in dates {
-        projection.add_date(provider, date);
+        projection.add_date(provider, &date);
     }
 
     projection.finish()
@@ -748,7 +747,7 @@ fn visit_database_sessions<F>(
 
 /// Mutable accumulator shared by the batch, cached, and single-file projections.
 struct AnalysisProjection {
-    all: FastHashMap<String, AggregatedAnalysisRow>,
+    unattributed: FastHashMap<String, AggregatedAnalysisRow>,
     claude: FastHashMap<String, AggregatedAnalysisRow>,
     codex: FastHashMap<String, AggregatedAnalysisRow>,
     copilot: FastHashMap<String, AggregatedAnalysisRow>,
@@ -758,39 +757,25 @@ struct AnalysisProjection {
     antigravity: FastHashMap<String, AggregatedAnalysisRow>,
     opencode: FastHashMap<String, AggregatedAnalysisRow>,
     cursor: FastHashMap<String, AggregatedAnalysisRow>,
-    all_dates: HashSet<String>,
-    claude_dates: HashSet<String>,
-    codex_dates: HashSet<String>,
-    copilot_dates: HashSet<String>,
-    gemini_dates: HashSet<String>,
-    grok_dates: HashSet<String>,
-    deepseek_dates: HashSet<String>,
-    antigravity_dates: HashSet<String>,
-    opencode_dates: HashSet<String>,
-    cursor_dates: HashSet<String>,
-    hermes_dates: HashSet<String>,
+    unattributed_dates: FastHashSet<String>,
+    claude_dates: FastHashSet<String>,
+    codex_dates: FastHashSet<String>,
+    copilot_dates: FastHashSet<String>,
+    gemini_dates: FastHashSet<String>,
+    grok_dates: FastHashSet<String>,
+    deepseek_dates: FastHashSet<String>,
+    antigravity_dates: FastHashSet<String>,
+    opencode_dates: FastHashSet<String>,
+    cursor_dates: FastHashSet<String>,
+    hermes_dates: FastHashSet<String>,
 }
 
 impl crate::scan::CompactSink for AnalysisProjection {
     fn fold(&mut self, provider: ExtensionType, date: &str, day: &DayEntry) {
-        merge_analysis_rows(&mut self.all, &day.analysis);
-        let provider_rows = match provider {
-            ExtensionType::ClaudeCode => Some(&mut self.claude),
-            ExtensionType::Codex => Some(&mut self.codex),
-            ExtensionType::Copilot => Some(&mut self.copilot),
-            ExtensionType::Gemini => Some(&mut self.gemini),
-            ExtensionType::Grok => Some(&mut self.grok),
-            ExtensionType::DeepSeek => Some(&mut self.deepseek),
-            ExtensionType::Antigravity => Some(&mut self.antigravity),
-            ExtensionType::OpenCode => Some(&mut self.opencode),
-            ExtensionType::Cursor => Some(&mut self.cursor),
-            ExtensionType::Hermes => None,
-        };
-        if let Some(rows) = provider_rows {
-            merge_analysis_rows(rows, &day.analysis);
-        }
+        let rows = self.provider_rows_mut(Some(provider));
+        merge_analysis_rows(rows, &day.analysis);
         if day.active.analysis {
-            self.add_date(Some(provider), date.to_string());
+            self.add_date(Some(provider), date);
         }
     }
 }
@@ -798,7 +783,7 @@ impl crate::scan::CompactSink for AnalysisProjection {
 impl AnalysisProjection {
     fn new() -> Self {
         Self {
-            all: FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS),
+            unattributed: FastHashMap::default(),
             claude: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             codex: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             copilot: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
@@ -808,82 +793,84 @@ impl AnalysisProjection {
             antigravity: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             opencode: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             cursor: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
-            all_dates: HashSet::new(),
-            claude_dates: HashSet::new(),
-            codex_dates: HashSet::new(),
-            copilot_dates: HashSet::new(),
-            gemini_dates: HashSet::new(),
-            grok_dates: HashSet::new(),
-            deepseek_dates: HashSet::new(),
-            antigravity_dates: HashSet::new(),
-            opencode_dates: HashSet::new(),
-            cursor_dates: HashSet::new(),
-            hermes_dates: HashSet::new(),
+            unattributed_dates: FastHashSet::default(),
+            claude_dates: FastHashSet::default(),
+            codex_dates: FastHashSet::default(),
+            copilot_dates: FastHashSet::default(),
+            gemini_dates: FastHashSet::default(),
+            grok_dates: FastHashSet::default(),
+            deepseek_dates: FastHashSet::default(),
+            antigravity_dates: FastHashSet::default(),
+            opencode_dates: FastHashSet::default(),
+            cursor_dates: FastHashSet::default(),
+            hermes_dates: FastHashSet::default(),
+        }
+    }
+
+    fn provider_rows_mut(
+        &mut self,
+        provider: Option<ExtensionType>,
+    ) -> &mut FastHashMap<String, AggregatedAnalysisRow> {
+        match provider {
+            Some(ExtensionType::ClaudeCode) => &mut self.claude,
+            Some(ExtensionType::Codex) => &mut self.codex,
+            Some(ExtensionType::Copilot) => &mut self.copilot,
+            Some(ExtensionType::Gemini) => &mut self.gemini,
+            Some(ExtensionType::Grok) => &mut self.grok,
+            Some(ExtensionType::DeepSeek) => &mut self.deepseek,
+            Some(ExtensionType::Antigravity) => &mut self.antigravity,
+            Some(ExtensionType::OpenCode) => &mut self.opencode,
+            Some(ExtensionType::Cursor) => &mut self.cursor,
+            Some(ExtensionType::Hermes) | None => &mut self.unattributed,
         }
     }
 
     fn add_session(&mut self, session: &AnalysisSession) {
         self.add_analysis(Some(session.provider), &session.analysis);
-        self.add_date(Some(session.provider), session.date.clone());
+        self.add_date(Some(session.provider), &session.date);
     }
 
     fn add_analysis(&mut self, provider: Option<ExtensionType>, analysis: &CodeAnalysis) {
-        aggregate_analysis_result(&mut self.all, analysis);
-        let provider_rows = match provider {
-            Some(ExtensionType::ClaudeCode) => Some(&mut self.claude),
-            Some(ExtensionType::Codex) => Some(&mut self.codex),
-            Some(ExtensionType::Copilot) => Some(&mut self.copilot),
-            Some(ExtensionType::Gemini) => Some(&mut self.gemini),
-            Some(ExtensionType::Grok) => Some(&mut self.grok),
-            Some(ExtensionType::DeepSeek) => Some(&mut self.deepseek),
-            Some(ExtensionType::Antigravity) => Some(&mut self.antigravity),
-            Some(ExtensionType::OpenCode) => Some(&mut self.opencode),
-            Some(ExtensionType::Cursor) => Some(&mut self.cursor),
-            Some(ExtensionType::Hermes) | None => None,
-        };
-        if let Some(rows) = provider_rows {
-            aggregate_analysis_result(rows, analysis);
-        }
+        let rows = self.provider_rows_mut(provider);
+        aggregate_analysis_result(rows, analysis);
     }
 
-    fn add_date(&mut self, provider: Option<ExtensionType>, date: String) {
-        self.all_dates.insert(date.clone());
-        match provider {
-            Some(ExtensionType::ClaudeCode) => {
-                self.claude_dates.insert(date);
-            }
-            Some(ExtensionType::Codex) => {
-                self.codex_dates.insert(date);
-            }
-            Some(ExtensionType::Copilot) => {
-                self.copilot_dates.insert(date);
-            }
-            Some(ExtensionType::Gemini) => {
-                self.gemini_dates.insert(date);
-            }
-            Some(ExtensionType::Grok) => {
-                self.grok_dates.insert(date);
-            }
-            Some(ExtensionType::DeepSeek) => {
-                self.deepseek_dates.insert(date);
-            }
-            Some(ExtensionType::Antigravity) => {
-                self.antigravity_dates.insert(date);
-            }
-            Some(ExtensionType::OpenCode) => {
-                self.opencode_dates.insert(date);
-            }
-            Some(ExtensionType::Cursor) => {
-                self.cursor_dates.insert(date);
-            }
-            Some(ExtensionType::Hermes) => {
-                self.hermes_dates.insert(date);
-            }
-            None => {}
+    fn add_date(&mut self, provider: Option<ExtensionType>, date: &str) {
+        let dates = match provider {
+            Some(ExtensionType::ClaudeCode) => &mut self.claude_dates,
+            Some(ExtensionType::Codex) => &mut self.codex_dates,
+            Some(ExtensionType::Copilot) => &mut self.copilot_dates,
+            Some(ExtensionType::Gemini) => &mut self.gemini_dates,
+            Some(ExtensionType::Grok) => &mut self.grok_dates,
+            Some(ExtensionType::DeepSeek) => &mut self.deepseek_dates,
+            Some(ExtensionType::Antigravity) => &mut self.antigravity_dates,
+            Some(ExtensionType::OpenCode) => &mut self.opencode_dates,
+            Some(ExtensionType::Cursor) => &mut self.cursor_dates,
+            Some(ExtensionType::Hermes) => &mut self.hermes_dates,
+            None => &mut self.unattributed_dates,
+        };
+        if !dates.contains(date) {
+            dates.insert(date.to_string());
         }
     }
 
     fn finish(self) -> AnalysisData {
+        let mut all_dates: FastHashSet<&str> = FastHashSet::default();
+        for set in [
+            &self.claude_dates,
+            &self.codex_dates,
+            &self.copilot_dates,
+            &self.gemini_dates,
+            &self.grok_dates,
+            &self.deepseek_dates,
+            &self.antigravity_dates,
+            &self.opencode_dates,
+            &self.cursor_dates,
+            &self.hermes_dates,
+            &self.unattributed_dates,
+        ] {
+            all_dates.extend(set.iter().map(String::as_str));
+        }
         let provider_days = ProviderActiveDays {
             claude: self.claude_dates.len(),
             codex: self.codex_dates.len(),
@@ -895,10 +882,44 @@ impl AnalysisProjection {
             opencode: self.opencode_dates.len(),
             cursor: self.cursor_dates.len(),
             hermes: self.hermes_dates.len(),
-            total: self.all_dates.len(),
+            total: all_dates.len(),
         };
+
+        let mut all: FastHashMap<String, AggregatedAnalysisRow> =
+            FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
+        for map in [
+            &self.claude,
+            &self.codex,
+            &self.copilot,
+            &self.gemini,
+            &self.grok,
+            &self.deepseek,
+            &self.antigravity,
+            &self.opencode,
+            &self.cursor,
+            &self.unattributed,
+        ] {
+            for (model, row) in map {
+                match all.get_mut(model) {
+                    Some(entry) => {
+                        entry.edit_lines += row.edit_lines;
+                        entry.read_lines += row.read_lines;
+                        entry.write_lines += row.write_lines;
+                        entry.bash_count += row.bash_count;
+                        entry.edit_count += row.edit_count;
+                        entry.read_count += row.read_count;
+                        entry.todo_write_count += row.todo_write_count;
+                        entry.write_count += row.write_count;
+                    }
+                    None => {
+                        all.insert(model.clone(), row.clone());
+                    }
+                }
+            }
+        }
+
         AnalysisData {
-            rows: into_sorted_rows(self.all),
+            rows: into_sorted_rows(all),
             per_provider: PerProviderAnalysisRows {
                 claude: into_sorted_rows(self.claude),
                 codex: into_sorted_rows(self.codex),
@@ -951,19 +972,22 @@ fn aggregate_analysis_result(
                 continue;
             }
 
-            let entry = aggregated
-                .entry(model.clone())
-                .or_insert_with(|| AggregatedAnalysisRow {
-                    model: model.clone(),
-                    edit_lines: 0,
-                    read_lines: 0,
-                    write_lines: 0,
-                    bash_count: 0,
-                    edit_count: 0,
-                    read_count: 0,
-                    todo_write_count: 0,
-                    write_count: 0,
-                });
+            let entry = match aggregated.get_mut(model) {
+                Some(entry) => entry,
+                None => aggregated
+                    .entry(model.clone())
+                    .or_insert_with(|| AggregatedAnalysisRow {
+                        model: model.clone(),
+                        edit_lines: 0,
+                        read_lines: 0,
+                        write_lines: 0,
+                        bash_count: 0,
+                        edit_count: 0,
+                        read_count: 0,
+                        todo_write_count: 0,
+                        write_count: 0,
+                    }),
+            };
 
             entry.edit_lines += record.total_edit_lines;
             entry.read_lines += record.total_read_lines;

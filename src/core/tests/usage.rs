@@ -167,6 +167,24 @@ fn seed_hermes_usage_db(path: &std::path::Path) {
         .unwrap();
 }
 
+/// Compares two model-usage maps after normalizing each entry to canonical flat token counts.
+fn assert_usage_map_eq(
+    actual: &vct_core::models::UsageResult,
+    expected: &vct_core::models::UsageResult,
+    label: &str,
+) {
+    let normalize = |map: &vct_core::models::UsageResult| {
+        map.iter()
+            .map(|(model, usage)| (model.clone(), vct_core::utils::normalize_usage_value(usage)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        normalize(actual),
+        normalize(expected),
+        "{label} usage differs"
+    );
+}
+
 /// Compares every bucket of two usage results.
 ///
 /// Every struct is destructured so adding a bucket fails to compile instead of silently going uncompared.
@@ -177,7 +195,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         provider_days,
         stored_costs,
     } = actual;
-    assert_eq!(models, &expected.models);
+    assert_usage_map_eq(models, &expected.models, "Merged");
 
     let PerProviderUsage {
         claude,
@@ -204,7 +222,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         ("DeepSeek", deepseek, &other.deepseek),
         ("Antigravity", antigravity, &other.antigravity),
     ] {
-        assert_eq!(actual_usage, expected_usage, "{provider} usage differs");
+        assert_usage_map_eq(actual_usage, expected_usage, provider);
     }
 
     let ProviderActiveDays {
@@ -344,6 +362,7 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
             .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(warm.diagnostics, cold.diagnostics);
+    assert_eq!(warm.data.models, cold.data.models);
     assert_usage_data_eq(&warm.data, &uncached);
 }
 

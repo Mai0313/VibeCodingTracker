@@ -31,10 +31,22 @@ pub fn accumulate_i64_fields(
     source: &serde_json::Map<String, Value>,
     fields: &[&str],
 ) {
-    for field in fields {
-        if let Some(value) = source.get(*field).and_then(|v| v.as_i64()) {
-            let current = target.get(*field).and_then(|v| v.as_i64()).unwrap_or(0);
-            target.insert(field.to_string(), (current + value).into());
+    for &field in fields {
+        if let Some(value) = source.get(field).and_then(Value::as_i64) {
+            add_i64_field(target, field, value);
+        }
+    }
+}
+
+/// Adds `delta` to `target[field]` in place, inserting `field` only when absent.
+fn add_i64_field(target: &mut serde_json::Map<String, Value>, field: &str, delta: i64) {
+    match target.get_mut(field) {
+        Some(slot) => {
+            let current = slot.as_i64().unwrap_or(0);
+            *slot = (current + delta).into();
+        }
+        None => {
+            target.insert(field.to_string(), delta.into());
         }
     }
 }
@@ -65,18 +77,25 @@ pub fn accumulate_nested_object(
     field_name: &str,
     source_nested: &serde_json::Map<String, Value>,
 ) {
-    let target_nested = target_obj
-        .entry(field_name.to_string())
-        .or_insert_with(|| serde_json::json!({}));
+    let target_nested = match target_obj.get_mut(field_name) {
+        Some(existing) => existing,
+        None => target_obj
+            .entry(field_name.to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new())),
+    };
 
     if let Some(target_nested_obj) = target_nested.as_object_mut() {
         for (key, value) in source_nested {
             if let Some(v) = value.as_i64() {
-                let current = target_nested_obj
-                    .get(key)
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                target_nested_obj.insert(key.clone(), (current + v).into());
+                match target_nested_obj.get_mut(key) {
+                    Some(slot) => {
+                        let current = slot.as_i64().unwrap_or(0);
+                        *slot = (current + v).into();
+                    }
+                    None => {
+                        target_nested_obj.insert(key.clone(), v.into());
+                    }
+                }
             }
         }
     }
@@ -130,18 +149,21 @@ pub fn process_claude_usage(
         None => return,
     };
 
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation": {},
-                "output_tokens": 0,
-                "service_tier": ""
-            })
-        });
+    let existing = match conversation_usage.get_mut(model) {
+        Some(existing) => existing,
+        None => conversation_usage
+            .entry(model.to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": {},
+                    "output_tokens": 0,
+                    "service_tier": ""
+                })
+            }),
+    };
 
     let Some(existing_obj) = existing.as_object_mut() else {
         return;
@@ -159,7 +181,12 @@ pub fn process_claude_usage(
     );
 
     if let Some(service_tier) = usage_obj.get("service_tier").and_then(|v| v.as_str()) {
-        existing_obj.insert("service_tier".to_string(), service_tier.into());
+        match existing_obj.get_mut("service_tier") {
+            Some(slot) => *slot = service_tier.into(),
+            None => {
+                existing_obj.insert("service_tier".to_string(), service_tier.into());
+            }
+        }
     }
 
     if let Some(cache_creation) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
@@ -303,15 +330,18 @@ pub fn process_codex_usage(
         None => return,
     };
 
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "total_token_usage": {},
-                "last_token_usage": {},
-                "model_context_window": null
-            })
-        });
+    let existing = match conversation_usage.get_mut(model) {
+        Some(existing) => existing,
+        None => conversation_usage
+            .entry(model.to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "total_token_usage": {},
+                    "last_token_usage": {},
+                    "model_context_window": null
+                })
+            }),
+    };
 
     let Some(existing_obj) = existing.as_object_mut() else {
         return;
@@ -339,11 +369,21 @@ pub fn process_codex_usage(
     }
 
     if let Some(last_usage) = info_obj.get("last_token_usage") {
-        existing_obj.insert("last_token_usage".to_string(), last_usage.clone());
+        match existing_obj.get_mut("last_token_usage") {
+            Some(slot) => *slot = last_usage.clone(),
+            None => {
+                existing_obj.insert("last_token_usage".to_string(), last_usage.clone());
+            }
+        }
     }
 
     if let Some(context_window) = info_obj.get("model_context_window") {
-        existing_obj.insert("model_context_window".to_string(), context_window.clone());
+        match existing_obj.get_mut("model_context_window") {
+            Some(slot) => *slot = context_window.clone(),
+            None => {
+                existing_obj.insert("model_context_window".to_string(), context_window.clone());
+            }
+        }
     }
 }
 
@@ -358,18 +398,21 @@ pub fn process_gemini_usage(
     tokens: &crate::models::GeminiTokens,
     tier_level: usize,
 ) {
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
-                "thoughts_tokens": 0,
-                "tool_tokens": 0,
-                "total_tokens": 0,
-            })
-        });
+    let existing = match conversation_usage.get_mut(model) {
+        Some(existing) => existing,
+        None => conversation_usage
+            .entry(model.to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                    "thoughts_tokens": 0,
+                    "tool_tokens": 0,
+                    "total_tokens": 0,
+                })
+            }),
+    };
 
     let Some(existing_obj) = existing.as_object_mut() else {
         return;
@@ -378,59 +421,12 @@ pub fn process_gemini_usage(
     // Gemini `tokens.input` includes `tokens.cached`; subtract cached reads so LiteLLM does not bill them twice.
     let input_non_cached = (tokens.input - tokens.cached).max(0);
 
-    let current_input = existing_obj
-        .get("input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "input_tokens".to_string(),
-        (current_input + input_non_cached).into(),
-    );
-
-    let current_cached = existing_obj
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "cache_read_input_tokens".to_string(),
-        (current_cached + tokens.cached).into(),
-    );
-
-    let current_output = existing_obj
-        .get("output_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "output_tokens".to_string(),
-        (current_output + tokens.output).into(),
-    );
-
-    let current_thoughts = existing_obj
-        .get("thoughts_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "thoughts_tokens".to_string(),
-        (current_thoughts + tokens.thoughts).into(),
-    );
-
-    let current_tool = existing_obj
-        .get("tool_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "tool_tokens".to_string(),
-        (current_tool + tokens.tool).into(),
-    );
-
-    let current_total = existing_obj
-        .get("total_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "total_tokens".to_string(),
-        (current_total + tokens.total).into(),
-    );
+    add_i64_field(existing_obj, "input_tokens", input_non_cached);
+    add_i64_field(existing_obj, "cache_read_input_tokens", tokens.cached);
+    add_i64_field(existing_obj, "output_tokens", tokens.output);
+    add_i64_field(existing_obj, "thoughts_tokens", tokens.thoughts);
+    add_i64_field(existing_obj, "tool_tokens", tokens.tool);
+    add_i64_field(existing_obj, "total_tokens", tokens.total);
 
     if tier_level > 0 {
         accumulate_tier_slice(

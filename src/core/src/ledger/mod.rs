@@ -16,7 +16,7 @@ use crate::utils::file::{ATOMIC_TEMP_PREFIX, write_json_atomic_metadata};
 use crate::utils::now_rfc3339_utc_nanos;
 use anyhow::Result;
 pub(crate) use format::{
-    DayEntry, HalfStamps, ScanFeature, ScanStamp, SessionEntry, merge_analysis_rows,
+    CompactUsage, DayEntry, HalfStamps, ScanFeature, ScanStamp, SessionEntry, merge_analysis_rows,
 };
 use format::{LedgerFile, LedgerHeader, SCHEMA_VERSION};
 pub use remote::{EXPORT_LINE_PREFIX, REMOTES_DIR_NAME, prune_remotes, remote_dir, store_export};

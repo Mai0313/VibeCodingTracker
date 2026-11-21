@@ -38,6 +38,7 @@ impl<K, V> TinyMap<K, V> {
         self.0.retain_mut(|(key, value)| keep(key, value));
     }
 
+    #[cfg(test)]
     pub(crate) fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
@@ -47,6 +48,17 @@ impl<K, V> TinyMap<K, V> {
             .binary_search_by(|(probe, _)| probe.borrow().cmp(key))
             .ok()
             .map(|index| &self.0[index].1)
+    }
+
+    pub(crate) fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.0
+            .binary_search_by(|(probe, _)| probe.borrow().cmp(key))
+            .ok()
+            .map(|index| &mut self.0[index].1)
     }
 
     #[cfg(test)]
@@ -105,10 +117,6 @@ pub(crate) enum Entry<'a, K, V> {
 }
 
 impl<'a, K, V> Entry<'a, K, V> {
-    pub(crate) fn or_insert(self, default: V) -> &'a mut V {
-        self.or_insert_with(|| default)
-    }
-
     pub(crate) fn or_insert_with(self, default: impl FnOnce() -> V) -> &'a mut V {
         match self {
             Self::Occupied(slot) => slot,

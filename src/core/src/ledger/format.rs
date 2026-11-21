@@ -1,16 +1,20 @@
 //! On-disk shape of a provider's ledger file and the fold helpers that build per-day entries from parsed sessions.
 //!
-//! Every value is either raw provider data (a token bucket in the provider's own key shape, a stored cost) or a plain count, so any time-range view reduces to filtering by day key and summing. Priced costs are never written; pricing is computed at display time from the current pricing map.
+//! Every value is either normalized provider token counters, a stored cost, or a plain count, so any time-range view reduces to filtering by day key and summing. Priced costs are never written; pricing is computed at display time from the current pricing map.
 
 use super::tiny_map::TinyMap;
 use crate::constants::FastHashMap;
 use crate::models::{AggregatedAnalysisRow, CodeAnalysis};
 use crate::session::diagnostics::UsageTokenContribution;
-use crate::utils::{extract_token_counts, merge_usage_values};
+use crate::utils::token_merge::token_counts_to_flat_value;
+use crate::utils::{MAX_TIER_LEVELS, TierSlice, TokenCounts, extract_token_counts};
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use serde_json::value::{RawValue, to_raw_value};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
 
 /// Schema version of the on-disk ledger format; files with a newer version are left untouched.
 pub(crate) const SCHEMA_VERSION: u32 = 1;
@@ -246,12 +250,866 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Compact normalized per-model token counters stored inline in [`DayEntry`].
+///
+/// Holds the nine independent billing counters inline plus optional per-level context-tier slices (no heap allocation when empty). Stream-deserializes both legacy v1 provider JSON shapes and compact flat JSON, and serializes compact flat JSON readable by v1 builds.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct CompactUsage {
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) cache_read: i64,
+    pub(crate) cache_creation_5m: i64,
+    pub(crate) cache_creation_1h: i64,
+    pub(crate) web_search_requests: i64,
+    pub(crate) tool_tokens: i64,
+    pub(crate) total: i64,
+    pub(crate) above_tiers: Option<Box<[TierSlice]>>,
+}
+
+impl CompactUsage {
+    /// Extracts normalized counters from an in-memory provider usage [`Value`].
+    pub(crate) fn from_value(usage: &Value) -> Self {
+        Self::from_token_counts(extract_token_counts(usage))
+    }
+
+    /// Packs normalized [`TokenCounts`] into the compact inline representation.
+    pub(crate) fn from_token_counts(counts: TokenCounts) -> Self {
+        Self {
+            input_tokens: counts.input_tokens,
+            output_tokens: counts.output_tokens,
+            reasoning_tokens: counts.reasoning_tokens,
+            cache_read: counts.cache_read,
+            cache_creation_5m: counts.cache_creation_5m,
+            cache_creation_1h: counts.cache_creation_1h,
+            web_search_requests: counts.web_search_requests,
+            tool_tokens: counts.tool_tokens,
+            total: counts.total,
+            above_tiers: compact_tier_slices(counts.above_tiers),
+        }
+    }
+
+    /// Returns total cache-creation tokens (`5m + 1h`).
+    #[inline]
+    pub(crate) fn cache_creation(&self) -> i64 {
+        self.cache_creation_5m + self.cache_creation_1h
+    }
+
+    /// Converts these counters into [`TokenCounts`] for pricing or flat JSON emission.
+    pub(crate) fn to_token_counts(&self) -> TokenCounts {
+        TokenCounts {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            cache_read: self.cache_read,
+            cache_creation: self.cache_creation(),
+            cache_creation_5m: self.cache_creation_5m,
+            cache_creation_1h: self.cache_creation_1h,
+            web_search_requests: self.web_search_requests,
+            tool_tokens: self.tool_tokens,
+            total: self.total,
+            above_tiers: self
+                .above_tiers
+                .as_deref()
+                .map_or_else(Vec::new, |slices| slices.to_vec()),
+        }
+    }
+
+    /// Converts these counters into the canonical flat JSON [`Value`] schema.
+    pub(crate) fn to_flat_value(&self) -> Value {
+        token_counts_to_flat_value(&self.to_token_counts())
+    }
+
+    /// Returns whether any token bucket or `web_search_requests` is non-zero.
+    pub(crate) fn has_activity(&self) -> bool {
+        self.total != 0
+            || self.input_tokens != 0
+            || self.output_tokens != 0
+            || self.reasoning_tokens != 0
+            || self.cache_read != 0
+            || self.cache_creation_5m != 0
+            || self.cache_creation_1h != 0
+            || self.web_search_requests != 0
+    }
+
+    /// Adds all counters and tier slices from `other` into `self`.
+    pub(crate) fn add_assign(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cache_read += other.cache_read;
+        self.cache_creation_5m += other.cache_creation_5m;
+        self.cache_creation_1h += other.cache_creation_1h;
+        self.web_search_requests += other.web_search_requests;
+        self.tool_tokens += other.tool_tokens;
+        self.total += other.total;
+        if let Some(other_tiers) = other.above_tiers.as_deref() {
+            self.merge_tier_slices(other_tiers);
+        }
+    }
+
+    /// Adds one database-reader token contribution (plus its context tier slice when `tier_level > 0`) directly in integer space.
+    pub(crate) fn add_contribution(&mut self, tokens: UsageTokenContribution, tier_level: usize) {
+        self.input_tokens += tokens.input_tokens;
+        self.output_tokens += tokens.output_tokens;
+        self.reasoning_tokens += tokens.reasoning_tokens;
+        self.cache_read += tokens.cache_read_tokens;
+        self.cache_creation_5m += tokens.cache_creation_tokens;
+        self.total += tokens.input_tokens
+            + tokens.output_tokens
+            + tokens.reasoning_tokens
+            + tokens.cache_read_tokens
+            + tokens.cache_creation_tokens;
+        if tier_level > 0 && tier_level <= MAX_TIER_LEVELS {
+            let slice = TierSlice {
+                input_tokens: tokens.input_tokens,
+                output_tokens: tokens.output_tokens,
+                reasoning_tokens: tokens.reasoning_tokens,
+                cache_read: tokens.cache_read_tokens,
+                cache_creation_5m: tokens.cache_creation_tokens,
+                cache_creation_1h: 0,
+            };
+            if !slice.is_empty() {
+                self.add_tier_slice(tier_level, &slice);
+            }
+        }
+    }
+
+    fn merge_tier_slices(&mut self, other: &[TierSlice]) {
+        if other.is_empty() {
+            return;
+        }
+        match self.above_tiers.as_deref_mut() {
+            Some(existing) if existing.len() >= other.len() => {
+                for (dst, src) in existing.iter_mut().zip(other) {
+                    dst.merge(src);
+                }
+            }
+            Some(existing) => {
+                let mut merged = Vec::with_capacity(other.len());
+                merged.extend_from_slice(existing);
+                merged.resize(other.len(), TierSlice::default());
+                for (dst, src) in merged.iter_mut().zip(other) {
+                    dst.merge(src);
+                }
+                self.above_tiers = compact_tier_slices(merged);
+            }
+            None => {
+                self.above_tiers = Some(other.to_vec().into_boxed_slice());
+            }
+        }
+    }
+
+    fn add_tier_slice(&mut self, level: usize, slice: &TierSlice) {
+        let index = level - 1;
+        match self.above_tiers.as_deref_mut() {
+            Some(existing) if index < existing.len() => {
+                existing[index].merge(slice);
+            }
+            Some(existing) => {
+                let mut merged = Vec::with_capacity(level);
+                merged.extend_from_slice(existing);
+                merged.resize(level, TierSlice::default());
+                merged[index].merge(slice);
+                self.above_tiers = Some(merged.into_boxed_slice());
+            }
+            None => {
+                let mut slices = vec![TierSlice::default(); level];
+                slices[index] = *slice;
+                self.above_tiers = Some(slices.into_boxed_slice());
+            }
+        }
+    }
+}
+
+fn compact_tier_slices(mut slices: Vec<TierSlice>) -> Option<Box<[TierSlice]>> {
+    while slices.last().is_some_and(TierSlice::is_empty) {
+        slices.pop();
+    }
+    if slices.is_empty() {
+        None
+    } else {
+        Some(slices.into_boxed_slice())
+    }
+}
+
+struct CacheCreationSplit {
+    ephemeral_5m: i64,
+    ephemeral_1h: i64,
+}
+
+impl Serialize for CacheCreationSplit {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("ephemeral_5m_input_tokens", &self.ephemeral_5m)?;
+        map.serialize_entry("ephemeral_1h_input_tokens", &self.ephemeral_1h)?;
+        map.end()
+    }
+}
+
+struct ServerToolUse {
+    web_search_requests: i64,
+}
+
+impl Serialize for ServerToolUse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("web_search_requests", &self.web_search_requests)?;
+        map.end()
+    }
+}
+
+struct SerializeAboveTiers<'a>(&'a [TierSlice]);
+
+impl Serialize for SerializeAboveTiers<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (index, slice) in self.0.iter().enumerate() {
+            let level = index + 1;
+            for (bucket, value) in [
+                ("input_tokens", slice.input_tokens),
+                ("output_tokens", slice.output_tokens),
+                ("reasoning_tokens", slice.reasoning_tokens),
+                ("cache_read_tokens", slice.cache_read),
+                ("cache_creation_5m_tokens", slice.cache_creation_5m),
+                ("cache_creation_1h_tokens", slice.cache_creation_1h),
+            ] {
+                if value != 0 {
+                    map.serialize_entry(&TierKey(level, bucket), &value)?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+/// Zero-allocation serializer for `level_<n>_<bucket>` map keys.
+struct TierKey(usize, &'static str);
+
+impl Serialize for TierKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("level_{}_{}", self.0, self.1))
+    }
+}
+
+impl Serialize for CompactUsage {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let cache_creation = self.cache_creation();
+        let has_above_tiers = self
+            .above_tiers
+            .as_deref()
+            .is_some_and(|slices| slices.iter().any(|slice| !slice.is_empty()));
+        let mut map = serializer.serialize_map(None)?;
+        // Always emit `input_tokens` so older v1 builds recognize this object as the flat usage shape in `merge_usage_values`.
+        map.serialize_entry("input_tokens", &self.input_tokens)?;
+        if self.output_tokens != 0 {
+            map.serialize_entry("output_tokens", &self.output_tokens)?;
+        }
+        if self.reasoning_tokens != 0 {
+            map.serialize_entry("reasoning_output_tokens", &self.reasoning_tokens)?;
+        }
+        if self.cache_read != 0 {
+            map.serialize_entry("cache_read_input_tokens", &self.cache_read)?;
+        }
+        if cache_creation != 0 {
+            map.serialize_entry("cache_creation_input_tokens", &cache_creation)?;
+        }
+        if self.cache_creation_1h != 0 {
+            map.serialize_entry(
+                "cache_creation",
+                &CacheCreationSplit {
+                    ephemeral_5m: self.cache_creation_5m,
+                    ephemeral_1h: self.cache_creation_1h,
+                },
+            )?;
+        }
+        if self.web_search_requests != 0 {
+            map.serialize_entry(
+                "server_tool_use",
+                &ServerToolUse {
+                    web_search_requests: self.web_search_requests,
+                },
+            )?;
+        }
+        if self.tool_tokens != 0 {
+            map.serialize_entry("tool_tokens", &self.tool_tokens)?;
+        }
+        if self.total != 0 {
+            map.serialize_entry("total_tokens", &self.total)?;
+        }
+        if has_above_tiers && let Some(slices) = self.above_tiers.as_deref() {
+            map.serialize_entry("above_tier", &SerializeAboveTiers(slices))?;
+        }
+        map.end()
+    }
+}
+
+/// Borrowed-when-possible JSON object key avoiding heap allocation on `from_slice`.
+struct StrKey<'de>(Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for StrKey<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = StrKey<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object key")
+            }
+
+            fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(StrKey(Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(StrKey(Cow::Owned(value.to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(StrKey(Cow::Owned(value)))
+            }
+        }
+
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
+
+/// Tolerant integer decoder matching `Value::as_i64` (non-integer JSON values decode as `None`).
+struct LenientI64(Option<i64>);
+
+impl<'de> Deserialize<'de> for LenientI64 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LenientI64Visitor;
+
+        impl<'de> Visitor<'de> for LenientI64Visitor {
+            type Value = LenientI64;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("any JSON value")
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(LenientI64(Some(value)))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(LenientI64(i64::try_from(value).ok()))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(LenientI64(None))
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(LenientI64(None))
+            }
+
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(LenientI64(None))
+            }
+
+            fn visit_bytes<E: de::Error>(self, _: &[u8]) -> Result<Self::Value, E> {
+                Ok(LenientI64(None))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientI64(None))
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientI64(None))
+            }
+
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                LenientI64::deserialize(d)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(LenientI64(None))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(LenientI64(None))
+            }
+        }
+
+        deserializer.deserialize_any(LenientI64Visitor)
+    }
+}
+
+struct LenientCacheCreation(Option<(i64, i64)>);
+
+impl<'de> Deserialize<'de> for LenientCacheCreation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SplitVisitor;
+
+        impl<'de> Visitor<'de> for SplitVisitor {
+            type Value = LenientCacheCreation;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a cache_creation object or non-object value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut ephemeral_5m = 0i64;
+                let mut ephemeral_1h = 0i64;
+                while let Some(StrKey(key)) = map.next_key()? {
+                    match key.as_ref() {
+                        "ephemeral_5m_input_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                ephemeral_5m = v;
+                            }
+                        }
+                        "ephemeral_1h_input_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                ephemeral_1h = v;
+                            }
+                        }
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(LenientCacheCreation(Some((ephemeral_5m, ephemeral_1h))))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(LenientCacheCreation(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(LenientCacheCreation(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(LenientCacheCreation(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(LenientCacheCreation(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(LenientCacheCreation(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientCacheCreation(None))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientCacheCreation(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(LenientCacheCreation(None))
+            }
+        }
+
+        deserializer.deserialize_any(SplitVisitor)
+    }
+}
+
+struct LenientServerToolUse(i64);
+
+impl<'de> Deserialize<'de> for LenientServerToolUse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StuVisitor;
+
+        impl<'de> Visitor<'de> for StuVisitor {
+            type Value = LenientServerToolUse;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a server_tool_use object or non-object value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut web_search_requests = 0i64;
+                while let Some(StrKey(key)) = map.next_key()? {
+                    if key.as_ref() == "web_search_requests" {
+                        if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                            web_search_requests = v;
+                        }
+                    } else {
+                        let _: IgnoredAny = map.next_value()?;
+                    }
+                }
+                Ok(LenientServerToolUse(web_search_requests))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(LenientServerToolUse(0))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(LenientServerToolUse(0))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(LenientServerToolUse(0))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(LenientServerToolUse(0))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(LenientServerToolUse(0))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientServerToolUse(0))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientServerToolUse(0))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(LenientServerToolUse(0))
+            }
+        }
+
+        deserializer.deserialize_any(StuVisitor)
+    }
+}
+
+struct LenientAboveTier(Vec<TierSlice>);
+
+impl<'de> Deserialize<'de> for LenientAboveTier {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AboveVisitor;
+
+        impl<'de> Visitor<'de> for AboveVisitor {
+            type Value = LenientAboveTier;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an above_tier object or non-object value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut slices = Vec::new();
+                while let Some(StrKey(key)) = map.next_key()? {
+                    let Some(tokens) = map.next_value::<LenientI64>()?.0 else {
+                        continue;
+                    };
+                    let Some(rest) = key.strip_prefix("level_") else {
+                        continue;
+                    };
+                    let Some(sep) = rest.find('_') else {
+                        continue;
+                    };
+                    let Ok(level) = rest[..sep].parse::<usize>() else {
+                        continue;
+                    };
+                    if level == 0 || level > MAX_TIER_LEVELS {
+                        continue;
+                    }
+                    let bucket: fn(&mut TierSlice) -> &mut i64 = match &rest[sep + 1..] {
+                        "input_tokens" => |s| &mut s.input_tokens,
+                        "output_tokens" => |s| &mut s.output_tokens,
+                        "reasoning_tokens" => |s| &mut s.reasoning_tokens,
+                        "cache_read_tokens" => |s| &mut s.cache_read,
+                        "cache_creation_5m_tokens" => |s| &mut s.cache_creation_5m,
+                        "cache_creation_1h_tokens" => |s| &mut s.cache_creation_1h,
+                        _ => continue,
+                    };
+                    if slices.len() < level {
+                        slices.resize(level, TierSlice::default());
+                    }
+                    *bucket(&mut slices[level - 1]) = tokens;
+                }
+                Ok(LenientAboveTier(slices))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(LenientAboveTier(Vec::new()))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(LenientAboveTier(Vec::new()))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(LenientAboveTier(Vec::new()))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(LenientAboveTier(Vec::new()))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(LenientAboveTier(Vec::new()))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientAboveTier(Vec::new()))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientAboveTier(Vec::new()))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(LenientAboveTier(Vec::new()))
+            }
+        }
+
+        deserializer.deserialize_any(AboveVisitor)
+    }
+}
+
+#[derive(Default)]
+struct CodexRawTotal {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
+    output_tokens: Option<i64>,
+    reasoning_output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+}
+
+struct LenientCodexTotal(Option<CodexRawTotal>);
+
+impl<'de> Deserialize<'de> for LenientCodexTotal {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CodexVisitor;
+
+        impl<'de> Visitor<'de> for CodexVisitor {
+            type Value = LenientCodexTotal;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a total_token_usage object or non-object value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut raw = CodexRawTotal::default();
+                while let Some(StrKey(key)) = map.next_key()? {
+                    match key.as_ref() {
+                        "input_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                raw.input_tokens = v;
+                            }
+                        }
+                        "cached_input_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                raw.cached_input_tokens = v;
+                            }
+                        }
+                        "cache_write_input_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                raw.cache_write_input_tokens = v;
+                            }
+                        }
+                        "output_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                raw.output_tokens = Some(v);
+                            }
+                        }
+                        "reasoning_output_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                raw.reasoning_output_tokens = Some(v);
+                            }
+                        }
+                        "total_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                raw.total_tokens = Some(v);
+                            }
+                        }
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(LenientCodexTotal(Some(raw)))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(LenientCodexTotal(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(LenientCodexTotal(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(LenientCodexTotal(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(LenientCodexTotal(None))
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(LenientCodexTotal(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientCodexTotal(None))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(LenientCodexTotal(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(LenientCodexTotal(None))
+            }
+        }
+
+        deserializer.deserialize_any(CodexVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactUsage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct UsageVisitor;
+
+        impl<'de> Visitor<'de> for UsageVisitor {
+            type Value = CompactUsage;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a usage JSON object")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(CompactUsage::default())
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(CompactUsage::default())
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut flat_input = 0i64;
+                let mut flat_output = 0i64;
+                let mut flat_cache_read = 0i64;
+                let mut flat_cache_creation = 0i64;
+                let mut thoughts = 0i64;
+                let mut reasoning_output = 0i64;
+                let mut tool_tokens = 0i64;
+                let mut published_total: Option<i64> = None;
+                let mut web_search_requests = 0i64;
+                let mut cc_split: Option<(i64, i64)> = None;
+                let mut above_tiers: Vec<TierSlice> = Vec::new();
+                let mut codex: Option<CodexRawTotal> = None;
+
+                while let Some(StrKey(key)) = map.next_key()? {
+                    match key.as_ref() {
+                        "input_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                flat_input = v;
+                            }
+                        }
+                        "output_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                flat_output = v;
+                            }
+                        }
+                        "cache_read_input_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                flat_cache_read = v;
+                            }
+                        }
+                        "cache_creation_input_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                flat_cache_creation = v;
+                            }
+                        }
+                        "thoughts_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                thoughts = v;
+                            }
+                        }
+                        "reasoning_output_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                reasoning_output = v;
+                            }
+                        }
+                        "tool_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                tool_tokens = v;
+                            }
+                        }
+                        "total_tokens" => {
+                            if let Some(v) = map.next_value::<LenientI64>()?.0 {
+                                published_total = Some(v);
+                            }
+                        }
+                        "cache_creation" => {
+                            cc_split = map.next_value::<LenientCacheCreation>()?.0;
+                        }
+                        "server_tool_use" => {
+                            web_search_requests = map.next_value::<LenientServerToolUse>()?.0;
+                        }
+                        "above_tier" => {
+                            above_tiers = map.next_value::<LenientAboveTier>()?.0;
+                        }
+                        "total_token_usage" => {
+                            codex = map.next_value::<LenientCodexTotal>()?.0;
+                        }
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                // Match `extract_token_counts` field normalization exactly across flat and Codex shapes.
+                let mut input_tokens = flat_input;
+                let mut output_tokens = flat_output;
+                let mut reasoning_tokens = thoughts + reasoning_output;
+                let mut cache_read = flat_cache_read;
+                let (mut cache_creation_5m, mut cache_creation_1h) = match cc_split {
+                    Some((ephemeral_5m, cc_1h)) => {
+                        let total_cc = flat_cache_creation.max(ephemeral_5m + cc_1h);
+                        (total_cc - cc_1h, cc_1h)
+                    }
+                    None => (flat_cache_creation, 0),
+                };
+
+                if let Some(c) = codex {
+                    input_tokens =
+                        (c.input_tokens - c.cached_input_tokens - c.cache_write_input_tokens)
+                            .max(0);
+                    cache_read = c.cached_input_tokens;
+                    cache_creation_5m = c.cache_write_input_tokens;
+                    cache_creation_1h = 0;
+                    if let Some(out) = c.output_tokens {
+                        output_tokens = out;
+                    }
+                    if let Some(reas) = c.reasoning_output_tokens {
+                        reasoning_tokens = reas;
+                    }
+                    output_tokens = (output_tokens - reasoning_tokens).max(0);
+                    if let Some(codex_total) = c.total_tokens {
+                        return Ok(CompactUsage {
+                            input_tokens,
+                            output_tokens,
+                            reasoning_tokens,
+                            cache_read,
+                            cache_creation_5m,
+                            cache_creation_1h,
+                            web_search_requests,
+                            tool_tokens: 0,
+                            total: codex_total,
+                            above_tiers: compact_tier_slices(above_tiers),
+                        });
+                    }
+                }
+
+                let derived_total = input_tokens
+                    + output_tokens
+                    + reasoning_tokens
+                    + cache_read
+                    + cache_creation_5m
+                    + cache_creation_1h
+                    + tool_tokens;
+                let total = published_total.map_or(derived_total, |p| p.max(derived_total));
+
+                Ok(CompactUsage {
+                    input_tokens,
+                    output_tokens,
+                    reasoning_tokens,
+                    cache_read,
+                    cache_creation_5m,
+                    cache_creation_1h,
+                    web_search_requests,
+                    tool_tokens,
+                    total,
+                    above_tiers: compact_tier_slices(above_tiers),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(UsageVisitor)
+    }
+}
+
 /// What one session did on one local day.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct DayEntry {
-    /// Per-model token buckets in the provider's raw key shape, stored as raw JSON text to keep the in-memory ledger compact.
+    /// Per-model normalized token counters stored inline to avoid per-entry heap allocations and fold-time JSON parsing.
     #[serde(default, skip_serializing_if = "TinyMap::is_empty")]
-    pub(crate) usage: TinyMap<String, Box<RawValue>>,
+    pub(crate) usage: TinyMap<String, CompactUsage>,
     /// Per-model file-operation and tool-call counters.
     #[serde(default, skip_serializing_if = "TinyMap::is_empty")]
     pub(crate) analysis: TinyMap<String, AggregatedAnalysisRow>,
@@ -272,16 +1130,12 @@ pub(crate) struct ActiveFlags {
 }
 
 impl DayEntry {
-    /// Parses a stored raw usage entry back into a [`Value`], returning [`Value::Null`] on malformed JSON.
-    pub(crate) fn usage_value(raw: &RawValue) -> Value {
-        serde_json::from_str(raw.get()).unwrap_or(Value::Null)
-    }
-
     /// Folds a parsed file session into both halves; every non-`<synthetic>` model in `conversation_usage` receives the record's tool counters, while `advisor_usage` contributes tokens only.
     pub(crate) fn add_file_records(&mut self, analysis: CodeAnalysis, emit: bool) {
         for record in analysis.records {
             for (model, usage) in record.conversation_usage {
-                if meaningful_usage(&usage) {
+                let compact = CompactUsage::from_value(&usage);
+                if compact.has_activity() {
                     self.active.usage = true;
                 }
                 if emit && !model.contains("<synthetic>") {
@@ -298,13 +1152,14 @@ impl DayEntry {
                     row.todo_write_count += record.tool_call_counts.todo_write;
                     row.write_count += record.tool_call_counts.write;
                 }
-                merge_model_usage(&mut self.usage, model, usage);
+                merge_model_usage(&mut self.usage, model, compact);
             }
             for (model, usage) in record.advisor_usage {
-                if meaningful_usage(&usage) {
+                let compact = CompactUsage::from_value(&usage);
+                if compact.has_activity() {
                     self.active.usage = true;
                 }
-                merge_model_usage(&mut self.usage, model, usage);
+                merge_model_usage(&mut self.usage, model, compact);
             }
         }
         if emit {
@@ -324,9 +1179,19 @@ impl DayEntry {
             self.active.usage = true;
         }
         if let Some(cost) = stored_cost {
-            *self.stored_cost.entry(model.clone()).or_insert(0.0) += cost;
+            if let Some(existing) = self.stored_cost.get_mut(&model) {
+                *existing += cost;
+            } else {
+                self.stored_cost.insert(model.clone(), cost);
+            }
         }
-        merge_model_usage(&mut self.usage, model, tokens.into_value(tier_level));
+        if let Some(existing) = self.usage.get_mut(&model) {
+            existing.add_contribution(tokens, tier_level);
+        } else {
+            let mut usage = CompactUsage::default();
+            usage.add_contribution(tokens, tier_level);
+            self.usage.insert(model, usage);
+        }
     }
 
     /// Folds one database analysis row into the analysis half.
@@ -336,10 +1201,13 @@ impl DayEntry {
                 if model.contains("<synthetic>") {
                     continue;
                 }
-                let row = self
-                    .analysis
-                    .entry(model.clone())
-                    .or_insert_with(|| empty_row(model));
+                let row = if let Some(existing) = self.analysis.get_mut(model) {
+                    existing
+                } else {
+                    self.analysis
+                        .entry(model.clone())
+                        .or_insert_with(|| empty_row(model))
+                };
                 row.edit_lines += record.total_edit_lines;
                 row.read_lines += record.total_read_lines;
                 row.write_lines += record.total_write_lines;
@@ -396,23 +1264,16 @@ fn empty_row(model: &str) -> AggregatedAnalysisRow {
     }
 }
 
-fn merge_model_usage(target: &mut TinyMap<String, Box<RawValue>>, model: String, usage: Value) {
-    let merged = match target.get(&model) {
-        Some(existing) => {
-            let mut value = DayEntry::usage_value(existing);
-            merge_usage_values(&mut value, &usage);
-            value
-        }
-        None => usage,
-    };
-    target.insert(
-        model,
-        to_raw_value(&merged).expect("a JSON value always serializes"),
-    );
-}
-
-fn meaningful_usage(value: &Value) -> bool {
-    extract_token_counts(value).has_activity()
+fn merge_model_usage(
+    target: &mut TinyMap<String, CompactUsage>,
+    model: String,
+    usage: CompactUsage,
+) {
+    if let Some(existing) = target.get_mut(&model) {
+        existing.add_assign(&usage);
+    } else {
+        target.insert(model, usage);
+    }
 }
 
 /// Merges per-model counters into a model-keyed accumulator.
@@ -421,9 +1282,12 @@ pub(crate) fn merge_analysis_rows(
     source: &TinyMap<String, AggregatedAnalysisRow>,
 ) {
     for (model, row) in source {
-        let entry = target
-            .entry(model.clone())
-            .or_insert_with(|| empty_row(model));
+        let entry = match target.get_mut(model) {
+            Some(existing) => existing,
+            None => target
+                .entry(model.clone())
+                .or_insert_with(|| empty_row(model)),
+        };
         entry.edit_lines += row.edit_lines;
         entry.read_lines += row.read_lines;
         entry.write_lines += row.write_lines;
@@ -556,7 +1420,7 @@ mod tests {
         day.add_usage_row("model".to_string(), tokens(400_000), 2, Some(0.0));
         day.add_usage_row("model".to_string(), tokens(1_000), 0, Some(0.0));
 
-        let counts = extract_token_counts(&DayEntry::usage_value(&day.usage["model"]));
+        let counts = day.usage["model"].to_token_counts();
         assert_eq!(counts.input_tokens, 701_000);
         assert_eq!(counts.above_tiers[0].input_tokens, 300_000);
         assert_eq!(counts.above_tiers[1].input_tokens, 400_000);
@@ -624,12 +1488,102 @@ mod tests {
         );
         assert!(old.active.analysis, "the other half stays");
         assert_eq!(
-            extract_token_counts(&DayEntry::usage_value(
-                &entry.days["2026-09-02"].usage["model"]
-            ))
-            .input_tokens,
+            entry.days["2026-09-02"].usage["model"].input_tokens,
             3_000
         );
+    }
+
+    #[test]
+    fn compact_usage_stays_inline_and_small() {
+        assert!(std::mem::size_of::<CompactUsage>() <= 96);
+    }
+
+    #[test]
+    fn compact_usage_deserializes_legacy_v1_shapes_and_round_trips_for_v1_readers() {
+        use crate::utils::merge_usage_values;
+
+        let samples = [
+            // Claude with 5m+1h cache split, server_tool_use, service_tier, and above_tier
+            json!({
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "cache_read_input_tokens": 10_000,
+                "cache_creation_input_tokens": 1_500,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 500,
+                    "ephemeral_1h_input_tokens": 1_000
+                },
+                "server_tool_use": {
+                    "web_search_requests": 3,
+                    "web_fetch_requests": 2
+                },
+                "service_tier": "standard",
+                "above_tier": {
+                    "level_1_input_tokens": 100,
+                    "level_1_cache_read_tokens": 9_000,
+                    "level_2_cache_creation_1h_tokens": 1_000
+                }
+            }),
+            // Codex nested total_token_usage with cache_write_input_tokens + above_tier
+            json!({
+                "total_token_usage": {
+                    "input_tokens": 100_000,
+                    "cached_input_tokens": 60_000,
+                    "cache_write_input_tokens": 30_000,
+                    "output_tokens": 2_000,
+                    "reasoning_output_tokens": 500,
+                    "total_tokens": 102_000
+                },
+                "last_token_usage": { "input_tokens": 5 },
+                "model_context_window": null,
+                "above_tier": {
+                    "level_1_input_tokens": 10_000,
+                    "level_1_cache_creation_5m_tokens": 30_000
+                }
+            }),
+            // Gemini thoughts_tokens + tool_tokens + published total_tokens
+            json!({
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 50,
+                "thoughts_tokens": 30,
+                "tool_tokens": 7,
+                "total_tokens": 250
+            }),
+            // Zero-token / null-valued fields
+            json!({
+                "input_tokens": 0,
+                "output_tokens": null,
+                "cache_creation": null,
+                "above_tier": { "level_0_input_tokens": 9, "level_1_unknown": 5 }
+            }),
+        ];
+
+        for sample in samples {
+            let expected = CompactUsage::from_value(&sample);
+            let raw = serde_json::to_vec(&sample).unwrap();
+            let decoded: CompactUsage = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(decoded, expected, "stream decode mismatch for {sample}");
+
+            let compact_json = serde_json::to_string(&decoded).unwrap();
+            let reparsed: CompactUsage = serde_json::from_str(&compact_json).unwrap();
+            assert_eq!(reparsed, expected, "compact round-trip mismatch for {sample}");
+
+            // Older v1 builds parse the serialized JSON via `extract_token_counts` and `merge_usage_values`.
+            let v1_value: Value = serde_json::from_str(&compact_json).unwrap();
+            assert!(
+                v1_value.get("input_tokens").is_some(),
+                "older v1 merge_usage_values requires input_tokens key"
+            );
+            assert_eq!(CompactUsage::from_value(&v1_value), expected);
+
+            // Simulate merging two compact entries in an older v1 build.
+            let mut merged_v1 = v1_value.clone();
+            merge_usage_values(&mut merged_v1, &v1_value);
+            let mut doubled = expected.clone();
+            doubled.add_assign(&expected);
+            assert_eq!(CompactUsage::from_value(&merged_v1), doubled);
+        }
     }
 
     #[test]
