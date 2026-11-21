@@ -195,20 +195,9 @@ fn agy_install_paths(os: &str, home: &Path, local_appdata: &Path) -> Vec<AgyBina
         path,
         own_sign_in: false,
     };
-    let own_sign_in = |path: &str| AgyBinary {
-        path: PathBuf::from(path),
-        own_sign_in: true,
-    };
     match os {
         "windows" => vec![agy(local_appdata.join("agy").join("bin").join("agy.exe"))],
-        "macos" => vec![
-            agy(home.join(".local").join("bin").join("agy")),
-            own_sign_in("/usr/local/bin/jetski"),
-        ],
-        _ => vec![
-            agy(home.join(".local").join("bin").join("agy")),
-            own_sign_in("/google/bin/releases/jetski-devs/tools/cli"),
-        ],
+        _ => vec![agy(home.join(".local").join("bin").join("agy"))],
     }
 }
 
@@ -984,20 +973,11 @@ mod tests {
         };
         assert_eq!(
             paths("linux"),
-            [
-                (home.join(".local").join("bin").join("agy"), false),
-                (
-                    PathBuf::from("/google/bin/releases/jetski-devs/tools/cli"),
-                    true
-                ),
-            ]
+            [(home.join(".local").join("bin").join("agy"), false)]
         );
         assert_eq!(
             paths("macos"),
-            [
-                (home.join(".local").join("bin").join("agy"), false),
-                (PathBuf::from("/usr/local/bin/jetski"), true),
-            ]
+            [(home.join(".local").join("bin").join("agy"), false)]
         );
         assert_eq!(
             paths("windows"),

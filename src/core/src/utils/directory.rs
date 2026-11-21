@@ -967,7 +967,7 @@ mod tests {
     fn test_collect_provider_files_keeps_same_named_files_across_roots_by_relative_path() {
         // Every Antigravity transcript shares the same file name; only the same conversation directory across roots is one session.
         let dir = tempdir().unwrap();
-        let roots = [dir.path().join("cli"), dir.path().join("jetski")];
+        let roots = [dir.path().join("cli"), dir.path().join("custom-build")];
         for (root, conversation) in [(0, "a"), (1, "b"), (1, "a")] {
             let logs = roots[root]
                 .join(conversation)
