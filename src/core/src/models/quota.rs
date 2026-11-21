@@ -818,55 +818,44 @@ impl fmt::Debug for GrokRefreshResponse {
     }
 }
 
-// ---- Antigravity (`agy -p '/usage' --output-format json`) ----
+// ---- Antigravity (Local Language Server Connect-RPC + direct CCPA) ----
 
-/// What `agy -p '/usage' --output-format json` prints (subset we read).
+/// Response from `POST .../exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgyPrintResponse {
-    /// `SUCCESS`, or `ERROR` with [`Self::error`] saying why.
+pub struct AntigravityLsQuotaResponse {
+    /// Wrapped quota summary payload.
     #[serde(default)]
-    pub status: Option<String>,
-    /// The failure message on an `ERROR` run.
-    #[serde(default)]
-    pub error: Option<String>,
-    /// The slash command's own result.
-    #[serde(default)]
-    pub command: Option<AgyCommand>,
+    pub response: Option<AntigravityQuotaSummary>,
 }
 
-/// The `command` object of an agy print-mode result.
+/// Quota summary payload shared by the local Language Server and `v1internal:retrieveUserQuotaSummary`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgyCommand {
-    /// The `/usage` payload.
-    #[serde(default)]
-    pub data: Option<AgyUsageData>,
-}
-
-/// The `command.data` object of a `/usage` run.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AgyUsageData {
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityQuotaSummary {
     /// One entry per shared model pool, e.g. "Gemini Models".
     #[serde(default)]
-    pub groups: Vec<AgyUsageGroup>,
+    pub groups: Vec<AntigravityQuotaGroup>,
 }
 
-/// One shared model pool of a `/usage` run.
+/// One shared model pool in an Antigravity quota summary.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgyUsageGroup {
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityQuotaGroup {
     /// Pool name, e.g. "Gemini Models" / "Claude and GPT models".
     #[serde(default)]
-    pub name: Option<String>,
-    /// The pool's limits.
+    pub display_name: Option<String>,
+    /// The pool's limits; informational groups omit this field or leave it empty.
     #[serde(default)]
-    pub buckets: Vec<AgyUsageBucket>,
+    pub buckets: Vec<AntigravityQuotaBucket>,
 }
 
-/// One limit of a `/usage` pool.
+/// One limit bucket in an Antigravity quota pool.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgyUsageBucket {
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityQuotaBucket {
     /// Display name, e.g. "Weekly Limit Remaining".
     #[serde(default)]
-    pub name: Option<String>,
+    pub display_name: Option<String>,
     /// Window code, e.g. `weekly` / `5h`.
     #[serde(default)]
     pub window: Option<String>,
@@ -984,18 +973,15 @@ pub struct AntigravityQuotaSnapshot {
     pub source: QuotaSource,
     /// Unix seconds when this snapshot was produced.
     pub fetched_at: i64,
-    /// One gauge per `/usage` limit, in the order agy lists them.
+    /// One gauge per quota limit, in response order.
     #[serde(default)]
     pub buckets: Vec<AntigravityBucket>,
     /// Whether any limit is spent (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
-    /// Whether `agy` has no stored sign-in or failed to sign in.
+    /// Whether Antigravity credentials are missing, expired, or rejected.
     #[serde(default)]
     pub needs_login: bool,
-    /// Modification time of `agy`'s sign-in store when sign-in last failed; persisted so retries pause until a re-login updates the timestamp.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signed_out_mtime: Option<std::time::SystemTime>,
 }
 
 /// One Antigravity limit, normalized.
@@ -1003,7 +989,7 @@ pub struct AntigravityQuotaSnapshot {
 pub struct AntigravityBucket {
     /// The model pool it belongs to, e.g. "Gemini Models".
     pub group: String,
-    /// Its window as agy names it, e.g. `weekly` / `5h`.
+    /// Its window label, e.g. `weekly` / `5h`.
     pub window: String,
     /// Percent consumed and reset time.
     pub usage: QuotaWindow,

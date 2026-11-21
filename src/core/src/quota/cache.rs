@@ -48,7 +48,7 @@ impl CachedQuota for GrokQuotaSnapshot {
 }
 
 impl CachedQuota for AntigravityQuotaSnapshot {
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
     const PROVIDER: &'static str = "antigravity";
 }
 
@@ -169,6 +169,13 @@ pub fn load_antigravity_cache() -> Option<AntigravityQuotaSnapshot> {
     load_cache(cache_path::<AntigravityQuotaSnapshot>())
 }
 
+/// Returns the cached Antigravity quota snapshot from `path` without touching `$HOME` or creating directories.
+pub(crate) fn load_antigravity_cache_from(
+    path: &std::path::Path,
+) -> Option<AntigravityQuotaSnapshot> {
+    load_cache(Ok(path.to_path_buf()))
+}
+
 /// Persists the Antigravity quota snapshot atomically.
 pub fn save_antigravity_cache(snap: &AntigravityQuotaSnapshot) -> Result<()> {
     save_cache(cache_path::<AntigravityQuotaSnapshot>(), snap)
@@ -275,6 +282,15 @@ mod tests {
         assert_eq!(grok.fetched_at, 44);
         assert_eq!(grok.period_label.as_deref(), Some("week"));
         assert_eq!(grok.prepaid_balance_dollars, Some(7.5));
+
+        let antigravity = round_trip(&AntigravityQuotaSnapshot {
+            fetched_at: 55,
+            limit_reached: true,
+            ..Default::default()
+        })
+        .expect("antigravity cache");
+        assert_eq!(antigravity.fetched_at, 55);
+        assert!(antigravity.limit_reached);
     }
 
     /// The stamp is the writing type's own version, under a nested `snapshot`.
