@@ -10,11 +10,11 @@ use crate::utils::TokenCounts;
 pub enum CostSource {
     /// Prices tokens via the full [`ModelPricingMap::get`] lookup chain (exact, normalized, substring, fuzzy).
     Litellm,
-    /// Prices tokens on an exact LiteLLM key match; otherwise returns the stored OpenCode cost verbatim.
+    /// Prices tokens on an exact or official normalized LiteLLM match; otherwise returns the stored OpenCode cost verbatim.
     OpenCodeStored(f64),
     /// Prices tokens on an exact LiteLLM key match; otherwise returns `0.0`.
     CursorEstimate,
-    /// Prices tokens on an exact LiteLLM key match; otherwise returns the stored Hermes cost verbatim.
+    /// Prices tokens on an exact or official normalized LiteLLM match; otherwise returns the stored Hermes cost verbatim.
     HermesStored(f64),
     /// Prices via [`ModelPricingMap::get`], falling back to `input_cost_per_token` when the matched entry has no cache-read price.
     GrokGauge,
@@ -22,7 +22,7 @@ pub enum CostSource {
 
 /// Returns `(cost_usd, matched_model)` for `model` and `counts` under `source`.
 ///
-/// Token costs are computed with [`calculate_cost`] plus per-query `web_search_requests` charges. `matched_model` is `Some` only when [`ModelPricingMap::get`] resolved via a non-exact LiteLLM key.
+/// Token costs are computed with [`calculate_cost`] plus per-query `web_search_requests` charges. `matched_model` is `Some` only when LiteLLM lookup resolved via a non-exact key.
 pub fn resolve_model_cost(
     model: &str,
     counts: &TokenCounts,
@@ -34,14 +34,19 @@ pub fn resolve_model_cost(
         token_cost + counts.web_search_requests as f64 * pricing.web_search_cost_per_query
     };
 
-    let exact_or = |stored: f64| match pricing_map.get_exact_ref(model) {
-        Some(pricing) => (priced(pricing), None),
-        None => (stored, None),
-    };
-
     match source {
-        CostSource::CursorEstimate => exact_or(0.0),
-        CostSource::OpenCodeStored(stored) | CostSource::HermesStored(stored) => exact_or(stored),
+        CostSource::CursorEstimate => match pricing_map.get_exact_ref(model) {
+            Some(pricing) => (priced(pricing), None),
+            None => (0.0, None),
+        },
+        CostSource::OpenCodeStored(stored) | CostSource::HermesStored(stored) => {
+            match pricing_map.lookup_exact_or_official_ref(model) {
+                (Some(pricing), matched_model) => {
+                    (priced(pricing), matched_model.map(|key| key.to_string()))
+                }
+                (None, _) => (stored, None),
+            }
+        }
         CostSource::Litellm => {
             let (pricing, matched_model) = pricing_map.lookup_ref(model);
             let cost = pricing.map_or(0.0, priced);
@@ -120,21 +125,44 @@ mod tests {
     #[test]
     fn test_opencode_tier_slice_cannot_reach_the_stored_cost_branch() {
         clear_pricing_cache();
-        let map = map_with_gpt4();
-        // Tier snapshots normalize names while stored-cost lookups require an exact key; an inert tier slice must not affect the stored fallback.
+        let mut raw = HashMap::new();
+        raw.insert(
+            "kyma/gemini-3.1-pro".to_string(),
+            ModelPricing {
+                input_cost_per_token: 2.7e-6,
+                ..Default::default()
+            },
+        );
+        let map = ModelPricingMap::new(raw);
+        // Tier snapshots normalize all keys while stored-cost lookups reject rank-3 resellers; an inert tier slice must not affect the stored fallback.
         let mut counts = counts(1_000_000);
         counts.above_tiers = vec![TierSlice {
             input_tokens: 1_000_000,
             ..Default::default()
         }];
         let (cost, matched) = resolve_model_cost(
-            "openai/gpt-4",
+            "opencode/gemini-3.1-pro",
             &counts,
             &map,
             CostSource::OpenCodeStored(99.0),
         );
         assert_eq!(cost, 99.0);
         assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_opencode_and_hermes_official_normalized_match_computes_from_tokens() {
+        clear_pricing_cache();
+        let map = map_with_gpt4();
+        for source in [
+            CostSource::OpenCodeStored(0.0),
+            CostSource::HermesStored(99.0),
+        ] {
+            let (cost, matched) =
+                resolve_model_cost("openai/gpt-4", &counts(1_000_000), &map, source);
+            assert!((cost - 10.0).abs() < 1e-6);
+            assert_eq!(matched.as_deref(), Some("gpt-4"));
+        }
     }
 
     #[test]
