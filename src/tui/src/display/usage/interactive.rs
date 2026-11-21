@@ -3,9 +3,9 @@
 //! [`UsageScanner`] caches one LiteLLM pricing map per UTC day across scans. [`UsageUiState`] retains the rendered model rows and totals between frames so resizes repaint without re-scanning, and highlights rows whose token counts changed.
 
 use crate::display::common::table::{
-    ColumnSpec, DetailItem, DetailSection, TableChrome, aligned_cells, create_controls_with_status,
+    ColumnSpec, DetailItem, DetailSection, TableChrome, create_controls_with_status,
     create_provider_row, create_ratatui_table, fit_columns, frame_layout, render_detail_panel,
-    render_scrollable_table, render_too_small,
+    render_scrollable_table, render_too_small, repeated_bar,
 };
 use crate::display::common::theme::theme;
 use crate::display::common::tui::{
@@ -19,9 +19,9 @@ use crate::display::usage::averages::{
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, TestBackend},
-    layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::{Color as RatatuiColor, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell as RatatuiCell, Clear, Paragraph, Row as RatatuiRow,
     },
@@ -548,10 +548,13 @@ pub(crate) struct UsageUiState {
     scroll: ScrollState,
     merge_enabled: bool,
     sort: UsageSort,
+    rows_sort: Option<UsageSort>,
+    merged_rows_sort: Option<UsageSort>,
 }
 
 impl UsageUiState {
     pub(crate) fn new(merge_enabled: bool) -> Self {
+        let sort = UsageSort::default();
         Self {
             rows: Vec::new(),
             merged_rows: Vec::new(),
@@ -560,7 +563,9 @@ impl UsageUiState {
             update_tracker: UpdateTracker::new(MAX_TRACKED_ROWS, 1000),
             scroll: ScrollState::new(),
             merge_enabled,
-            sort: UsageSort::default(),
+            sort,
+            rows_sort: Some(sort),
+            merged_rows_sort: Some(sort),
         }
     }
 
@@ -576,37 +581,62 @@ impl UsageUiState {
             .map(|row| row.model.clone())
     }
 
+    /// Re-syncs the selection index against the active rows without touching highlight state.
+    fn sync_selection(&mut self, previous: Option<&str>) {
+        let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
+        self.scroll
+            .sync_by(previous, rows.iter().map(|row| row.model.as_str()));
+    }
+
+    /// Sorts only the active row slice if its sort order lags `self.sort`.
+    fn ensure_active_sorted(&mut self) {
+        if self.merge_enabled {
+            if self.merged_rows_sort != Some(self.sort) {
+                self.sort.apply(&mut self.merged_rows);
+                self.merged_rows_sort = Some(self.sort);
+            }
+        } else if self.rows_sort != Some(self.sort) {
+            self.sort.apply(&mut self.rows);
+            self.rows_sort = Some(self.sort);
+        }
+    }
+
     /// Re-syncs selection and highlight tracking to the active rows; flashes differences only when `changed` is `true`.
     fn resync(&mut self, previous: Option<String>, changed: bool) {
-        let fingerprints: Vec<_> = self
-            .view()
-            .iter()
-            .map(|row| (row.model.clone(), row_fingerprint(row)))
-            .collect();
-        let models: Vec<_> = fingerprints
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        self.scroll.sync(previous.as_deref(), &models);
-        self.update_tracker.cleanup(models);
-        for (model, fingerprint) in fingerprints {
+        let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
+        self.scroll
+            .sync_by(previous.as_deref(), rows.iter().map(|row| row.model.as_str()));
+        self.update_tracker
+            .cleanup_str(rows.iter().map(|row| row.model.as_str()));
+        let now = std::time::Instant::now();
+        for row in rows {
+            let fingerprint = row_fingerprint(row);
             if changed {
-                self.update_tracker.track_update(model, &fingerprint);
+                self.update_tracker
+                    .track_update_at(row.model.clone(), &fingerprint, now);
             } else {
-                self.update_tracker.prime(model, &fingerprint);
+                self.update_tracker.prime(row.model.clone(), &fingerprint);
             }
         }
     }
 
-    /// Replaces the cached scan data with `payload`, re-sorts, and flashes changed rows.
+    /// Replaces the cached scan data with `payload`, sorts the active list, and flashes changed rows.
     pub(crate) fn apply(&mut self, payload: UsageRefreshPayload) {
         let previous = self.selected_model();
         self.rows = payload.rows;
         self.merged_rows = payload.merged_rows;
         self.totals = payload.totals;
         self.provider_totals = payload.provider_totals;
-        self.sort.apply(&mut self.rows);
-        self.sort.apply(&mut self.merged_rows);
+        // Sort only the active list immediately and clear the inactive list's cached sort so toggling sorts it lazily.
+        if self.merge_enabled {
+            self.sort.apply(&mut self.merged_rows);
+            self.merged_rows_sort = Some(self.sort);
+            self.rows_sort = None;
+        } else {
+            self.sort.apply(&mut self.rows);
+            self.rows_sort = Some(self.sort);
+            self.merged_rows_sort = None;
+        }
         self.resync(previous, true);
     }
 
@@ -615,6 +645,7 @@ impl UsageUiState {
         if enabled != self.merge_enabled {
             let previous = self.selected_model();
             self.merge_enabled = enabled;
+            self.ensure_active_sorted();
             self.resync(previous, false);
         }
     }
@@ -624,19 +655,20 @@ impl UsageUiState {
         if sort != self.sort {
             let previous = self.selected_model();
             self.sort = sort;
-            self.sort.apply(&mut self.rows);
-            self.sort.apply(&mut self.merged_rows);
-            self.resync(previous, false);
+            self.ensure_active_sorted();
+            self.sync_selection(previous.as_deref());
         }
     }
 
     /// Moves the sort one column left or right (`←` / `→`).
     pub(crate) fn step_sort(&mut self, step: isize) {
-        let previous = self.selected_model();
-        self.sort = self.sort.step(step);
-        self.sort.apply(&mut self.rows);
-        self.sort.apply(&mut self.merged_rows);
-        self.resync(previous, false);
+        let next = self.sort.step(step);
+        self.set_sort(next);
+    }
+
+    /// Evicts expired row-change highlights as of `now`, returning `true` when any highlight cleared.
+    pub(crate) fn prune_expired(&mut self, now: std::time::Instant) -> bool {
+        self.update_tracker.prune_expired(now)
     }
 
     /// Moves the selection.
@@ -721,7 +753,7 @@ impl UsageUiState {
 /// Result of one [`UsageScanner::scan`] run.
 pub(crate) enum UsageScanOutcome {
     /// New or changed priced usage data to apply to the UI.
-    Updated(UsageRefreshPayload),
+    Updated(Box<UsageRefreshPayload>),
     /// Zero sources changed and every input affecting the priced summary matched the prior emission.
     Unchanged,
 }
@@ -802,6 +834,7 @@ impl UsageScanner {
                 return Err(error);
             }
         };
+        let pre_save_stats = ledger.stats();
         // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every refresh.
         if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
             log::warn!("failed to save the session ledger: {error:#}");
@@ -826,21 +859,23 @@ impl UsageScanner {
             );
         }
 
-        let stats = ledger.stats();
+        let post_save_stats = ledger.stats();
         let remote_after = remote_snapshot_stamps(&paths.cache_dir);
+        let snapshot_stable =
+            remote_before == remote_after && pre_save_stats.entries == post_save_stats.entries;
         let key = UsageSnapshotKey {
             time_range,
             providers,
             pricing_date: self.loaded_pricing_utc_date,
             local_date,
-            remote_stamps: remote_after,
-            total_parsed_sources: stats.total_parsed_sources,
-            ledger_entries: stats.entries,
-            retained: stats.retained,
+            remote_stamps: remote_before,
+            total_parsed_sources: pre_save_stats.total_parsed_sources,
+            ledger_entries: pre_save_stats.entries,
+            retained: pre_save_stats.retained,
             failure_count: collection.diagnostics.failures.len(),
         };
-        if stats.parsed_sources == 0
-            && remote_before == key.remote_stamps
+        if pre_save_stats.parsed_sources == 0
+            && snapshot_stable
             && self.last_emitted.as_ref() == Some(&key)
         {
             return Ok(UsageScanOutcome::Unchanged);
@@ -855,13 +890,14 @@ impl UsageScanner {
         );
         summary.rows.retain(|row| row.total != 0 || row.cost != 0.0);
         let merged_rows = merge_rows_by_base_model(&summary.rows);
-        self.last_emitted = Some(key);
-        Ok(UsageScanOutcome::Updated(UsageRefreshPayload {
+        // Never cache a key when remote snapshots or concurrent ledger saves shifted mid-scan.
+        self.last_emitted = snapshot_stable.then_some(key);
+        Ok(UsageScanOutcome::Updated(Box::new(UsageRefreshPayload {
             rows: summary.rows,
             merged_rows,
             totals: summary.totals,
             provider_totals: summary.provider_totals,
-        }))
+        })))
     }
 }
 
@@ -1001,6 +1037,39 @@ pub(crate) fn layout_usage_columns(inner: u16) -> UsageTableColumns {
     }
 }
 
+/// Formats one numeric usage column (`0..6`) for `row` without allocating dropped columns.
+pub(crate) fn format_usage_column(row: &UsageRow, col: usize) -> String {
+    match col {
+        0 => format_compact(row.input_tokens),
+        1 => format_compact(row.output_with_reasoning()),
+        2 => format_compact(row.cache_read),
+        3 => format_compact(row.cache_creation),
+        4 => format_compact(row.total),
+        5 => format_cost(row.cost),
+        _ => String::new(),
+    }
+}
+
+/// Builds the two-span share bar + percentage for `value / total` fitted to `width` columns, using static bar slices.
+pub(crate) fn share_spans(value: i64, total: i64, width: u16) -> Option<[Span<'static>; 2]> {
+    if total <= 0 || width < 6 {
+        return None;
+    }
+    let theme = theme();
+    let share = (value as f64 / total as f64).clamp(0.0, 1.0);
+    // Reserve 6 columns for "100.0%".
+    let bar_w = usize::from(width - 6);
+    let filled = ((share * bar_w as f64).round() as usize).min(bar_w);
+    let pad = bar_w - filled;
+    Some([
+        Span::styled(repeated_bar('━', filled), theme.accent()),
+        Span::styled(
+            format!("{}{:>5.1}%", repeated_bar(' ', pad), share * 100.0),
+            theme.dim(),
+        ),
+    ])
+}
+
 /// Builds one formatted model row for the usage table, prepending `prefix` to the model name.
 pub(crate) fn build_usage_table_row(
     row: &UsageRow,
@@ -1015,26 +1084,24 @@ pub(crate) fn build_usage_table_row(
     } else {
         Style::default()
     };
-    let all = [
-        format_compact(row.input_tokens),
-        format_compact(row.output_with_reasoning()),
-        format_compact(row.cache_read),
-        format_compact(row.cache_creation),
-        format_compact(row.total),
-        format_cost(row.cost),
-    ];
-    let mut cells = Vec::with_capacity(cols.header.len());
-    cells.push(format!("{prefix}{}", row.model));
-    cells.extend(cols.kept.iter().map(|&i| all[i].clone()));
-    let mut cells = aligned_cells(cells, 1);
+    let mut cells: Vec<RatatuiCell<'static>> = Vec::with_capacity(cols.header.len());
+    let model = if prefix.is_empty() {
+        row.model.clone()
+    } else {
+        format!("{prefix}{}", row.model)
+    };
+    cells.push(RatatuiCell::from(Text::from(model).alignment(Alignment::Left)));
+    for &i in &cols.kept {
+        cells.push(RatatuiCell::from(
+            Text::from(format_usage_column(row, i)).alignment(Alignment::Right),
+        ));
+    }
     if cols.share_w > 0 {
-        let share = share_cell(row.total, total_tokens, cols.share_w);
-        let bar: String = share.chars().take_while(|c| *c == '━').collect();
-        let rest = share[bar.len()..].to_string();
-        cells.push(RatatuiCell::from(Line::from(vec![
-            Span::styled(bar, theme.accent()),
-            Span::styled(rest, theme.dim()),
-        ])));
+        if let Some(spans) = share_spans(row.total, total_tokens, cols.share_w) {
+            cells.push(RatatuiCell::from(Line::from(Vec::from(spans))));
+        } else {
+            cells.push(RatatuiCell::from(""));
+        }
     }
     RatatuiRow::new(cells).style(style)
 }
@@ -1441,8 +1508,11 @@ fn bar_spans(pct: f64, cells: usize) -> [Span<'static>; 2] {
     let theme = theme();
     let filled = ((pct / (100.0 / cells as f64)).ceil() as i64).clamp(0, cells as i64) as usize;
     [
-        Span::styled("━".repeat(filled), Style::default().fg(theme.gauge(pct))),
-        Span::styled("━".repeat(cells - filled), theme.border()),
+        Span::styled(
+            repeated_bar('━', filled),
+            Style::default().fg(theme.gauge(pct)),
+        ),
+        Span::styled(repeated_bar('━', cells - filled), theme.border()),
     ]
 }
 
@@ -1460,7 +1530,7 @@ pub(crate) fn provider_share_bar(
     let total: i64 = segments.iter().map(|(_, t)| *t).sum();
 
     if width == 0 || total <= 0 {
-        return Line::from(Span::styled("░".repeat(width), theme().border()));
+        return Line::from(Span::styled(repeated_bar('░', width), theme().border()));
     }
 
     // Largest-remainder apportionment ensures segment widths sum to exactly `width`.
@@ -1489,7 +1559,7 @@ pub(crate) fn provider_share_bar(
         .enumerate()
         .filter_map(|(i, (color, _))| {
             let w = widths[i];
-            (w > 0).then(|| Span::styled("█".repeat(w), Style::default().fg(*color)))
+            (w > 0).then(|| Span::styled(repeated_bar('█', w), Style::default().fg(*color)))
         })
         .collect();
     Line::from(spans)
@@ -1557,6 +1627,7 @@ fn grid_cells(spec: &GridSpec, band: Rect, n: usize) -> Vec<Rect> {
 }
 
 /// Formats `value / total` as a bar and percentage fitted to `width` columns (empty if `total <= 0` or `width < 6`).
+#[cfg(test)]
 fn share_cell(value: i64, total: i64, width: u16) -> String {
     if total <= 0 || width < 6 {
         return String::new();
@@ -1564,10 +1635,11 @@ fn share_cell(value: i64, total: i64, width: u16) -> String {
     let share = (value as f64 / total as f64).clamp(0.0, 1.0);
     // Reserve 6 columns for "100.0%".
     let bar_w = usize::from(width - 6);
-    let filled = (share * bar_w as f64).round() as usize;
+    let filled = ((share * bar_w as f64).round() as usize).min(bar_w);
     format!(
-        "{:<bar_w$}{:>5.1}%",
-        "━".repeat(filled.min(bar_w)),
+        "{}{}{:>5.1}%",
+        repeated_bar('━', filled),
+        repeated_bar(' ', bar_w - filled),
         share * 100.0
     )
 }
@@ -3936,5 +4008,31 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(remote_changed, UsageScanOutcome::Updated(_)));
+    }
+
+    #[test]
+    fn set_sort_then_toggle_merge_sorts_inactive_list() {
+        let row = |model: &str, cost: f64| UsageRow {
+            model: model.to_string(),
+            input_tokens: 10,
+            output_tokens: 10,
+            total: 20,
+            cost,
+            ..Default::default()
+        };
+        let rows = vec![row("z-model", 10.0), row("a-model", 1.0)];
+        let merged_rows = vec![row("z-model", 10.0), row("a-model", 1.0)];
+        let mut ui = UsageUiState::new(false);
+        ui.apply(UsageRefreshPayload {
+            rows,
+            merged_rows,
+            totals: UsageTotals::default(),
+            provider_totals: UsageProviderTotals::default(),
+        });
+        // Switch sort to Model while unmerged, then toggle merge on; merged_rows must sort by Model.
+        ui.set_sort(UsageSort::Model);
+        ui.set_merge(true);
+        let names: Vec<&str> = ui.view().iter().map(|r| r.model.as_str()).collect();
+        assert_eq!(names, vec!["a-model", "z-model"]);
     }
 }

@@ -2,14 +2,17 @@
 
 use crate::display::analysis::averages::{AnalysisRow, build_analysis_rows_with_providers};
 use crate::display::common::provider_tui_color;
-use crate::display::common::table::{
-    ColumnSpec, DetailItem, DetailSection, fit_columns, styled_row,
-};
+use crate::display::common::table::{ColumnSpec, DetailItem, DetailSection, fit_columns};
 use crate::display::common::theme::theme;
 use crate::display::common::tui::{
     LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker, remote_snapshot_stamps,
 };
-use ratatui::{layout::Constraint, style::Style, widgets::Row as RatatuiRow};
+use ratatui::{
+    layout::{Alignment, Constraint},
+    style::Style,
+    text::Text,
+    widgets::{Cell as RatatuiCell, Row as RatatuiRow},
+};
 use vct_core::analysis::AnalysisData;
 use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
@@ -127,25 +130,6 @@ impl AnalysisUiState {
             .retain(|row| row.total_lines() != 0 || row.total_calls() != 0);
         self.sort.apply(&mut self.rows);
         self.totals = AnalysisRow::default();
-        let fingerprints: Vec<_> = self
-            .rows
-            .iter()
-            .map(|row| {
-                (
-                    row.model.clone(),
-                    (
-                        row.edit_lines,
-                        row.read_lines,
-                        row.write_lines,
-                        row.bash_count,
-                        row.edit_count,
-                        row.read_count,
-                        row.todo_write_count,
-                        row.write_count,
-                    ),
-                )
-            })
-            .collect();
         for row in &self.rows {
             self.totals.edit_lines += row.edit_lines;
             self.totals.read_lines += row.read_lines;
@@ -156,14 +140,26 @@ impl AnalysisUiState {
             self.totals.todo_write_count += row.todo_write_count;
             self.totals.write_count += row.write_count;
         }
-        let models: Vec<_> = fingerprints
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        self.scroll.sync(previous.as_deref(), &models);
-        self.update_tracker.cleanup(models);
-        for (model, fingerprint) in fingerprints {
-            self.update_tracker.track_update(model, &fingerprint);
+        self.scroll.sync_by(
+            previous.as_deref(),
+            self.rows.iter().map(|row| row.model.as_str()),
+        );
+        self.update_tracker
+            .cleanup_str(self.rows.iter().map(|row| row.model.as_str()));
+        let now = std::time::Instant::now();
+        for row in &self.rows {
+            let fingerprint = (
+                row.edit_lines,
+                row.read_lines,
+                row.write_lines,
+                row.bash_count,
+                row.edit_count,
+                row.read_count,
+                row.todo_write_count,
+                row.write_count,
+            );
+            self.update_tracker
+                .track_update_at(row.model.clone(), &fingerprint, now);
         }
     }
 
@@ -173,18 +169,22 @@ impl AnalysisUiState {
             let previous = self.selected_model();
             self.sort = sort;
             self.sort.apply(&mut self.rows);
-            let models: Vec<_> = self.rows.iter().map(|row| row.model.clone()).collect();
-            self.scroll.sync(previous.as_deref(), &models);
+            self.scroll.sync_by(
+                previous.as_deref(),
+                self.rows.iter().map(|row| row.model.as_str()),
+            );
         }
     }
 
     /// Steps the sort column by `step` places along the header, preserving selection.
     pub(crate) fn step_sort(&mut self, step: isize) {
-        let previous = self.selected_model();
-        self.sort = self.sort.step(step);
-        self.sort.apply(&mut self.rows);
-        let models: Vec<_> = self.rows.iter().map(|row| row.model.clone()).collect();
-        self.scroll.sync(previous.as_deref(), &models);
+        let next = self.sort.step(step);
+        self.set_sort(next);
+    }
+
+    /// Evicts expired row-change highlights as of `now`, returning `true` when any highlight cleared.
+    pub(crate) fn prune_expired(&mut self, now: std::time::Instant) -> bool {
+        self.update_tracker.prune_expired(now)
     }
 
     /// Moves the table selection by `delta`.
@@ -244,7 +244,7 @@ impl AnalysisUiState {
 /// Result of one [`AnalysisScanner::scan`] run.
 pub(crate) enum AnalysisScanOutcome {
     /// New or changed analysis data to apply to the UI.
-    Updated(AnalysisData),
+    Updated(Box<AnalysisData>),
     /// Zero sources changed and every input affecting the analysis summary matched the prior emission.
     Unchanged,
 }
@@ -298,6 +298,7 @@ impl AnalysisScanner {
                 return Err(error);
             }
         };
+        let pre_save_stats = ledger.stats();
         // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every tick.
         if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
             log::warn!("failed to save the session ledger: {error:#}");
@@ -322,27 +323,30 @@ impl AnalysisScanner {
             );
         }
 
-        let stats = ledger.stats();
+        let post_save_stats = ledger.stats();
         let remote_after = remote_snapshot_stamps(&paths.cache_dir);
+        let snapshot_stable =
+            remote_before == remote_after && pre_save_stats.entries == post_save_stats.entries;
         let key = AnalysisSnapshotKey {
             time_range,
             providers,
             local_date,
-            remote_stamps: remote_after,
-            total_parsed_sources: stats.total_parsed_sources,
-            ledger_entries: stats.entries,
-            retained: stats.retained,
+            remote_stamps: remote_before,
+            total_parsed_sources: pre_save_stats.total_parsed_sources,
+            ledger_entries: pre_save_stats.entries,
+            retained: pre_save_stats.retained,
             failure_count: aggregation.diagnostics.failures.len(),
         };
-        if stats.parsed_sources == 0
-            && remote_before == key.remote_stamps
+        if pre_save_stats.parsed_sources == 0
+            && snapshot_stable
             && self.last_emitted.as_ref() == Some(&key)
         {
             return Ok(AnalysisScanOutcome::Unchanged);
         }
 
-        self.last_emitted = Some(key);
-        Ok(AnalysisScanOutcome::Updated(aggregation.data))
+        // Never cache a key when remote snapshots or concurrent ledger saves shifted mid-scan.
+        self.last_emitted = snapshot_stable.then_some(key);
+        Ok(AnalysisScanOutcome::Updated(Box::new(aggregation.data)))
     }
 }
 
@@ -450,6 +454,21 @@ pub(crate) fn layout_analysis_columns(inner: u16) -> AnalysisTableColumns {
     }
 }
 
+/// Formats one numeric analysis column (`0..8`) for `row` without allocating dropped columns.
+pub(crate) fn format_analysis_column(row: &AnalysisRow, col: usize) -> String {
+    match col {
+        0 => format_compact(row.edit_lines as i64),
+        1 => format_compact(row.read_lines as i64),
+        2 => format_compact(row.write_lines as i64),
+        3 => format_compact(row.bash_count as i64),
+        4 => format_compact(row.edit_count as i64),
+        5 => format_compact(row.read_count as i64),
+        6 => format_compact(row.todo_write_count as i64),
+        7 => format_compact(row.write_count as i64),
+        _ => String::new(),
+    }
+}
+
 /// Builds one formatted analysis table row, prepending `prefix` (such as `"▸ "` or `"▾ "`) to the model name.
 pub(crate) fn build_analysis_table_row(
     row: &AnalysisRow,
@@ -463,20 +482,21 @@ pub(crate) fn build_analysis_table_row(
     } else {
         Style::default()
     };
-    let all = [
-        format_compact(row.edit_lines as i64),
-        format_compact(row.read_lines as i64),
-        format_compact(row.write_lines as i64),
-        format_compact(row.bash_count as i64),
-        format_compact(row.edit_count as i64),
-        format_compact(row.read_count as i64),
-        format_compact(row.todo_write_count as i64),
-        format_compact(row.write_count as i64),
-    ];
-    let mut cells = Vec::with_capacity(cols.header.len());
-    cells.push(format!("{prefix}{}", row.model));
-    cells.extend(cols.kept.iter().map(|&i| all[i].clone()));
-    styled_row(cells, style, 1)
+    let mut cells: Vec<RatatuiCell<'static>> = Vec::with_capacity(cols.header.len());
+    let model = if prefix.is_empty() {
+        row.model.clone()
+    } else {
+        format!("{prefix}{}", row.model)
+    };
+    cells.push(RatatuiCell::from(
+        Text::from(model).alignment(Alignment::Left),
+    ));
+    for &i in &cols.kept {
+        cells.push(RatatuiCell::from(
+            Text::from(format_analysis_column(row, i)).alignment(Alignment::Right),
+        ));
+    }
+    RatatuiRow::new(cells).style(style)
 }
 
 /// Builds the structured sections for one analysis row's `Details` panel.

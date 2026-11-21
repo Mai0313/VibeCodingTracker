@@ -97,8 +97,8 @@ struct ScanRequest {
 }
 
 enum ScanData {
-    Usage(UsageRefreshPayload),
-    Analysis(AnalysisData),
+    Usage(Box<UsageRefreshPayload>),
+    Analysis(Box<AnalysisData>),
     Unchanged,
 }
 
@@ -315,11 +315,14 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             .expect("Failed to get current process ID for memory monitoring");
         let mut sys = System::new();
         init_process_metrics(&mut sys, pid);
+        let mut metrics = process_metrics(&sys, pid);
         let metrics_interval =
             Duration::from_millis(vct_core::constants::refresh::METRICS_REFRESH_MS);
         let mut last_metrics = Instant::now();
         let mut last_draw: Option<Instant> = None;
         let mut refresh_indicator_drawn = false;
+        let mut last_refresh_status: Option<&'static str> = None;
+        let mut update_notice_drawn = false;
         let mut spinner = 0usize;
         let mut help_open = false;
 
@@ -337,12 +340,12 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                         let had_failure = failure_until.is_some() || retry_at.is_some();
                         match output.data {
                             ScanData::Usage(payload) => {
-                                usage.apply(payload);
+                                usage.apply(*payload);
                                 shown[0] = Some(output.request);
                                 redraw = true;
                             }
                             ScanData::Analysis(data) => {
-                                analysis.apply(data);
+                                analysis.apply(*data);
                                 shown[1] = Some(output.request);
                                 redraw = true;
                             }
@@ -426,23 +429,49 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 None
             };
 
-            let loading = tab.scans() && shown[tab.index()].is_none();
-            let tick = if loading {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_secs(1)
-            };
-            if last_metrics.elapsed() >= metrics_interval {
-                last_metrics = Instant::now();
-                refresh_process_metrics(&mut sys, pid);
+            let now = Instant::now();
+            if usage.prune_expired(now) && tab == Tab::Usage {
+                redraw = true;
             }
-            let metrics = process_metrics(&sys, pid);
-            if redraw || last_draw.is_none_or(|at| at.elapsed() >= tick) {
+            if analysis.prune_expired(now) && tab == Tab::Analysis {
+                redraw = true;
+            }
+            let loading = tab.scans() && shown[tab.index()].is_none();
+            if now.saturating_duration_since(last_metrics) >= metrics_interval {
+                last_metrics = now;
+                refresh_process_metrics(&mut sys, pid);
+                let next_metrics = process_metrics(&sys, pid);
+                if (next_metrics.0 * 10.0).round() != (metrics.0 * 10.0).round()
+                    || (next_metrics.1 * 10.0).round() != (metrics.1 * 10.0).round()
+                {
+                    metrics = next_metrics;
+                    redraw = true;
+                }
+            }
+            let active = worker.as_ref().is_some_and(RefreshWorker::is_active);
+            let refresh = refresh_status(active, failure_until);
+            let update_text = update_notice.get().map(String::as_str);
+            if update_text.is_some() != update_notice_drawn
+                || (refresh != last_refresh_status
+                    && (refresh != Some("Refreshing...")
+                        || last_draw.is_none_or(|at| {
+                            now.saturating_duration_since(at) >= Duration::from_secs(1)
+                        })))
+            {
+                redraw = true;
+            }
+            if loading
+                && last_draw.is_none_or(|at| {
+                    now.saturating_duration_since(at) >= Duration::from_millis(100)
+                })
+            {
+                redraw = true;
+            }
+            if redraw || last_draw.is_none() {
                 spinner = spinner.wrapping_add(1);
-                let active = worker.as_ref().is_some_and(RefreshWorker::is_active);
-                let refresh = refresh_status(active, failure_until);
                 refresh_indicator_drawn = refresh.is_some();
-                let update_text = update_notice.get().map(String::as_str);
+                last_refresh_status = refresh;
+                update_notice_drawn = update_text.is_some();
                 let data_status = data_tab_status(refresh, update_text);
                 let update_status = update_text.map(|text| (text, theme().good));
                 if let Some((_, state)) = quota_now {
@@ -475,7 +504,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 })?;
                 // ratatui cannot embed OSC 8 escapes in cells, so hyperlink the rendered repo label directly.
                 overlay_repo_hyperlink(completed.buffer)?;
-                last_draw = Some(Instant::now());
+                last_draw = Some(now);
             }
 
             let mut go_to = None;

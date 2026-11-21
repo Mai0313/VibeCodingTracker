@@ -13,9 +13,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
-use vct_core::config::{Config, SettingValue, apply_setting, setting_description};
 #[cfg(test)]
 use vct_core::config::get_setting;
+use vct_core::config::{Config, SettingValue, apply_setting, setting_description};
 
 /// Below this only a notice is drawn.
 const SETTINGS_MIN_W: u16 = 64;

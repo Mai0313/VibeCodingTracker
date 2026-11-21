@@ -238,7 +238,8 @@ fn query_default_colors() -> Option<(Rgb, Rgb)> {
                 return None;
             }
             // SAFETY: `buf` is writable for `buf.len()` bytes.
-            let read = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+            let read =
+                unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
             if read < 0 {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                     continue;

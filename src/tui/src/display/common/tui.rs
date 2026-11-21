@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use vct_core::constants::{FastHashMap, FastHashSet};
 
 /// Tracks whether the alternate-screen TUI currently owns the terminal for [`force_restore_terminal`].
 static IN_TUI: AtomicBool = AtomicBool::new(false);
@@ -509,16 +510,18 @@ pub fn overlay_repo_hyperlink(buffer: &Buffer) -> io::Result<()> {
     };
 
     // Emit OSC 8 open, dim + underline matching the ratatui cell, reset, and OSC 8 close.
-    let color = match theme().dim {
-        Color::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
-        _ => "90".to_string(),
-    };
     let mut stdout = io::stdout();
     queue!(stdout, MoveTo(x, y))?;
-    write!(
-        stdout,
-        "\x1b]8;;{REPO_URL}\x1b\\\x1b[{color};4m{REPO_LABEL}\x1b[0m\x1b]8;;\x1b\\"
-    )?;
+    match theme().dim {
+        Color::Rgb(r, g, b) => write!(
+            stdout,
+            "\x1b]8;;{REPO_URL}\x1b\\\x1b[38;2;{r};{g};{b};4m{REPO_LABEL}\x1b[0m\x1b]8;;\x1b\\"
+        )?,
+        _ => write!(
+            stdout,
+            "\x1b]8;;{REPO_URL}\x1b\\\x1b[90;4m{REPO_LABEL}\x1b[0m\x1b]8;;\x1b\\"
+        )?,
+    }
     stdout.flush()
 }
 
@@ -804,8 +807,8 @@ impl InputAction {
 ///
 /// Stores a hash and last-change [`Instant`] per key rather than cloning row data. The `max_tracked` cap is enforced by [`Self::cleanup`], not by [`Self::track_update`].
 pub struct UpdateTracker {
-    last_update_times: std::collections::HashMap<String, Instant>,
-    previous_hashes: std::collections::HashMap<String, u64>,
+    last_update_times: FastHashMap<String, Instant>,
+    previous_hashes: FastHashMap<String, u64>,
     max_tracked: usize,
     highlight_duration: Duration,
 }
@@ -823,8 +826,8 @@ impl UpdateTracker {
     /// Creates a tracker retaining up to `max_tracked` rows and highlighting changes for `highlight_duration_millis`.
     pub fn new(max_tracked: usize, highlight_duration_millis: u64) -> Self {
         Self {
-            last_update_times: std::collections::HashMap::new(),
-            previous_hashes: std::collections::HashMap::new(),
+            last_update_times: FastHashMap::default(),
+            previous_hashes: FastHashMap::default(),
             max_tracked,
             highlight_duration: Duration::from_millis(highlight_duration_millis),
         }
@@ -834,6 +837,16 @@ impl UpdateTracker {
     ///
     /// Does not evict entries; call [`Self::cleanup`] to enforce `max_tracked`.
     pub fn track_update<T: std::hash::Hash>(&mut self, key: String, data: &T) {
+        self.track_update_at(key, data, Instant::now());
+    }
+
+    /// Records `data` for `key` at `now`, avoiding repeated clock reads across a batch refresh.
+    pub(crate) fn track_update_at<T: std::hash::Hash>(
+        &mut self,
+        key: String,
+        data: &T,
+        now: Instant,
+    ) {
         let hash = hash_of(data);
 
         let entry_changed = match self.previous_hashes.get(&key) {
@@ -841,8 +854,8 @@ impl UpdateTracker {
             None => true,
         };
 
-        if entry_changed {
-            self.last_update_times.insert(key.clone(), Instant::now());
+        if entry_changed && !self.highlight_duration.is_zero() {
+            self.last_update_times.insert(key.clone(), now);
         }
 
         self.previous_hashes.insert(key, hash);
@@ -855,21 +868,37 @@ impl UpdateTracker {
         self.previous_hashes.insert(key, hash_of(data));
     }
 
-    /// Removes entries absent from `current_keys`, trims remaining entries to `max_tracked`, and shrinks the internal maps.
+    /// Removes entries absent from `current_keys`, trims remaining entries to `max_tracked`, and shrinks over-allocated internal maps.
     ///
-    /// When trimming to `max_tracked`, evicted keys are chosen in arbitrary `HashMap` iteration order.
+    /// When trimming to `max_tracked`, evicted keys are chosen in arbitrary map iteration order.
     pub fn cleanup<I>(&mut self, current_keys: I)
     where
         I: IntoIterator<Item = String>,
     {
-        let current_keys: std::collections::HashSet<String> = current_keys.into_iter().collect();
+        let current_keys: FastHashSet<String> = current_keys.into_iter().collect();
+        self.cleanup_with_set(&current_keys);
+    }
 
+    /// Retains only keys in `current_keys`, enforces `max_tracked`, and shrinks capacity only past `2 * max_tracked`.
+    pub(crate) fn cleanup_str<'a>(&mut self, current_keys: impl IntoIterator<Item = &'a str>) {
+        let current_keys: FastHashSet<&str> = current_keys.into_iter().collect();
+        self.previous_hashes
+            .retain(|key, _| current_keys.contains(key.as_str()));
+        self.last_update_times
+            .retain(|key, _| current_keys.contains(key.as_str()));
+        self.trim_and_shrink();
+    }
+
+    fn cleanup_with_set(&mut self, current_keys: &FastHashSet<String>) {
         self.previous_hashes
             .retain(|key, _| current_keys.contains(key));
         self.last_update_times
             .retain(|key, _| current_keys.contains(key));
+        self.trim_and_shrink();
+    }
 
-        // HashMap iteration order is unspecified, so trimming is not LRU.
+    fn trim_and_shrink(&mut self) {
+        // Map iteration order is unspecified, so trimming is not LRU.
         if self.previous_hashes.len() > self.max_tracked {
             let keys_to_remove: Vec<_> = self
                 .previous_hashes
@@ -883,18 +912,49 @@ impl UpdateTracker {
             }
         }
 
-        self.previous_hashes.shrink_to_fit();
-        self.last_update_times.shrink_to_fit();
+        let shrink_threshold = self.max_tracked.saturating_mul(2);
+        if self.previous_hashes.capacity() > shrink_threshold {
+            self.previous_hashes.shrink_to_fit();
+        }
+        if self.last_update_times.capacity() > shrink_threshold {
+            self.last_update_times.shrink_to_fit();
+        }
+    }
+
+    /// Removes expired highlight timestamps as of `now`, returning `true` when at least one entry was evicted.
+    pub fn prune_expired(&mut self, now: Instant) -> bool {
+        if self.last_update_times.is_empty() {
+            return false;
+        }
+        let before = self.last_update_times.len();
+        self.last_update_times.retain(|_, update_time| {
+            now.saturating_duration_since(*update_time) < self.highlight_duration
+        });
+        self.last_update_times.len() != before
+    }
+
+    /// Returns whether any row currently has an unexpired highlight timestamp.
+    #[cfg(test)]
+    pub(crate) fn has_active_highlights(&self) -> bool {
+        !self.last_update_times.is_empty()
+    }
+
+    /// Returns whether `key` changed within the configured highlight duration as of `now`.
+    pub fn is_recently_updated_at(&self, key: &str, now: Instant) -> bool {
+        if self.last_update_times.is_empty() {
+            return false;
+        }
+        self.last_update_times.get(key).is_some_and(|update_time| {
+            now.saturating_duration_since(*update_time) < self.highlight_duration
+        })
     }
 
     /// Returns whether `key` changed within the configured highlight duration.
     pub fn is_recently_updated(&self, key: &str) -> bool {
-        self.last_update_times
-            .get(key)
-            .map(|update_time| {
-                Instant::now().duration_since(*update_time) < self.highlight_duration
-            })
-            .unwrap_or(false)
+        if self.last_update_times.is_empty() {
+            return false;
+        }
+        self.is_recently_updated_at(key, Instant::now())
     }
 }
 
@@ -920,14 +980,29 @@ impl ScrollState {
     ///
     /// Matches `prev_model` by name first; otherwise clamps the existing selection index into range, or clears it when `models` is empty.
     pub fn sync(&mut self, prev_model: Option<&str>, models: &[String]) {
-        if models.is_empty() {
+        self.sync_by(prev_model, models.iter().map(String::as_str));
+    }
+
+    /// Reconciles the selection against borrowed selectable model names without allocating a `Vec<String>`.
+    pub(crate) fn sync_by<'a>(
+        &mut self,
+        prev_model: Option<&str>,
+        models: impl IntoIterator<Item = &'a str>,
+    ) {
+        let mut count = 0usize;
+        let mut matched = None;
+        for (idx, model) in models.into_iter().enumerate() {
+            count += 1;
+            if matched.is_none() && prev_model == Some(model) {
+                matched = Some(idx);
+            }
+        }
+        if count == 0 {
             self.table.select(None);
             return;
         }
-        let max = models.len() - 1;
-        let idx = prev_model
-            .and_then(|m| models.iter().position(|x| x == m))
-            .unwrap_or_else(|| self.table.selected().unwrap_or(0).min(max));
+        let max = count - 1;
+        let idx = matched.unwrap_or_else(|| self.table.selected().unwrap_or(0).min(max));
         self.table.select(Some(idx.min(max)));
     }
 
@@ -1271,6 +1346,23 @@ mod tests {
         );
         worker.request();
         assert_eq!(wait_for_result(&mut worker), Ok(7));
+    }
+
+    #[test]
+    fn update_tracker_prunes_expired_entries_and_fast_paths_when_empty() {
+        let mut tracker = UpdateTracker::new(16, 100);
+        let t0 = Instant::now();
+        assert!(!tracker.has_active_highlights());
+        assert!(!tracker.prune_expired(t0));
+
+        tracker.track_update_at("claude".to_string(), &1u64, t0);
+        assert!(tracker.has_active_highlights());
+        assert!(tracker.is_recently_updated_at("claude", t0 + Duration::from_millis(50)));
+        assert!(!tracker.prune_expired(t0 + Duration::from_millis(50)));
+
+        assert!(tracker.prune_expired(t0 + Duration::from_millis(150)));
+        assert!(!tracker.has_active_highlights());
+        assert!(!tracker.is_recently_updated_at("claude", t0 + Duration::from_millis(150)));
     }
 
     fn wait_for_result(worker: &mut RefreshWorker<usize>) -> Result<usize, RefreshWorkerError> {
