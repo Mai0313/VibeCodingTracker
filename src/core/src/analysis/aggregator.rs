@@ -186,13 +186,24 @@ pub fn aggregate_sessions_by_model_with_diagnostics(
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<AnalysisCollection> {
+    aggregate_sessions_by_model_with_diagnostics_and_remote_hook(time_range, providers, || {})
+}
+
+/// Like [`aggregate_sessions_by_model_with_diagnostics`], invoking `before_remotes` after local scanning finishes and before remote snapshots are loaded and folded.
+#[doc(hidden)]
+pub fn aggregate_sessions_by_model_with_diagnostics_and_remote_hook(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    before_remotes: impl FnOnce(),
+) -> Result<AnalysisCollection> {
     let paths = crate::utils::resolve_paths()?;
     let mut ledger = SessionLedger::open(&paths.cache_dir);
-    let collection = aggregate_sessions_by_model_from_paths_with_cache(
+    let collection = aggregate_sessions_by_model_from_paths_with_cache_and_remote_hook(
         &paths,
         time_range,
         providers,
         &mut ledger,
+        before_remotes,
     )?;
     if let Err(error) = ledger.save() {
         log::warn!("failed to save the session ledger: {error:#}");
@@ -485,7 +496,23 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
     providers: ProvidersConfig,
     ledger: &mut SessionLedger,
 ) -> Result<AnalysisCollection> {
-    ledger.begin_scan();
+    aggregate_sessions_by_model_from_paths_with_cache_and_remote_hook(
+        paths,
+        time_range,
+        providers,
+        ledger,
+        || {},
+    )
+}
+
+fn aggregate_sessions_by_model_from_paths_with_cache_and_remote_hook(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    ledger: &mut SessionLedger,
+    before_remotes: impl FnOnce(),
+) -> Result<AnalysisCollection> {
+    ledger.begin_local_scan();
     let mut projection = AnalysisProjection::new();
     let mut diagnostics = ScanDiagnostics::default();
 
@@ -526,6 +553,8 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
         );
     }
 
+    before_remotes();
+    ledger.reload_remotes();
     // Hermes records no file operations, so analysis folds it nowhere.
     crate::scan::fold_remotes(
         ledger,
@@ -1075,5 +1104,33 @@ mod tests {
             aggregated.get("claude-opus-4-8").is_none(),
             "advisor model must not be credited with the main model's file operations"
         );
+    }
+
+    #[test]
+    fn remote_hook_runs_before_remote_snapshots_are_folded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = crate::utils::resolve_paths_from_home(dir.path());
+        let mut ledger = SessionLedger::open(&paths.cache_dir);
+        let export = r#"{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider":"claude","sessions":{"s1":{"days":{"2026-11-20":{"active":{"analysis":true},"analysis":{"claude-test":{"model":"claude-test","editLines":7,"readLines":0,"writeLines":0,"bashCount":0,"editCount":2,"readCount":0,"todoWriteCount":0,"writeCount":0}}}}}}}}}"#;
+
+        let out = aggregate_sessions_by_model_from_paths_with_cache_and_remote_hook(
+            &paths,
+            TimeRange::All,
+            ProvidersConfig::default(),
+            &mut ledger,
+            || {
+                crate::ledger::store_export(&paths.cache_dir, "devbox", export).unwrap();
+            },
+        )
+        .unwrap();
+
+        let row = out
+            .data
+            .rows
+            .iter()
+            .find(|r| r.model == "claude-test")
+            .expect("remote snapshot written inside before_remotes hook must be folded");
+        assert_eq!(row.edit_lines, 7);
+        assert_eq!(row.edit_count, 2);
     }
 }

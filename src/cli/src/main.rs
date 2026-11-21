@@ -27,7 +27,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use vct_core::get_version_info;
 use vct_core::scan::build_scan_pool;
 use vct_core::session::{ParseMode, parse_session_file_with_diagnostics};
-use vct_core::usage::{scan_daily_usage_priced, scan_usage_priced};
+use vct_core::usage::pipeline::{
+    scan_daily_usage_priced_with_remote_hook, scan_usage_priced_with_remote_hook,
+};
 use vct_tui::display::app::{AppOptions, Tab, run_app};
 use vct_tui::display::usage::{display_usage_table_with_pricing, display_usage_text_with_pricing};
 
@@ -137,9 +139,6 @@ fn dispatch(cli: Cli) -> Result<()> {
                     }
                     let scan_pool =
                         Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
-                    if !json {
-                        prepare_remotes(&config.remotes)?;
-                    }
                     if json {
                         let dataset = scan_pool.install(|| {
                             vct_core::analysis::collect_analysis_sessions_with(
@@ -151,10 +150,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                         report_analysis_collection(&dataset.diagnostics)?;
                         write_pretty_json(&dataset)?;
                     } else {
+                        let remote_sync = start_remotes_sync(&config.remotes)?;
                         let aggregation = scan_pool.install(|| {
-                            vct_core::analysis::aggregate_sessions_by_model_with_diagnostics(
+                            vct_core::analysis::aggregate_sessions_by_model_with_diagnostics_and_remote_hook(
                                 time_range,
                                 config.providers,
+                                || remote_sync.finish(),
                             )
                         })?;
                         report_analysis_collection(&aggregation.diagnostics)?;
@@ -194,10 +195,15 @@ fn dispatch(cli: Cli) -> Result<()> {
             );
             let merge = merge_providers || config.usage.merge_models;
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
-            prepare_remotes(&config.remotes)?;
+            let remote_sync = start_remotes_sync(&config.remotes)?;
 
             if json && by_day {
-                let scan = scan_daily_usage_priced(time_range, config.providers, &scan_pool)?;
+                let scan = scan_daily_usage_priced_with_remote_hook(
+                    time_range,
+                    config.providers,
+                    &scan_pool,
+                    || remote_sync.finish(),
+                )?;
                 if let Some(error) = &scan.pricing_error {
                     eprintln!(
                         "Warning: Failed to fetch pricing data: {error}. Costs will be unavailable."
@@ -211,7 +217,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                 );
                 write_pretty_json(&output)?;
             } else {
-                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
+                let scan = scan_usage_priced_with_remote_hook(
+                    time_range,
+                    config.providers,
+                    &scan_pool,
+                    || remote_sync.finish(),
+                )?;
                 if json {
                     if let Some(error) = &scan.pricing_error {
                         eprintln!(
@@ -391,15 +402,48 @@ fn prune_remotes(config: &vct_core::config::RemotesConfig) -> Result<std::path::
     Ok(cache_dir)
 }
 
-/// Prunes removed `[remotes]` snapshots and synchronously refreshes the remaining hosts, printing a warning for each failure.
-fn prepare_remotes(config: &vct_core::config::RemotesConfig) -> Result<()> {
-    let cache_dir = prune_remotes(config)?;
-    for (host, error) in vct_core::remote::sync(&cache_dir, config) {
-        eprintln!(
-            "Warning: Could not fetch usage from remote {host}: {error}. Its last fetched data, if any, is shown."
-        );
+/// Background handle for an in-flight one-shot `[remotes]` sync overlapping with local scanning.
+struct PendingRemoteSync {
+    handle: Option<std::thread::JoinHandle<Vec<(String, String)>>>,
+}
+
+impl PendingRemoteSync {
+    /// Waits for the background sync to complete and prints any per-host fetch warnings to stderr.
+    fn finish(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let failures = handle.join().unwrap_or_else(|_| {
+                vec![("<remote>".to_string(), "remote sync panicked".to_string())]
+            });
+            for (host, error) in failures {
+                eprintln!(
+                    "Warning: Could not fetch usage from remote {host}: {error}. Its last fetched data, if any, is shown."
+                );
+            }
+        }
     }
-    Ok(())
+}
+
+impl Drop for PendingRemoteSync {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Prunes removed `[remotes]` snapshots and spawns a background sync for the remaining hosts when online and non-empty.
+fn start_remotes_sync(config: &vct_core::config::RemotesConfig) -> Result<PendingRemoteSync> {
+    let cache_dir = prune_remotes(config)?;
+    if config.hosts.is_empty() || vct_core::utils::network_disabled() {
+        return Ok(PendingRemoteSync { handle: None });
+    }
+    let remotes = config.clone();
+    let handle = std::thread::Builder::new()
+        .name("vct-remote-sync".to_string())
+        .spawn(move || vct_core::remote::sync(&cache_dir, &remotes))?;
+    Ok(PendingRemoteSync {
+        handle: Some(handle),
+    })
 }
 
 /// Returns whether `cli` opens the interactive app via [`open_app`] rather than running a one-shot command.
