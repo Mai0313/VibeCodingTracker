@@ -35,6 +35,12 @@ pub struct QuotaCardBucket {
     pub used_percent: f64,
     /// Absolute reset time in Unix seconds, or `null` when unknown.
     pub resets_at: Option<i64>,
+    /// Optional pool description (for example which models share this bucket).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether this quota bucket is currently disabled by the provider.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 /// Normalized quota card emitted by `vct quota --json`.
@@ -44,6 +50,9 @@ pub struct QuotaCard {
     pub provider: String,
     /// Plan tier (for example `"max 20x"` or `"plus"`), or `null` when unavailable.
     pub plan: Option<String>,
+    /// Available extra AI credit balance when reported and positive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_credits: Option<i64>,
     /// Unix seconds when this snapshot was produced (`0` if never fetched).
     pub fetched_at: i64,
     /// Origin of this snapshot (`"api"`, `"session_fallback"`, or `"none"`).
@@ -68,6 +77,8 @@ impl QuotaCard {
                 window: "5h".to_string(),
                 used_percent: w.used_percent,
                 resets_at: w.resets_at_unix,
+                description: None,
+                disabled: false,
             });
         }
         if let Some(w) = &snap.seven_day {
@@ -76,6 +87,8 @@ impl QuotaCard {
                 window: "7d".to_string(),
                 used_percent: w.used_percent,
                 resets_at: w.resets_at_unix,
+                description: None,
+                disabled: false,
             });
         }
         if let (Some(w), Some(label)) = (&snap.scoped_weekly, &snap.scoped_label) {
@@ -84,11 +97,14 @@ impl QuotaCard {
                 window: "7d".to_string(),
                 used_percent: w.used_percent,
                 resets_at: w.resets_at_unix,
+                description: None,
+                disabled: false,
             });
         }
         Self {
             provider: "claude".to_string(),
             plan: snap.plan_type.clone(),
+            available_credits: None,
             fetched_at: snap.fetched_at,
             source: snap.source,
             limit_reached: snap.limit_reached,
@@ -107,6 +123,8 @@ impl QuotaCard {
                 window: "5h".to_string(),
                 used_percent: w.used_percent,
                 resets_at: w.resets_at_unix,
+                description: None,
+                disabled: false,
             });
         }
         if let Some(w) = &snap.secondary {
@@ -115,11 +133,14 @@ impl QuotaCard {
                 window: "7d".to_string(),
                 used_percent: w.used_percent,
                 resets_at: w.resets_at_unix,
+                description: None,
+                disabled: false,
             });
         }
         Self {
             provider: "codex".to_string(),
             plan: snap.plan_type.clone(),
+            available_credits: None,
             fetched_at: snap.fetched_at,
             source: snap.source,
             limit_reached: snap.limit_reached == Some(true),
@@ -138,11 +159,14 @@ impl QuotaCard {
                 window: "1m".to_string(),
                 used_percent: w.used_percent,
                 resets_at: w.resets_at_unix,
+                description: None,
+                disabled: false,
             });
         }
         Self {
             provider: "copilot".to_string(),
             plan: snap.plan_type.clone(),
+            available_credits: None,
             fetched_at: snap.fetched_at,
             source: snap.source,
             limit_reached: snap.limit_reached,
@@ -166,12 +190,15 @@ impl QuotaCard {
                     window: "cycle".to_string(),
                     used_percent: w.used_percent,
                     resets_at: w.resets_at_unix,
+                    description: None,
+                    disabled: false,
                 });
             }
         }
         Self {
             provider: "cursor".to_string(),
             plan: snap.plan_type.clone(),
+            available_credits: None,
             fetched_at: snap.fetched_at,
             source: snap.source,
             limit_reached: snap.limit_reached,
@@ -196,11 +223,14 @@ impl QuotaCard {
                 window: window.to_string(),
                 used_percent: w.used_percent,
                 resets_at: w.resets_at_unix,
+                description: None,
+                disabled: false,
             });
         }
         Self {
             provider: "grok".to_string(),
             plan: snap.plan_type.clone(),
+            available_credits: None,
             fetched_at: snap.fetched_at,
             source: snap.source,
             limit_reached: snap.limit_reached,
@@ -224,11 +254,14 @@ impl QuotaCard {
                 window: b.window.clone(),
                 used_percent: b.usage.used_percent,
                 resets_at: b.usage.resets_at_unix,
+                description: b.group_description.clone(),
+                disabled: b.disabled,
             })
             .collect();
         Self {
             provider: "antigravity".to_string(),
-            plan: None,
+            plan: snap.plan_type.clone(),
+            available_credits: snap.available_credits.filter(|&c| c > 0),
             fetched_at: snap.fetched_at,
             source: snap.source,
             limit_reached: snap.limit_reached,
@@ -592,19 +625,29 @@ mod tests {
             &AntigravityQuotaSnapshot {
                 source: QuotaSource::Api,
                 fetched_at: 1005,
+                plan_type: Some("Google AI Pro".to_string()),
+                available_credits: Some(500),
                 buckets: vec![AntigravityBucket {
                     group: "Gemini Models".to_string(),
+                    group_description: Some("Models within this group: Gemini Flash".to_string()),
                     window: "5h".to_string(),
                     usage: win(42.0, Some(2100)),
+                    disabled: true,
                 }],
                 limit_reached: false,
                 needs_login: false,
             },
             None,
         );
-        assert_eq!(antigravity.plan, None);
+        assert_eq!(antigravity.plan.as_deref(), Some("Google AI Pro"));
+        assert_eq!(antigravity.available_credits, Some(500));
         assert_eq!(antigravity.buckets[0].label, "Gemini Models");
         assert_eq!(antigravity.buckets[0].window, "5h");
+        assert_eq!(
+            antigravity.buckets[0].description.as_deref(),
+            Some("Models within this group: Gemini Flash")
+        );
+        assert!(antigravity.buckets[0].disabled);
     }
 
     #[test]
@@ -764,10 +807,14 @@ mod tests {
             &AntigravityQuotaSnapshot {
                 source: QuotaSource::Api,
                 fetched_at: 1234,
+                plan_type: None,
+                available_credits: Some(0),
                 buckets: vec![AntigravityBucket {
                     group: "Gemini".to_string(),
+                    group_description: None,
                     window: "5h".to_string(),
                     usage: win(10.0, None),
+                    disabled: false,
                 }],
                 limit_reached: false,
                 needs_login: false,
@@ -778,7 +825,38 @@ mod tests {
         let obj = value.as_object().unwrap();
         assert!(obj.contains_key("plan") && obj["plan"].is_null());
         assert!(obj.contains_key("error") && obj["error"].is_null());
+        assert!(!obj.contains_key("available_credits"));
         let bucket = obj["buckets"][0].as_object().unwrap();
         assert!(bucket.contains_key("resets_at") && bucket["resets_at"].is_null());
+        assert!(!bucket.contains_key("description"));
+        assert!(!bucket.contains_key("disabled"));
+
+        // Non-zero credits, pool description, and disabled flag serialize when set.
+        let rich = QuotaCard::from_antigravity(
+            &AntigravityQuotaSnapshot {
+                source: QuotaSource::Api,
+                fetched_at: 1234,
+                plan_type: Some("Google AI Ultra".to_string()),
+                available_credits: Some(1_000),
+                buckets: vec![AntigravityBucket {
+                    group: "Gemini".to_string(),
+                    group_description: Some("Models within this group: Gemini Pro".to_string()),
+                    window: "5h".to_string(),
+                    usage: win(0.0, None),
+                    disabled: true,
+                }],
+                limit_reached: false,
+                needs_login: false,
+            },
+            None,
+        );
+        let rich_val = serde_json::to_value(&rich).unwrap();
+        assert_eq!(rich_val["plan"], "Google AI Ultra");
+        assert_eq!(rich_val["available_credits"], 1_000);
+        assert_eq!(
+            rich_val["buckets"][0]["description"],
+            "Models within this group: Gemini Pro"
+        );
+        assert_eq!(rich_val["buckets"][0]["disabled"], true);
     }
 }

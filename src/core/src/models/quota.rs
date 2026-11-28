@@ -370,6 +370,47 @@ where
     })
 }
 
+/// Deserializes an optional value leniently, mapping null or malformed shapes to `None`.
+pub(crate) fn de_lenient_opt<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?.and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            serde_json::from_value(v).ok()
+        }
+    }))
+}
+
+/// Deserializes an optional `i64` from either a JSON integer or a numeric string (proto3 int64), returning `None` on null or malformed values.
+fn de_opt_i64_from_str_or_int<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+/// Deserializes an `availableCredits` array leniently, skipping malformed elements and mapping null or non-arrays to an empty `Vec`.
+fn de_lenient_credits<'de, D>(deserializer: D) -> Result<Vec<AntigravityCredit>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Array(arr)) => arr
+            .into_iter()
+            .filter_map(|e| serde_json::from_value(e).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
 /// The reset-credit summary embedded in a wham/usage response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WhamResetCredits {
@@ -844,6 +885,9 @@ pub struct AntigravityQuotaGroup {
     /// Pool name, e.g. "Gemini Models" / "Claude and GPT models".
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Server-provided pool description, e.g. listing the models sharing this pool.
+    #[serde(default)]
+    pub description: Option<String>,
     /// The pool's limits; informational groups omit this field or leave it empty.
     #[serde(default)]
     pub buckets: Vec<AntigravityQuotaBucket>,
@@ -865,6 +909,78 @@ pub struct AntigravityQuotaBucket {
     /// RFC3339 time the limit refills.
     #[serde(default)]
     pub reset_time: Option<String>,
+    /// Whether this quota bucket is currently disabled by the server.
+    #[serde(default, deserialize_with = "de_bool_or_false")]
+    pub disabled: bool,
+}
+
+/// Response subset from `POST .../exa.language_server_pb.LanguageServerService/GetUserStatus`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityLsUserStatusResponse {
+    /// Account tier and plan metadata, when available.
+    #[serde(default, deserialize_with = "de_lenient_opt")]
+    pub user_status: Option<AntigravityLsUserStatus>,
+}
+
+/// The `userStatus` payload inside [`AntigravityLsUserStatusResponse`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityLsUserStatus {
+    /// Subscription tier and available extra AI credits.
+    #[serde(default, deserialize_with = "de_lenient_opt")]
+    pub user_tier: Option<AntigravityUserTier>,
+    /// Fallback plan status wrapper.
+    #[serde(default, deserialize_with = "de_lenient_opt")]
+    pub plan_status: Option<AntigravityPlanStatus>,
+}
+
+/// The `planStatus` fallback wrapper inside [`AntigravityLsUserStatus`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityPlanStatus {
+    /// Nested plan metadata.
+    #[serde(default, deserialize_with = "de_lenient_opt")]
+    pub plan_info: Option<AntigravityPlanInfo>,
+}
+
+/// The `planInfo` fallback metadata inside [`AntigravityPlanStatus`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityPlanInfo {
+    /// Fallback plan label when `userTier` carries none.
+    #[serde(default)]
+    pub plan_name: Option<String>,
+}
+
+/// Subscription tier metadata shared by `GetUserStatus` (`userTier`) and `v1internal:loadCodeAssist` (`paidTier` / `currentTier`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityUserTier {
+    /// Stable tier identifier, e.g. `g1-pro-tier`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Human-readable tier name, e.g. `Google AI Pro`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Tier description fallback when `name` is absent.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Available extra AI credit grants on this tier.
+    #[serde(default, deserialize_with = "de_lenient_credits")]
+    pub available_credits: Vec<AntigravityCredit>,
+}
+
+/// One extra credit grant entry under [`AntigravityUserTier::available_credits`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityCredit {
+    /// Credit kind, e.g. `GOOGLE_ONE_AI`.
+    #[serde(default)]
+    pub credit_type: Option<String>,
+    /// Remaining credit balance (proto3 int64 string or integer; omitted when zero).
+    #[serde(default, deserialize_with = "de_opt_i64_from_str_or_int")]
+    pub credit_amount: Option<i64>,
 }
 
 // ---- Normalized Copilot / Cursor / Grok / Antigravity snapshots (worker output + cache) ----
@@ -973,10 +1089,16 @@ pub struct AntigravityQuotaSnapshot {
     pub source: QuotaSource,
     /// Unix seconds when this snapshot was produced.
     pub fetched_at: i64,
+    /// Plan tier (e.g. "Google AI Pro"), shown on the card header when available.
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    /// Available extra AI credit balance when positive.
+    #[serde(default)]
+    pub available_credits: Option<i64>,
     /// One gauge per quota limit, in response order.
     #[serde(default)]
     pub buckets: Vec<AntigravityBucket>,
-    /// Whether any limit is spent (drives the `LIMIT` flag).
+    /// Whether any active limit is spent (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
     /// Whether Antigravity credentials are missing, expired, or rejected.
@@ -989,10 +1111,16 @@ pub struct AntigravityQuotaSnapshot {
 pub struct AntigravityBucket {
     /// The model pool it belongs to, e.g. "Gemini Models".
     pub group: String,
+    /// Optional server description for the pool, e.g. which models share it.
+    #[serde(default)]
+    pub group_description: Option<String>,
     /// Its window label, e.g. `weekly` / `5h`.
     pub window: String,
     /// Percent consumed and reset time.
     pub usage: QuotaWindow,
+    /// Whether this quota bucket is currently disabled.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[cfg(test)]

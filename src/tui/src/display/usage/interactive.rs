@@ -2561,7 +2561,123 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16, wide: bool) -> Quot
     }
 }
 
-/// Builds the Antigravity card with age-only header (no plan name in the quota summary), grouped by pool with `5h` limits first.
+/// Builds a disabled-bucket line padded to `label_w` with a warning status label and optional reset countdown.
+fn disabled_gauge_line(
+    label: &str,
+    label_w: usize,
+    reset: Option<i64>,
+    now: i64,
+    inner_w: u16,
+) -> Line<'static> {
+    const STATUS: &str = "disabled";
+    let mut spans = vec![
+        Span::raw(format!("{label:<label_w$} ")),
+        Span::styled(STATUS, Style::default().fg(theme().warn)),
+    ];
+    if let Some(reset) = reset {
+        let text = format_duration_until(reset, now);
+        let used = label_w + 1 + STATUS.len();
+        let room = usize::from(inner_w).saturating_sub(used);
+        let width = text.chars().count();
+        let marker = if room >= width + 4 {
+            Some(format!("  ↻ {text}"))
+        } else if room > width {
+            Some(format!(" {text}"))
+        } else {
+            None
+        };
+        if let Some(marker) = marker {
+            spans.push(Span::styled(marker, theme().dim()));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Builds an Antigravity pool header line, appending dim model names inline (` · A, B +N`) when `inner_w` leaves room.
+fn pool_header_line(name: &str, description: Option<&str>, inner_w: u16) -> Line<'static> {
+    const MODELS_PREFIX: &str = "models within this group:";
+    let cleaned = description.and_then(|raw| {
+        let trimmed = raw.trim();
+        let rest = if trimmed
+            .get(..MODELS_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MODELS_PREFIX))
+        {
+            trimmed[MODELS_PREFIX.len()..].trim()
+        } else {
+            trimmed
+        };
+        (!rest.is_empty()).then_some(rest)
+    });
+
+    if name.is_empty() {
+        return match cleaned {
+            Some(desc) => dim_line_fit(desc, inner_w),
+            None => Line::from(""),
+        };
+    }
+
+    let inner = usize::from(inner_w);
+    let name_w = name.chars().count();
+    let Some(desc) = cleaned else {
+        return Line::from(fit_text(name, inner_w));
+    };
+    let Some(avail) = inner.checked_sub(name_w + 3).filter(|&room| room > 0) else {
+        return Line::from(fit_text(name, inner_w));
+    };
+
+    let items: Vec<&str> = desc
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() {
+        return Line::from(fit_text(name, inner_w));
+    }
+
+    let summary = if items.len() == 1 {
+        (items[0].chars().count() <= avail).then(|| items[0].to_string())
+    } else {
+        let mut kept = 0usize;
+        let mut joined = String::new();
+        for item in &items {
+            let candidate = if kept == 0 {
+                (*item).to_string()
+            } else {
+                format!("{joined}, {item}")
+            };
+            let remaining = items.len() - kept - 1;
+            let reserve = if remaining > 0 {
+                format!(" +{remaining}").chars().count()
+            } else {
+                0
+            };
+            if candidate.chars().count() + reserve > avail {
+                break;
+            }
+            joined = candidate;
+            kept += 1;
+        }
+        if kept == 0 {
+            None
+        } else {
+            let hidden = items.len() - kept;
+            if hidden > 0 {
+                joined.push_str(&format!(" +{hidden}"));
+            }
+            Some(joined)
+        }
+    };
+
+    match summary {
+        Some(models) => Line::from(vec![
+            Span::raw(name.to_string()),
+            Span::styled(format!(" · {models}"), theme().dim()),
+        ]),
+        None => Line::from(fit_text(name, inner_w)),
+    }
+}
+
+/// Builds the Antigravity card: plan and age header, pools with inline model hints and `5h` limits first, disabled status when applicable, and positive extra AI credits.
 fn antigravity_card(
     antigravity: &AntigravityQuotaSnapshot,
     now: i64,
@@ -2569,7 +2685,12 @@ fn antigravity_card(
     wide: bool,
 ) -> QuotaCard {
     let inner = card_inner_w(width);
-    let mut lines: Vec<Line> = vec![plan_line(None, antigravity.fetched_at, now, inner)];
+    let mut lines: Vec<Line> = vec![plan_line(
+        antigravity.plan_type.as_deref(),
+        antigravity.fetched_at,
+        now,
+        inner,
+    )];
     if antigravity.needs_login {
         lines.push(login_hint_line(ANTIGRAVITY_LOGIN_HINT, inner));
     }
@@ -2581,27 +2702,53 @@ fn antigravity_card(
             .collect::<Vec<_>>(),
     )
     .min(usize::from(ANTIGRAVITY_LABEL_W));
-    let mut pools: Vec<(&str, Vec<&AntigravityBucket>)> = Vec::new();
+    let mut pools: Vec<(&str, Option<&str>, Vec<&AntigravityBucket>)> = Vec::new();
     for bucket in &antigravity.buckets {
-        match pools.iter_mut().find(|(name, _)| *name == bucket.group) {
-            Some((_, limits)) => limits.push(bucket),
-            None => pools.push((&bucket.group, vec![bucket])),
+        match pools.iter_mut().find(|(name, _, _)| *name == bucket.group) {
+            Some((_, desc, limits)) => {
+                if desc.is_none() {
+                    *desc = bucket.group_description.as_deref();
+                }
+                limits.push(bucket);
+            }
+            None => pools.push((
+                &bucket.group,
+                bucket.group_description.as_deref(),
+                vec![bucket],
+            )),
         }
     }
-    for (name, mut limits) in pools {
+    for (name, description, mut limits) in pools {
         limits.sort_by_key(|b| b.window != "5h");
-        lines.push(Line::from(fit_text(name, inner)));
+        lines.push(pool_header_line(name, description, inner));
         for bucket in limits {
-            lines.push(gauge_line(
-                &fit_text(&bucket.window, ANTIGRAVITY_LABEL_W),
-                label_w,
-                bucket.usage.used_percent,
-                bucket.usage.resets_at_unix,
-                now,
-                inner,
-                wide,
-            ));
+            let label = fit_text(&bucket.window, ANTIGRAVITY_LABEL_W);
+            if bucket.disabled {
+                lines.push(disabled_gauge_line(
+                    &label,
+                    label_w,
+                    bucket.usage.resets_at_unix,
+                    now,
+                    inner,
+                ));
+            } else {
+                lines.push(gauge_line(
+                    &label,
+                    label_w,
+                    bucket.usage.used_percent,
+                    bucket.usage.resets_at_unix,
+                    now,
+                    inner,
+                    wide,
+                ));
+            }
         }
+    }
+    if !antigravity.needs_login
+        && let Some(credits) = antigravity.available_credits.filter(|&c| c > 0)
+        && let Some(line) = detail_line(&[format!("credits {}", format_number(credits))], inner)
+    {
+        lines.push(line);
     }
     // The login hint already explains an empty card, so the two never stack.
     if antigravity.buckets.is_empty() && !antigravity.needs_login {
@@ -2984,11 +3131,13 @@ mod tests {
         let bucket =
             |group: &str, window: &str, used_percent: f64, reset_in: i64| AntigravityBucket {
                 group: group.to_string(),
+                group_description: None,
                 window: window.to_string(),
                 usage: QuotaWindow {
                     used_percent,
                     resets_at_unix: Some(now + reset_in),
                 },
+                disabled: false,
             };
         AntigravityQuotaSnapshot {
             source: QuotaSource::Api,
@@ -3080,17 +3229,108 @@ mod tests {
         let antigravity = AntigravityQuotaSnapshot {
             buckets: vec![AntigravityBucket {
                 group: "Gemini Models".to_string(),
+                group_description: None,
                 window: "Weekly Limit Remaining".to_string(),
                 usage: QuotaWindow {
                     used_percent: 42.0,
                     resets_at_unix: None,
                 },
+                disabled: false,
             }],
             ..Default::default()
         };
         let rendered = render_min_card(&antigravity_card(&antigravity, 0, CARD_GRID.min_w, false));
         assert!(rendered.contains("Weekly L…"), "got:\n{rendered}");
         assert!(rendered.contains("42%"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn antigravity_panel_shows_plan_credits_disabled_buckets_and_inline_pool_models() {
+        let now = 1_000;
+        let snapshot = AntigravityQuotaSnapshot {
+            source: QuotaSource::Api,
+            fetched_at: now,
+            plan_type: Some("Google AI Pro".to_string()),
+            available_credits: Some(1_250),
+            buckets: vec![
+                AntigravityBucket {
+                    group: "Gemini Models".to_string(),
+                    group_description: Some(
+                        "Models within this group: Gemini Pro, Gemini Flash, Gemini Lite"
+                            .to_string(),
+                    ),
+                    window: "5h".to_string(),
+                    usage: QuotaWindow {
+                        used_percent: 25.0,
+                        resets_at_unix: Some(now + 3_600),
+                    },
+                    disabled: false,
+                },
+                AntigravityBucket {
+                    group: "Claude and GPT models".to_string(),
+                    group_description: Some(
+                        "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS".to_string(),
+                    ),
+                    window: "weekly".to_string(),
+                    usage: QuotaWindow {
+                        used_percent: 0.0,
+                        resets_at_unix: Some(now + 7_200),
+                    },
+                    disabled: true,
+                },
+            ],
+            limit_reached: false,
+            needs_login: false,
+        };
+
+        // Wide Quota-tab cell renders plan, inline model hints, disabled status, and credits.
+        let wide_card = antigravity_card(&snapshot, now, 64, true);
+        let wide = render_card_in(&wide_card, 64, 10);
+        assert!(wide.contains("Google AI Pro"), "got:\n{wide}");
+        assert!(
+            wide.contains("Gemini Models · Gemini Pro, Gemini Flash, Gemini Lite"),
+            "got:\n{wide}"
+        );
+        assert!(
+            wide.contains("Claude and GPT models · Claude Opus, Claude Sonnet, GPT-OSS"),
+            "got:\n{wide}"
+        );
+        assert!(wide.contains("weekly disabled"), "got:\n{wide}");
+        assert!(wide.contains("credits 1,250"), "got:\n{wide}");
+
+        // Medium cell truncates trailing pool models with an explicit `+N` overflow marker.
+        let medium = render_card_in(&antigravity_card(&snapshot, now, 56, true), 56, 10);
+        assert!(
+            medium.contains("Claude and GPT models · Claude Opus, Claude Sonnet +1"),
+            "got:\n{medium}"
+        );
+
+        // Narrow cell omits inline models when room is too tight instead of chopping model names.
+        let narrow = render_card_in(
+            &antigravity_card(&snapshot, now, CARD_GRID.min_w, false),
+            CARD_GRID.min_w,
+            10,
+        );
+        assert!(!narrow.contains("Gemini Pro"), "got:\n{narrow}");
+        assert!(narrow.contains("weekly disabled"), "got:\n{narrow}");
+
+        // Exact `+N` reserve fits `"Claude and GPT models · Claude Opus +2"` inside 38 inner columns (40-col card).
+        let exact = line_text(pool_header_line(
+            "Claude and GPT models",
+            Some("Models within this group: Claude Opus, Claude Sonnet, GPT-OSS"),
+            38,
+        ));
+        assert_eq!(exact, "Claude and GPT models · Claude Opus +2");
+
+        // Needs-login suppresses the credits line so the login hint stays uncrowded.
+        let mut login_snap = snapshot;
+        login_snap.needs_login = true;
+        let login_card = render_card_in(&antigravity_card(&login_snap, now, 64, true), 64, 10);
+        assert!(
+            login_card.contains(ANTIGRAVITY_LOGIN_HINT),
+            "got:\n{login_card}"
+        );
+        assert!(!login_card.contains("credits 1,250"), "got:\n{login_card}");
     }
 
     #[test]
@@ -3577,11 +3817,13 @@ mod tests {
                 .iter()
                 .map(|pool| AntigravityBucket {
                     group: pool.to_string(),
+                    group_description: None,
                     window: "20h".to_string(),
                     usage: QuotaWindow {
                         used_percent: 1.0,
                         resets_at_unix: None,
                     },
+                    disabled: false,
                 })
                 .collect(),
             ..Default::default()
