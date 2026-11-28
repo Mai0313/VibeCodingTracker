@@ -1601,3 +1601,86 @@ fn quota_json_fetches_normalized_cards_caches_and_isolates_auth_failure() {
     assert!(home.home().join(".vct/quota/codex.json").exists());
     assert!(!home.home().join(".vct/config.toml").exists());
 }
+
+#[test]
+fn quota_json_emits_antigravity_plan_credits_pool_description_and_disabled() {
+    use httpmock::prelude::*;
+
+    let server = MockServer::start();
+    let quota_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary")
+            .header("x-antigravity-csrf-token", "test-csrf");
+        then.status(200).json_body(json!({
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "description": "Models within this group: Gemini Pro, Gemini Flash",
+                        "buckets": [
+                            {
+                                "displayName": "5h Limit",
+                                "window": "5h",
+                                "remainingFraction": 0.8,
+                                "resetTime": "2026-12-01T00:00:00Z"
+                            },
+                            {
+                                "displayName": "Weekly Limit",
+                                "window": "weekly",
+                                "disabled": true
+                            }
+                        ]
+                    }
+                ]
+            }
+        }));
+    });
+    let status_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/exa.language_server_pb.LanguageServerService/GetUserStatus")
+            .header("x-antigravity-csrf-token", "test-csrf");
+        then.status(200).json_body(json!({
+            "userStatus": {
+                "userTier": {
+                    "id": "g1-pro-tier",
+                    "name": "Google AI Pro",
+                    "availableCredits": [
+                        { "creditType": "GOOGLE_ONE_AI", "creditAmount": "500" }
+                    ]
+                }
+            }
+        }));
+    });
+
+    let home = TempHome::new();
+    let output = child_cmd(&home)
+        .args(["quota", "--json"])
+        .env("ANTIGRAVITY_LS_ADDRESS", server.address().to_string())
+        .env("ANTIGRAVITY_CSRF_TOKEN", "test-csrf")
+        .env_remove("ANTIGRAVITY_APP_DATA_DIR")
+        .env_remove("CLOUD_CODE_URL")
+        .output()
+        .expect("spawn vct quota --json");
+    assert!(
+        output.status.success(),
+        "vct quota --json failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    quota_mock.assert();
+    status_mock.assert();
+
+    let cards: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cards.len(), 1);
+    let agy = &cards[0];
+    assert_eq!(agy["provider"], "antigravity");
+    assert_eq!(agy["plan"], "Google AI Pro");
+    assert_eq!(agy["available_credits"], 500);
+    assert_eq!(agy["buckets"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        agy["buckets"][0]["description"],
+        "Models within this group: Gemini Pro, Gemini Flash"
+    );
+    assert!(agy["buckets"][0].get("disabled").is_none());
+    assert_eq!(agy["buckets"][1]["window"], "weekly");
+    assert_eq!(agy["buckets"][1]["disabled"], true);
+}
