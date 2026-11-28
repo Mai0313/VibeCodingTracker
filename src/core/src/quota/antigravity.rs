@@ -8,8 +8,9 @@
 //! 4. Direct Cloud Code HTTP (`v1internal:retrieveUserQuotaSummary`) using local OAuth credentials (OS credential store or `~/.gemini/antigravity-cli/antigravity-oauth-token`), read-only with no OAuth refresh or embedded client secret.
 
 use crate::models::{
-    AntigravityBucket, AntigravityLsQuotaResponse, AntigravityQuotaSnapshot,
-    AntigravityQuotaSummary, QuotaSource, QuotaWindow,
+    AntigravityBucket, AntigravityLsQuotaResponse, AntigravityLsUserStatusResponse,
+    AntigravityQuotaSnapshot, AntigravityQuotaSummary, AntigravityUserTier, QuotaSource,
+    QuotaWindow,
 };
 use crate::quota::cache::load_antigravity_cache_from;
 use crate::quota::http::{detect_cli_version, iso_to_unix_secs};
@@ -34,6 +35,12 @@ pub const ANTIGRAVITY_LOGIN_HINT: &str = "run: agy models";
 /// Connect-RPC path for querying quota from a local Antigravity Language Server.
 const LS_QUOTA_PATH: &str =
     "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
+
+/// Connect-RPC path for querying subscription tier and extra credits from a local Antigravity Language Server.
+const LS_USER_STATUS_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+
+/// Cache TTL in seconds for slow-changing plan and credit metadata (`GetUserStatus` and `loadCodeAssist`).
+const USER_STATUS_TTL_SECS: i64 = 300;
 
 /// Default Cloud Code API base URL for personal (`consumer`) accounts.
 const CCPA_CONSUMER_BASE: &str = "https://daily-cloudcode-pa.googleapis.com";
@@ -160,6 +167,34 @@ impl fmt::Debug for AntigravityOAuthCreds {
 struct LoadCodeAssistResponse {
     #[serde(default)]
     cloudaicompanion_project: Option<String>,
+    #[serde(default, deserialize_with = "crate::models::quota::de_lenient_opt")]
+    paid_tier: Option<AntigravityUserTier>,
+    #[serde(default, deserialize_with = "crate::models::quota::de_lenient_opt")]
+    current_tier: Option<AntigravityUserTier>,
+}
+
+/// Extracted subscription plan and extra AI credit balance for Antigravity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AntigravityAccountMeta {
+    plan_type: Option<String>,
+    available_credits: Option<i64>,
+}
+
+/// Cached `GetUserStatus` metadata keyed by Language Server endpoint and TTL.
+#[derive(Debug, Clone)]
+struct CachedUserStatus {
+    endpoint_key: u64,
+    fetched_at: i64,
+    meta: AntigravityAccountMeta,
+}
+
+/// Cached `v1internal:loadCodeAssist` project and tier metadata keyed by credential hash and TTL.
+#[derive(Debug, Clone)]
+struct CachedLoadCodeAssist {
+    key: u64,
+    fetched_at: i64,
+    project: String,
+    meta: AntigravityAccountMeta,
 }
 
 /// Outcome of a direct Cloud Code HTTP quota fetch.
@@ -302,6 +337,112 @@ fn call_ls_quota_raw(client: &Client, base_url: &str, csrf_token: &str) -> Resul
     Ok((status, body))
 }
 
+/// Trims an optional string and returns `None` when empty.
+fn non_empty_trimmed(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts the display plan label from an [`AntigravityUserTier`] (`name`, falling back to `description`).
+fn extract_tier_plan(tier: Option<&AntigravityUserTier>) -> Option<String> {
+    let tier = tier?;
+    non_empty_trimmed(tier.name.as_deref())
+        .or_else(|| non_empty_trimmed(tier.description.as_deref()))
+}
+
+/// Extracts a positive available AI credit balance from an [`AntigravityUserTier`], preferring `GOOGLE_ONE_AI`.
+fn extract_tier_credits(tier: Option<&AntigravityUserTier>) -> Option<i64> {
+    let tier = tier?;
+    tier.available_credits
+        .iter()
+        .find_map(|credit| {
+            (credit.credit_type.as_deref() == Some("GOOGLE_ONE_AI"))
+                .then_some(credit.credit_amount)
+                .flatten()
+                .filter(|&amount| amount > 0)
+        })
+        .or_else(|| {
+            tier.available_credits
+                .iter()
+                .find_map(|credit| credit.credit_amount.filter(|&amount| amount > 0))
+        })
+}
+
+/// Extracts plan tier and available credits from a `GetUserStatus` JSON body, returning `None` on non-JSON or missing `userStatus`.
+fn extract_ls_user_status(body: &str) -> Option<AntigravityAccountMeta> {
+    let parsed: AntigravityLsUserStatusResponse = serde_json::from_str(body).ok()?;
+    let status = parsed.user_status?;
+    let plan_type = extract_tier_plan(status.user_tier.as_ref()).or_else(|| {
+        non_empty_trimmed(
+            status
+                .plan_status
+                .as_ref()
+                .and_then(|plan| plan.plan_info.as_ref())
+                .and_then(|info| info.plan_name.as_deref()),
+        )
+    });
+    let available_credits = extract_tier_credits(status.user_tier.as_ref());
+    Some(AntigravityAccountMeta {
+        plan_type,
+        available_credits,
+    })
+}
+
+/// Extracts plan tier and available credits from a `loadCodeAssist` response, checking `paidTier` and `currentTier` independently.
+fn extract_lca_meta(resp: &LoadCodeAssistResponse) -> AntigravityAccountMeta {
+    let plan_type = extract_tier_plan(resp.paid_tier.as_ref())
+        .or_else(|| extract_tier_plan(resp.current_tier.as_ref()));
+    let available_credits = extract_tier_credits(resp.paid_tier.as_ref())
+        .or_else(|| extract_tier_credits(resp.current_tier.as_ref()));
+    AntigravityAccountMeta {
+        plan_type,
+        available_credits,
+    }
+}
+
+/// Calls `GetUserStatus` on a local Language Server on a best-effort basis and returns extracted plan and credits.
+fn call_ls_user_status(
+    client: &Client,
+    base_url: &str,
+    csrf_token: &str,
+) -> Option<AntigravityAccountMeta> {
+    let resp = match client
+        .post(format!("{base_url}{LS_USER_STATUS_PATH}"))
+        .timeout(LS_RPC_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("Connect-Protocol-Version", "1")
+        .header("x-codeium-csrf-token", csrf_token)
+        .header("x-antigravity-csrf-token", csrf_token)
+        .body("{}")
+        .send()
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::debug!("antigravity quota: GetUserStatus failed: {e}");
+            return None;
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        log::debug!(
+            "antigravity quota: GetUserStatus returned HTTP {}",
+            status.as_u16()
+        );
+        return None;
+    }
+    let Ok(body) = resp.text() else {
+        log::debug!("antigravity quota: failed to read GetUserStatus body");
+        return None;
+    };
+    let meta = extract_ls_user_status(&body);
+    if meta.is_none() {
+        log::debug!("antigravity quota: GetUserStatus returned unusable body");
+    }
+    meta
+}
+
 /// Maps a unified [`AntigravityQuotaSummary`] into an [`AntigravityQuotaSnapshot`] stamped at `now`.
 fn map_quota_summary(summary: AntigravityQuotaSummary, now: i64) -> AntigravityQuotaSnapshot {
     let mut buckets = Vec::new();
@@ -309,24 +450,33 @@ fn map_quota_summary(summary: AntigravityQuotaSummary, now: i64) -> AntigravityQ
         if group.buckets.is_empty() {
             continue;
         }
+        let group_description = non_empty_trimmed(group.description.as_deref());
         for bucket in group.buckets {
-            let Some(remaining) = bucket.remaining_fraction else {
-                continue;
+            let used_percent = match bucket.remaining_fraction {
+                Some(remaining) => (1.0 - remaining.clamp(0.0, 1.0)) * 100.0,
+                None if bucket.disabled => 0.0,
+                None => continue,
             };
             buckets.push(AntigravityBucket {
                 group: group.display_name.clone().unwrap_or_default(),
+                group_description: group_description.clone(),
                 window: bucket.window.or(bucket.display_name).unwrap_or_default(),
                 usage: QuotaWindow {
-                    used_percent: (1.0 - remaining.clamp(0.0, 1.0)) * 100.0,
+                    used_percent,
                     resets_at_unix: bucket.reset_time.as_deref().and_then(iso_to_unix_secs),
                 },
+                disabled: bucket.disabled,
             });
         }
     }
-    let limit_reached = buckets.iter().any(|b| b.usage.used_percent >= 100.0);
+    let limit_reached = buckets
+        .iter()
+        .any(|b| !b.disabled && b.usage.used_percent >= 100.0);
     AntigravityQuotaSnapshot {
         source: QuotaSource::Api,
         fetched_at: now,
+        plan_type: None,
+        available_credits: None,
         buckets,
         limit_reached,
         needs_login: false,
@@ -474,12 +624,12 @@ fn parse_daemon_discovery_file(body: &str) -> Option<DaemonEndpoint> {
     })
 }
 
-/// Tries each live candidate in `files` in order, returning the first successful `(status, body)`.
+/// Tries each live candidate in `files` in order, returning the first successful `(base_url, csrf_token, status, body)`.
 fn try_discovery_files_raw(
     client: &Client,
     files: &[PathBuf],
     pid_alive: impl Fn(u32) -> bool,
-) -> Option<(u16, String)> {
+) -> Option<(String, String, u16, String)> {
     for path in files {
         let Ok(body) = std::fs::read_to_string(path) else {
             continue;
@@ -495,7 +645,7 @@ fn try_discovery_files_raw(
             Ok((status, text))
                 if (200..300).contains(&status) && map_ls_quota(&text, 0).is_ok() =>
             {
-                return Some((status, text));
+                return Some((base_url, endpoint.csrf_token, status, text));
             }
             Ok((status, _)) => {
                 log::debug!(
@@ -1225,8 +1375,10 @@ fn fetch_antigravity_raw_with(
     }
 
     // Tier 2: daemon discovery files.
-    if let Some(res) = try_discovery_files_raw(ls_client, discovery_files, pid_alive) {
-        return Ok(res);
+    if let Some((_, _, status, body)) =
+        try_discovery_files_raw(ls_client, discovery_files, pid_alive)
+    {
+        return Ok((status, body));
     }
 
     // Tier 3: Linux `/proc` hub discovery.
@@ -1276,18 +1428,50 @@ fn fetch_antigravity_raw_with(
     bail!("{}", missing_source_error(os, token_path));
 }
 
-/// Per-worker Antigravity quota state holding the cached local hub (Linux) and `loadCodeAssist` project ID.
+/// Per-worker Antigravity quota state holding the cached local hub (Linux), LS user status, and `loadCodeAssist` metadata.
 #[derive(Default)]
 pub struct AntigravityState {
     /// Loopback HTTP client (`no_proxy`, short connect timeout) built lazily on first poll.
     local_client: Option<Client>,
-    /// Cached `(pid, port, csrf_token)` from Linux `/proc` hub discovery.
+    /// Cached `(pid, base_url, csrf_token)` from Linux `/proc` hub discovery.
     cached_hub: Option<CachedHub>,
-    /// Cached `(credential_hash, cloudaicompanionProject)` from `loadCodeAssist`.
-    cached_project: Option<(u64, String)>,
+    /// Cached `GetUserStatus` plan and credit metadata for the active LS endpoint.
+    cached_user_status: Option<CachedUserStatus>,
+    /// Cached `loadCodeAssist` project, plan, and credit metadata for Tier 4.
+    cached_lca: Option<CachedLoadCodeAssist>,
 }
 
 impl AntigravityState {
+    /// Resolves plan tier and available credits from `GetUserStatus`, caching successful lookups per endpoint for [`USER_STATUS_TTL_SECS`].
+    fn resolve_ls_user_status(
+        &mut self,
+        http: &Client,
+        base_url: &str,
+        csrf_token: &str,
+        now: i64,
+    ) -> AntigravityAccountMeta {
+        let endpoint_key = project_cache_key(base_url, "ls", csrf_token);
+        if let Some(cached) = &self.cached_user_status
+            && cached.endpoint_key == endpoint_key
+            && now >= cached.fetched_at
+            && now - cached.fetched_at < USER_STATUS_TTL_SECS
+        {
+            return cached.meta.clone();
+        }
+        // Clear stale metadata before refreshing so a failing refresh never retains outdated plan/credits.
+        self.cached_user_status = None;
+        if let Some(meta) = call_ls_user_status(http, base_url, csrf_token) {
+            self.cached_user_status = Some(CachedUserStatus {
+                endpoint_key,
+                fetched_at: now,
+                meta: meta.clone(),
+            });
+            meta
+        } else {
+            AntigravityAccountMeta::default()
+        }
+    }
+
     /// Runs one quota poll across the 4-tier HTTP resolution chain.
     pub fn resolve(&mut self, client: &Client) -> QuotaOutcome<AntigravityQuotaSnapshot> {
         let now = chrono::Local::now().timestamp();
@@ -1361,7 +1545,13 @@ impl AntigravityState {
                 match call_ls_quota_raw(http, &base_url, &token) {
                     Ok((status, body)) if (200..300).contains(&status) => {
                         match map_ls_quota(&body, now) {
-                            Ok(snap) => return QuotaOutcome::Data(snap),
+                            Ok(mut snap) => {
+                                let meta =
+                                    self.resolve_ls_user_status(http, &base_url, &token, now);
+                                snap.plan_type = meta.plan_type;
+                                snap.available_credits = meta.available_credits;
+                                return QuotaOutcome::Data(snap);
+                            }
                             Err(e) => {
                                 log::warn!("antigravity quota: failed to parse LS response: {e}");
                             }
@@ -1378,9 +1568,16 @@ impl AntigravityState {
         }
 
         // Tier 2: local daemon discovery files.
-        if let Some((_, body)) = try_discovery_files_raw(ls_client, discovery_files, &pid_alive) {
+        if let Some((base_url, csrf_token, _, body)) =
+            try_discovery_files_raw(ls_client, discovery_files, &pid_alive)
+        {
             match map_ls_quota(&body, now) {
-                Ok(snap) => return QuotaOutcome::Data(snap),
+                Ok(mut snap) => {
+                    let meta = self.resolve_ls_user_status(ls_client, &base_url, &csrf_token, now);
+                    snap.plan_type = meta.plan_type;
+                    snap.available_credits = meta.available_credits;
+                    return QuotaOutcome::Data(snap);
+                }
                 Err(e) => {
                     log::warn!("antigravity quota: failed to parse daemon LS response: {e}");
                 }
@@ -1393,15 +1590,23 @@ impl AntigravityState {
                 && let Ok((status, body)) =
                     call_ls_quota_raw(ls_client, &hub.base_url, &hub.csrf_token)
                 && (200..300).contains(&status)
-                && let Ok(snap) = map_ls_quota(&body, now)
+                && let Ok(mut snap) = map_ls_quota(&body, now)
             {
+                let meta =
+                    self.resolve_ls_user_status(ls_client, &hub.base_url, &hub.csrf_token, now);
+                snap.plan_type = meta.plan_type;
+                snap.available_credits = meta.available_credits;
                 return QuotaOutcome::Data(snap);
             }
             self.cached_hub = None;
         }
         if let Some((hub, _, body)) = discover_hub() {
             match map_ls_quota(&body, now) {
-                Ok(snap) => {
+                Ok(mut snap) => {
+                    let meta =
+                        self.resolve_ls_user_status(ls_client, &hub.base_url, &hub.csrf_token, now);
+                    snap.plan_type = meta.plan_type;
+                    snap.available_credits = meta.available_credits;
                     self.cached_hub = Some(hub);
                     return QuotaOutcome::Data(snap);
                 }
@@ -1431,7 +1636,7 @@ impl AntigravityState {
         }
     }
 
-    /// Calls `v1internal:loadCodeAssist` (cached) if needed and `v1internal:retrieveUserQuotaSummary`.
+    /// Calls `v1internal:loadCodeAssist` (cached per credential with [`USER_STATUS_TTL_SECS`] TTL) if needed and `v1internal:retrieveUserQuotaSummary`.
     fn fetch_ccpa(
         &mut self,
         client: &Client,
@@ -1442,57 +1647,98 @@ impl AntigravityState {
         let base_url = ccpa_base_url(&creds.auth_method, cloud_code_url);
         let ua = antigravity_ccpa_ua(&creds.auth_method);
 
-        let (project, send_user_project) = match &creds.project_id {
-            Some(pid) => (pid.clone(), true),
+        let (project, meta, send_user_project) = match &creds.project_id {
+            Some(pid) => (pid.clone(), AntigravityAccountMeta::default(), true),
             None => {
                 let identity = creds
                     .refresh_token
                     .as_deref()
                     .unwrap_or(&creds.access_token);
                 let key = project_cache_key(&base_url, &creds.auth_method, identity);
-                if let Some((cached_key, cached_project)) = &self.cached_project
-                    && *cached_key == key
+                if let Some(cached) = &self.cached_lca
+                    && cached.key == key
+                    && now >= cached.fetched_at
+                    && now - cached.fetched_at < USER_STATUS_TTL_SECS
                 {
-                    (cached_project.clone(), false)
+                    (cached.project.clone(), cached.meta.clone(), false)
                 } else {
-                    let (status, body) = match call_load_code_assist_raw(
+                    let fallback_project = self
+                        .cached_lca
+                        .as_ref()
+                        .filter(|cached| cached.key == key)
+                        .map(|cached| cached.project.clone());
+                    // Clear stale metadata before refreshing so transient failures do not keep outdated plan/credits.
+                    self.cached_lca = None;
+                    let lca_result = match call_load_code_assist_raw(
                         client,
                         &base_url,
                         &creds.access_token,
                         &ua,
                     ) {
-                        Ok(res) => res,
+                        Ok((status, _)) if status == 401 || status == 403 => {
+                            return CcpaFetch::NeedsLogin;
+                        }
+                        Ok((status, body)) if (200..300).contains(&status) => {
+                            match serde_json::from_str::<LoadCodeAssistResponse>(&body) {
+                                Ok(parsed) => {
+                                    let project = parsed
+                                        .cloudaicompanion_project
+                                        .as_deref()
+                                        .and_then(|s| non_empty_trimmed(Some(s)));
+                                    match project {
+                                        Some(project) => {
+                                            let meta = extract_lca_meta(&parsed);
+                                            Ok((project, meta))
+                                        }
+                                        None => {
+                                            log::warn!(
+                                                "antigravity quota: loadCodeAssist returned no cloudaicompanionProject"
+                                            );
+                                            Err(())
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "antigravity quota: failed to parse loadCodeAssist: {e}"
+                                    );
+                                    Err(())
+                                }
+                            }
+                        }
+                        Ok((status, _)) => {
+                            log::warn!("antigravity quota: loadCodeAssist returned HTTP {status}");
+                            Err(())
+                        }
                         Err(e) => {
                             log::warn!("antigravity quota: loadCodeAssist failed: {e}");
-                            return CcpaFetch::Transient;
+                            Err(())
                         }
                     };
-                    if status == 401 || status == 403 {
-                        return CcpaFetch::NeedsLogin;
-                    }
-                    if !(200..300).contains(&status) {
-                        log::warn!("antigravity quota: loadCodeAssist returned HTTP {status}");
-                        return CcpaFetch::Transient;
-                    }
-                    let parsed: LoadCodeAssistResponse = match serde_json::from_str(&body) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            log::warn!("antigravity quota: failed to parse loadCodeAssist: {e}");
-                            return CcpaFetch::Transient;
+                    match lca_result {
+                        Ok((project, meta)) => {
+                            self.cached_lca = Some(CachedLoadCodeAssist {
+                                key,
+                                fetched_at: now,
+                                project: project.clone(),
+                                meta: meta.clone(),
+                            });
+                            (project, meta, false)
                         }
-                    };
-                    let Some(project) = parsed
-                        .cloudaicompanion_project
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                    else {
-                        log::warn!(
-                            "antigravity quota: loadCodeAssist returned no cloudaicompanionProject"
-                        );
-                        return CcpaFetch::Transient;
-                    };
-                    self.cached_project = Some((key, project.clone()));
-                    (project, false)
+                        Err(()) => {
+                            // Keep serving quota using the previously known project while clearing stale metadata, and retry LCA on the next poll.
+                            let Some(project) = fallback_project else {
+                                return CcpaFetch::Transient;
+                            };
+                            self.cached_lca = Some(CachedLoadCodeAssist {
+                                key,
+                                fetched_at: now.saturating_sub(USER_STATUS_TTL_SECS),
+                                project: project.clone(),
+                                meta: AntigravityAccountMeta::default(),
+                            });
+                            (project, AntigravityAccountMeta::default(), false)
+                        }
+                    }
                 }
             }
         };
@@ -1519,7 +1765,11 @@ impl AntigravityState {
             return CcpaFetch::Transient;
         }
         match map_ccpa_quota(&body, now) {
-            Ok(snap) => CcpaFetch::Ok(snap),
+            Ok(mut snap) => {
+                snap.plan_type = meta.plan_type;
+                snap.available_credits = meta.available_credits;
+                CcpaFetch::Ok(snap)
+            }
             Err(e) => {
                 log::warn!("antigravity quota: failed to parse CCPA quota response: {e}");
                 CcpaFetch::Transient
@@ -1582,22 +1832,45 @@ mod tests {
             snap.buckets[0].usage.resets_at_unix,
             iso_to_unix_secs("2026-11-14T08:37:03Z")
         );
+        assert_eq!(
+            snap.buckets[0].group_description.as_deref(),
+            Some("Models within this group: Gemini Flash, Gemini Pro")
+        );
+        assert!(!snap.buckets[0].disabled);
         assert!(!snap.limit_reached);
         assert!(!snap.needs_login);
 
-        // Spent limit flags limit_reached; missing window falls back to displayName; missing fraction is skipped.
+        // Spent limit flags limit_reached; missing window falls back to displayName; missing fraction is skipped unless disabled.
         let edge = r#"{"groups":[
             {"displayName":"Empty Info Group"},
-            {"displayName":"Pool","buckets":[
-                {"displayName":"Daily","remainingFraction":0},
-                {"window":"5h"}
+            {"displayName":"Pool","description":"Models within this group: Model A","buckets":[
+                {"displayName":"Daily","remainingFraction":0,"disabled":null},
+                {"window":"5h"},
+                {"window":"paused","disabled":true}
             ]}
         ]}"#;
         let edge_snap = map_ccpa_quota(edge, 42).unwrap();
-        assert_eq!(edge_snap.buckets.len(), 1);
+        assert_eq!(edge_snap.buckets.len(), 2);
         assert_eq!(edge_snap.buckets[0].window, "Daily");
         assert_eq!(edge_snap.buckets[0].usage.used_percent, 100.0);
+        assert!(!edge_snap.buckets[0].disabled);
+        assert_eq!(
+            edge_snap.buckets[0].group_description.as_deref(),
+            Some("Models within this group: Model A")
+        );
+        assert_eq!(edge_snap.buckets[1].window, "paused");
+        assert_eq!(edge_snap.buckets[1].usage.used_percent, 0.0);
+        assert!(edge_snap.buckets[1].disabled);
         assert!(edge_snap.limit_reached);
+
+        // A disabled exhausted bucket alone must not trigger limit_reached.
+        let disabled_only = r#"{"groups":[{"displayName":"Pool","buckets":[
+            {"window":"5h","remainingFraction":0,"disabled":true}
+        ]}]}"#;
+        let disabled_snap = map_ccpa_quota(disabled_only, 42).unwrap();
+        assert_eq!(disabled_snap.buckets.len(), 1);
+        assert!(disabled_snap.buckets[0].disabled);
+        assert!(!disabled_snap.limit_reached);
     }
 
     #[test]
@@ -2282,11 +2555,11 @@ window.__APP_CONFIG__={"csrfToken":"tok-second"};</script>"#;
         ));
         std::fs::remove_file(&token).unwrap();
 
-        // Valid v2 cached snapshot marks presence; an empty or mismatched cache does not.
+        // Valid v3 cached snapshot marks presence; an older v2 cache does not.
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         std::fs::write(
             &cache,
-            r#"{"schema_version":1,"provider":"antigravity","snapshot":{"buckets":[{"group":"G","window":"5h","usage":{"used_percent":10.0,"resets_at_unix":null}}]}}"#,
+            r#"{"schema_version":2,"provider":"antigravity","snapshot":{"fetched_at":1,"buckets":[{"group":"G","window":"5h","usage":{"used_percent":10.0,"resets_at_unix":null}}]}}"#,
         )
         .unwrap();
         assert!(!antigravity_quota_present_in(
@@ -2300,7 +2573,7 @@ window.__APP_CONFIG__={"csrfToken":"tok-second"};</script>"#;
         ));
         std::fs::write(
             &cache,
-            r#"{"schema_version":2,"provider":"antigravity","snapshot":{"fetched_at":1,"buckets":[{"group":"G","window":"5h","usage":{"used_percent":10.0,"resets_at_unix":null}}]}}"#,
+            r#"{"schema_version":3,"provider":"antigravity","snapshot":{"fetched_at":1,"buckets":[{"group":"G","window":"5h","usage":{"used_percent":10.0,"resets_at_unix":null}}]}}"#,
         )
         .unwrap();
         assert!(antigravity_quota_present_in(
@@ -2396,5 +2669,236 @@ window.__APP_CONFIG__={"csrfToken":"tok-second"};</script>"#;
             assert!(err.contains(&expected), "{os}: {err}");
             assert!(err.contains(ANTIGRAVITY_LOGIN_HINT), "{os}: {err}");
         }
+    }
+
+    #[test]
+    fn ls_user_status_enriches_plan_and_credits_with_ttl_and_graceful_fallback() {
+        let server = MockServer::start();
+        let quota = server.mock(|when, then| {
+            when.method(POST).path(LS_QUOTA_PATH);
+            then.status(200).body(LS_FIXTURE);
+        });
+        let mut status_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path(LS_USER_STATUS_PATH)
+                .header("connect-protocol-version", "1")
+                .header("x-codeium-csrf-token", "tok-1")
+                .header("x-antigravity-csrf-token", "tok-1")
+                .body("{}");
+            then.status(200).json_body(serde_json::json!({
+                "userStatus": {
+                    "planStatus": {
+                        "planInfo": { "planName": "Legacy" },
+                        "availablePromptCredits": 500,
+                        "availableFlowCredits": 100
+                    },
+                    "userTier": {
+                        "id": "g1-pro-tier",
+                        "name": "Google AI Pro",
+                        "availableCredits": [
+                            { "creditType": "OTHER", "creditAmount": 10 },
+                            { "creditType": "GOOGLE_ONE_AI", "creditAmount": "750" }
+                        ]
+                    }
+                }
+            }));
+        });
+
+        let client = build_client().unwrap();
+        let mut state = AntigravityState::default();
+
+        // First poll fetches GetUserStatus; second poll within 300s reuses cache.
+        for ts in [1_000, 1_120] {
+            let outcome = state.resolve_with(
+                &client,
+                &client,
+                ts,
+                Some(&server.base_url()),
+                Some("tok-1"),
+                &[],
+                |_| false,
+                || None,
+                || None,
+                None,
+            );
+            match outcome {
+                QuotaOutcome::Data(snap) => {
+                    assert_eq!(snap.plan_type.as_deref(), Some("Google AI Pro"));
+                    assert_eq!(snap.available_credits, Some(750));
+                }
+                _ => panic!("expected LS quota data"),
+            }
+        }
+        quota.assert_calls(2);
+        status_mock.assert_calls(1);
+
+        // Past TTL, an SPA 200 HTML catch-all clears stale plan/credits without failing quota.
+        status_mock.delete();
+        let html_mock = server.mock(|when, then| {
+            when.method(POST).path(LS_USER_STATUS_PATH);
+            then.status(200).body("<!doctype html><html></html>");
+        });
+        let outcome = state.resolve_with(
+            &client,
+            &client,
+            1_300,
+            Some(&server.base_url()),
+            Some("tok-1"),
+            &[],
+            |_| false,
+            || None,
+            || None,
+            None,
+        );
+        html_mock.assert_calls(1);
+        match outcome {
+            QuotaOutcome::Data(snap) => {
+                assert_eq!(snap.plan_type, None);
+                assert_eq!(snap.available_credits, None);
+                assert_eq!(snap.buckets.len(), 4);
+            }
+            _ => panic!("expected LS quota data despite HTML GetUserStatus"),
+        }
+    }
+
+    #[test]
+    fn extract_ls_user_status_ignores_legacy_credits_and_falls_back_plan_name() {
+        // Zero / omitted GOOGLE_ONE_AI credits stay None even when legacy prompt credits are present.
+        let body = r#"{
+            "userStatus": {
+                "planStatus": {
+                    "planInfo": { "planName": "Pro" },
+                    "availablePromptCredits": 500
+                },
+                "userTier": {
+                    "name": "Google AI Pro",
+                    "availableCredits": [{ "creditType": "GOOGLE_ONE_AI", "minimumCreditAmountForUsage": "50" }]
+                }
+            }
+        }"#;
+        let meta = extract_ls_user_status(body).unwrap();
+        assert_eq!(meta.plan_type.as_deref(), Some("Google AI Pro"));
+        assert_eq!(meta.available_credits, None);
+
+        // Missing userTier falls back to planStatus.planInfo.planName; null availableCredits stays lenient.
+        let fallback = r#"{
+            "userStatus": {
+                "planStatus": { "planInfo": { "planName": "Enterprise" } },
+                "userTier": { "availableCredits": null }
+            }
+        }"#;
+        let meta = extract_ls_user_status(fallback).unwrap();
+        assert_eq!(meta.plan_type.as_deref(), Some("Enterprise"));
+        assert_eq!(meta.available_credits, None);
+    }
+
+    #[test]
+    fn direct_ccpa_extracts_tier_plan_and_credits_and_refreshes_on_ttl_with_project_fallback() {
+        let server = MockServer::start();
+        let mut load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(200).json_body(serde_json::json!({
+                "cloudaicompanionProject": "proj-1",
+                "paidTier": {
+                    "id": "g1-ultra-tier",
+                    "name": "",
+                    "availableCredits": [
+                        { "creditType": "GOOGLE_ONE_AI", "creditAmount": 1200 }
+                    ]
+                },
+                "currentTier": {
+                    "name": "Google AI Ultra"
+                }
+            }));
+        });
+        let quota = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1internal:retrieveUserQuotaSummary")
+                .json_body(serde_json::json!({ "project": "proj-1" }));
+            then.status(200).body(ccpa_fixture());
+        });
+
+        let creds = serde_json::json!({
+            "token": {
+                "access_token": "tok-valid",
+                "refresh_token": "rt-ttl",
+                "expiry": "2099-01-01T00:00:00Z"
+            },
+            "auth_method": "consumer"
+        })
+        .to_string();
+
+        let client = build_client().unwrap();
+        let mut state = AntigravityState::default();
+
+        // Independent tier fallback: credits from paidTier, plan from currentTier when paidTier.name is empty.
+        let outcome = state.resolve_with(
+            &client,
+            &client,
+            1_000,
+            None,
+            None,
+            &[],
+            |_| false,
+            || None,
+            || Some(creds.clone()),
+            Some(&server.base_url()),
+        );
+        match outcome {
+            QuotaOutcome::Data(snap) => {
+                assert_eq!(snap.plan_type.as_deref(), Some("Google AI Ultra"));
+                assert_eq!(snap.available_credits, Some(1_200));
+            }
+            _ => panic!("expected CCPA data"),
+        }
+        load.assert_calls(1);
+
+        // Past TTL, transient LCA 500 keeps serving quota via cached project while clearing stale metadata.
+        load.delete();
+        let failing_load = server.mock(|when, then| {
+            when.method(POST).path("/v1internal:loadCodeAssist");
+            then.status(500).body("boom");
+        });
+        for ts in [1_300, 1_360] {
+            let outcome = state.resolve_with(
+                &client,
+                &client,
+                ts,
+                None,
+                None,
+                &[],
+                |_| false,
+                || None,
+                || Some(creds.clone()),
+                Some(&server.base_url()),
+            );
+            match outcome {
+                QuotaOutcome::Data(snap) => {
+                    assert_eq!(snap.plan_type, None);
+                    assert_eq!(snap.available_credits, None);
+                    assert_eq!(snap.buckets.len(), 4);
+                }
+                _ => panic!("expected CCPA quota fallback on transient LCA error"),
+            }
+        }
+        failing_load.assert_calls(2);
+        quota.assert_calls(3);
+    }
+
+    #[test]
+    fn load_code_assist_tolerates_malformed_tier_fields() {
+        let body = r#"{
+            "cloudaicompanionProject": "proj-lenient",
+            "paidTier": "unexpected-string",
+            "currentTier": { "name": "Free", "availableCredits": "not-an-array" }
+        }"#;
+        let parsed: LoadCodeAssistResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed.cloudaicompanion_project.as_deref(),
+            Some("proj-lenient")
+        );
+        let meta = extract_lca_meta(&parsed);
+        assert_eq!(meta.plan_type.as_deref(), Some("Free"));
+        assert_eq!(meta.available_credits, None);
     }
 }

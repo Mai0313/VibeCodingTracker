@@ -48,7 +48,7 @@ impl CachedQuota for GrokQuotaSnapshot {
 }
 
 impl CachedQuota for AntigravityQuotaSnapshot {
-    const SCHEMA_VERSION: u32 = 2;
+    const SCHEMA_VERSION: u32 = 3;
     const PROVIDER: &'static str = "antigravity";
 }
 
@@ -285,11 +285,31 @@ mod tests {
 
         let antigravity = round_trip(&AntigravityQuotaSnapshot {
             fetched_at: 55,
+            plan_type: Some("Google AI Pro".into()),
+            available_credits: Some(250),
+            buckets: vec![crate::models::AntigravityBucket {
+                group: "Gemini Models".into(),
+                group_description: Some("Models within this group: Gemini Flash".into()),
+                window: "5h".into(),
+                usage: QuotaWindow {
+                    used_percent: 25.0,
+                    resets_at_unix: Some(1_700_000_000),
+                },
+                disabled: true,
+            }],
             limit_reached: true,
             ..Default::default()
         })
         .expect("antigravity cache");
         assert_eq!(antigravity.fetched_at, 55);
+        assert_eq!(antigravity.plan_type.as_deref(), Some("Google AI Pro"));
+        assert_eq!(antigravity.available_credits, Some(250));
+        assert_eq!(antigravity.buckets.len(), 1);
+        assert_eq!(
+            antigravity.buckets[0].group_description.as_deref(),
+            Some("Models within this group: Gemini Flash")
+        );
+        assert!(antigravity.buckets[0].disabled);
         assert!(antigravity.limit_reached);
     }
 

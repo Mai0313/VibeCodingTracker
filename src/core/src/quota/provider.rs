@@ -153,7 +153,7 @@ impl QuotaSnapshot for AntigravityQuotaSnapshot {
         self.fetched_at
     }
     fn is_present(&self) -> bool {
-        !self.buckets.is_empty() || self.needs_login
+        !self.buckets.is_empty() || self.plan_type.is_some() || self.needs_login
     }
     fn set_needs_login(&mut self, value: bool) {
         self.needs_login = value;
